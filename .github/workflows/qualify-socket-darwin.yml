@@ -1,0 +1,206 @@
+name: Diagnose Darwin socket close ordering
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-socket-darwin.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qualify-socket-darwin-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  compare:
+    name: Compare baseline and region head on one Darwin runner
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: d9c9843fd0e362b9fb0ed5e0f32cd4d2389fc9f4
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Prepare bounded diagnostic collector outside checkout
+        run: |
+          cat > "$RUNNER_TEMP/socket-diagnostic.mjs" <<'DIAGNOSTIC'
+          import { spawnSync, execFileSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+          import { join, resolve } from "node:path";
+          const root=process.cwd(), label=process.env.SOURCE_LABEL, head=process.env.SOURCE_SHA;
+          if(!["baseline","head"].includes(label))throw Error("source label missing");
+          const verify=()=>{
+            if(execFileSync("git",["rev-parse","HEAD"],{encoding:"utf8"}).trim()!==head)throw Error("source head mismatch");
+            execFileSync("git",["diff","--exit-code","HEAD"],{stdio:"inherit"});
+          };
+          verify();
+          if(process.version!=="v"+readFileSync(".node-version","utf8").trim())throw Error("Node pin mismatch");
+          const output=join(process.env.RUNNER_TEMP,"socket-diagnostic",label);
+          const generated=join(root,"tests/corpus/.socket-diagnostic");
+          if(existsSync(generated)||existsSync(join(output,"summary.json")))throw Error("diagnostic paths already owned");
+          mkdirSync(output,{recursive:true});
+          const baseEnv={...process.env,SCRIPTC_NO_CACHE:"1",SCRIPTC_TEST_SHARD:"",SCRIPTC_TEST_WORKERS:"1"};
+          delete baseEnv.SCRIPTC_TEST_OPTIMIZATION;
+          const observe=(command,args,env,timeout=180000)=>{
+            const r=spawnSync(command,args,{cwd:root,env,encoding:"utf8",input:"",timeout,maxBuffer:1024*1024});
+            return {code:r.status,signal:r.signal,error:r.error?.message,stdout:r.stdout??"",stderr:r.stderr??""};
+          };
+          const checked=(command,args)=>{
+            const r=observe(command,args,baseEnv);
+            if(r.code!==0||r.signal||r.error)throw Error("preflight failed: "+command+" "+r.stderr);
+            return r.stdout.trim();
+          };
+          const helper=JSON.parse(checked("packages/llvm-darwin-arm64/bin/scriptc-llvm-codegen",["version","--format=json"]));
+          const helperPackage=JSON.parse(readFileSync("packages/llvm-darwin-arm64/package.json","utf8"));
+          if(helper.llvm_version!=="22.1.8"||helper.protocol_version!=="1"||helper.scriptc_package_version!==helperPackage.version||!helper.supported_targets.includes("arm64-apple-macosx14.0.0"))throw Error("helper identity mismatch");
+          checked("node",["packages/runtime-darwin-arm64/scripts/verify.mjs"]);
+          const original=join(root,"tests/corpus/evolving-let-socket-optional-reads.cjs");
+          const source=readFileSync(original,"utf8");
+          const one=(text,from,to)=>{
+            if(text.split(from).length!==2)throw Error("fixture marker missing or ambiguous");
+            return text.replace(from,to);
+          };
+          const barrier=one(source,"    c.end();\n    server.close();","    c.once('close', () => server.close());\n    c.end();");
+          let trace=one(source,"const server = net.createServer((s) => s.end());",
+            "const server = net.createServer((s) => {\n  console.log('trace server accept');\n  s.on('error', (err) => console.log('trace accepted error', err.message));\n  s.on('close', () => console.log('trace accepted close'));\n  s.end();\n});\nserver.on('close', () => console.log('trace server close'));");
+          trace=one(trace,"    report('after');","    console.log('trace client connect');\n    report('after');");
+          trace=one(trace,"    server.close();","    console.log('trace closing listener');\n    server.close();");
+          trace=one(trace,"  });\n});","  });\n  c.on('error', (err) => console.log('trace client error', err.message));\n  c.on('close', () => console.log('trace client close'));\n});");
+          const report={label,head,status:"collecting",node:process.version,helper,
+            fixtureSha256:createHash("sha256").update(source).digest("hex"),
+            host:{imageOS:process.env.ImageOS,imageVersion:process.env.ImageVersion,arch:process.arch,os:checked("sw_vers",[]),clang:checked("clang",["--version"]),sdk:checked("xcrun",["--show-sdk-version"])},
+            artifact:label==="head"?{run:41079002760,id:12989416775,sourceHead:head,workflowHead:"41f8430807b645090ab8ff6a2dca2d92e84d403c"}:null,
+            canonical:[],observations:[]};
+          const save=()=>writeFileSync(join(output,"summary.json"),JSON.stringify(report,null,2)+"\n");
+          let complete=true, owned=false;
+          try{
+            mkdirSync(generated);owned=true;
+            writeFileSync(join(generated,"trace.cjs"),trace);
+            writeFileSync(join(generated,"close-barrier.cjs"),barrier);
+            for(const flavor of ["plain","san"]){
+              const env={...baseEnv,SCRIPTC_SAN:flavor==="san"?"1":""};
+              const jsonPath=join(output,"canonical-"+flavor+".json");
+              const canonical=observe("pnpm",["test","tests/harness/differential.test.ts","-t","evolving-let-socket-optional-reads\\.cjs$","--reporter=json","--outputFile="+jsonPath],env);
+              const item={flavor,...canonical};
+              try{
+                const data=JSON.parse(readFileSync(jsonPath,"utf8"));
+                const executed=data.testResults.flatMap(s=>s.assertionResults).filter(t=>t.status==="passed"||t.status==="failed");
+                if(executed.length!==1||!executed[0].fullName.endsWith("evolving-let-socket-optional-reads.cjs"))throw Error("expected exactly one executed canonical test");
+                item.case={name:executed[0].fullName,status:executed[0].status,failures:executed[0].failureMessages};
+                item.success=data.success;
+                const consistent=canonical.code===0&&item.case.status==="passed"&&data.success===true||canonical.code===1&&item.case.status==="failed"&&data.success===false;
+                if(canonical.error||canonical.signal||!consistent)complete=false;
+              }catch(error){item.reportError=String(error);complete=false;}
+              report.canonical.push(item);save();
+              for(const [name,entry] of [["original",original],["trace",join(generated,"trace.cjs")],["barrier",join(generated,"close-barrier.cjs")]]){
+                const binary=resolve(output,flavor+"-"+name);
+                const args=["packages/cli/dist/main.js","build",entry,"--backend","llvm","--optimization","release","--print","diagnostics","-o",binary];
+                if(flavor==="san")args.push("--sanitize");
+                const build=observe(process.execPath,args,env);
+                const observation={flavor,name,sourceSha256:createHash("sha256").update(readFileSync(entry)).digest("hex"),build,runs:[]};
+                report.observations.push(observation);
+                let envelope;
+                try{envelope=JSON.parse(build.stdout);}catch{}
+                if(build.code!==0||build.signal||build.error||envelope?.success!==true||envelope.phase!=="complete"||envelope.artifact!==binary){
+                  observation.status="build-incomplete";complete=false;save();continue;
+                }
+                for(let attempt=1;attempt<=5;attempt++){
+                  const node=observe(process.execPath,["--import","./tests/harness/comptime-shim.mjs",entry],env,30000);
+                  const native=observe(binary,[],env,30000);
+                  const valid=!node.error&&!node.signal&&node.code===0&&!native.error&&!native.signal&&(name!=="trace"||native.code===0);
+                  const result=!valid?"incomplete":name==="trace"?"diagnostic":native.code===node.code&&native.stdout===node.stdout&&native.stderr===node.stderr?"matches-oracle":"mismatch";
+                  if(!valid)complete=false;
+                  observation.runs.push({attempt,result,node,native});
+                }
+                observation.status="observed";save();
+                console.log(JSON.stringify({label,head,flavor,name,results:observation.runs.map(r=>r.result)}));
+              }
+            }
+            verify();report.sourceVerifiedAfter=true;
+          }catch(error){report.error=String(error);complete=false;}
+          finally{
+            if(owned)rmSync(generated,{recursive:true,force:true});
+            report.status=complete&&report.canonical.length===2&&report.observations.length===6&&report.observations.every(o=>o.runs.length===5)?"complete":"incomplete";
+            save();
+          }
+          // The final workflow step judges all records. Observed mismatches do not
+          // prevent collecting the other flavor or source revision.
+
+          DIAGNOSTIC
+      - name: Verify baseline source
+        run: |
+          test "$(git rev-parse HEAD)" = d9c9843fd0e362b9fb0ed5e0f32cd4d2389fc9f4
+          git diff --exit-code HEAD
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/native-packages
+        with:
+          target: darwin-arm64
+      - run: pnpm build
+      - name: Observe baseline plain and sanitizer behavior
+        env:
+          SOURCE_LABEL: baseline
+          SOURCE_SHA: d9c9843fd0e362b9fb0ed5e0f32cd4d2389fc9f4
+        run: node "$RUNNER_TEMP/socket-diagnostic.mjs"
+
+      # Both revisions use the same host and SDK. Reports and the collector
+      # stay outside the checkout so checkout's clean cannot erase them.
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          persist-credentials: false
+      - name: Verify region source
+        run: |
+          test "$(git rev-parse HEAD)" = 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          git diff --exit-code HEAD
+      - run: pnpm install --frozen-lockfile
+      # This artifact's build job verified the unchanged region source
+      # before and after building. Its workflow commit is separate.
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-darwin-arm64
+          path: ${{ runner.temp }}/region-native
+          run-id: 41079002760
+          github-token: ${{ github.token }}
+      - run: tar -xzf "$RUNNER_TEMP/region-native/native-darwin-arm64.tar.gz"
+      - run: node packages/runtime-darwin-arm64/scripts/verify.mjs
+      - run: pnpm build
+      - name: Observe region head plain and sanitizer behavior
+        env:
+          SOURCE_LABEL: head
+          SOURCE_SHA: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+        run: node "$RUNNER_TEMP/socket-diagnostic.mjs"
+      - name: Report observed verdicts without hiding mismatches
+        if: always()
+        run: |
+          node --input-type=module <<'VERDICT'
+          import { readFileSync, appendFileSync } from "node:fs";
+          import { join } from "node:path";
+          const reports=["baseline","head"].map(label=>JSON.parse(readFileSync(join(process.env.RUNNER_TEMP,"socket-diagnostic",label,"summary.json"),"utf8")));
+          const rows=reports.flatMap(r=>r.observations.map(o=>[r.label,o.flavor,o.name,o.runs.filter(x=>x.result==="matches-oracle").length,o.runs.filter(x=>x.result==="mismatch").length,o.runs.filter(x=>x.result==="incomplete").length].join(" | ")));
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY,"| source | flavor | case | matches | mismatches | incomplete |\n|---|---|---|---:|---:|---:|\n"+rows.map(r=>"| "+r+" |").join("\n")+"\n\nTrace runs record event order; their completion is not a parity verdict.\n");
+          const bad=reports.some(r=>r.status!=="complete"||r.canonical.some(c=>c.code!==0||c.success!==true||c.case?.status!=="passed")||r.observations.some(o=>o.name!=="trace"&&o.runs.some(x=>x.result!=="matches-oracle")));
+          if(reports[0].fixtureSha256!==reports[1].fixtureSha256||JSON.stringify(reports[0].host)!==JSON.stringify(reports[1].host))throw Error("comparison inputs differ");
+          if(bad){console.error("[scriptc-darwin-socket] FAILED (exit 1): observed mismatch or incomplete proof; inspect diagnostic artifact");process.exitCode=1;}
+          VERDICT
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-socket-diagnostics
+          path: ${{ runner.temp }}/socket-diagnostic/*/summary.json
+          if-no-files-found: error
+          retention-days: 1
