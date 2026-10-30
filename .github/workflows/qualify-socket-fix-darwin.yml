@@ -1,0 +1,125 @@
+name: Qualify upstream Darwin socket fixture repair
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-socket-fix-darwin.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qualify-socket-fix-darwin
+  cancel-in-progress: false
+
+jobs:
+  sockets:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      SCRIPTC_NO_CACHE: "1"
+      SCRIPTC_TEST_SHARD: ""
+      SCRIPTC_TEST_WORKERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: |
+          test "$(git rev-parse HEAD)" = 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          git diff --exit-code HEAD
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-darwin-arm64
+          path: ${{ runner.temp }}/region-native
+          run-id: 41079002760
+          github-token: ${{ github.token }}
+      - run: |
+          tar -xzf "$RUNNER_TEMP/region-native/native-darwin-arm64.tar.gz"
+          node packages/runtime-darwin-arm64/scripts/verify.mjs
+          pnpm build
+      - name: Apply only the merged upstream fixture repair
+        run: |
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/vercel-labs/scriptc/10c1f11c8e27477fcb774a23f6261dd60abd4b03/tests/corpus/evolving-let-socket-optional-reads.cjs \
+            -o "$RUNNER_TEMP/upstream-socket.cjs"
+          node --input-type=module <<'VERIFY'
+          import { createHash } from "node:crypto";
+          import { copyFileSync, readFileSync } from "node:fs";
+          import { execFileSync } from "node:child_process";
+          const file="tests/corpus/evolving-let-socket-optional-reads.cjs";
+          const sha=path=>createHash("sha256").update(readFileSync(path)).digest("hex");
+          execFileSync("git",["diff","--exit-code","HEAD"],{stdio:"inherit"});
+          if(sha(file)!=="4c36acd248eaf741506c8d5352cb012206d529224ab0b37ca35786ea48cd9439")throw Error("original fixture differs");
+          const upstream=process.env.RUNNER_TEMP+"/upstream-socket.cjs";
+          if(sha(upstream)!=="5ee4721dd45713aea592c88f81735ddccf181ddb7a904499a53d758a1023afac")throw Error("upstream fixture differs");
+          copyFileSync(upstream,file);
+          VERIFY
+      - name: Canonical socket cases in plain and sanitizer modes
+        run: |
+          failed=0
+          unset SCRIPTC_TEST_OPTIMIZATION
+          for flavor in plain san; do
+            export SCRIPTC_SAN=""
+            if [ "$flavor" = san ]; then export SCRIPTC_SAN=1; fi
+            if ! pnpm test tests/harness/differential.test.ts \
+              -t '(evolving-let-socket-optional-reads\.cjs|6251-net-connect-poll-phase-order\.ts|net-server-socket-peer-close\.cjs)$' \
+              --reporter=default --reporter=json --outputFile="$RUNNER_TEMP/socket-$flavor.json"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+      - name: Verify coverage and restore the source fixture
+        if: always()
+        run: |
+          node --input-type=module <<'PROOF'
+          import { createHash } from "node:crypto";
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { execFileSync } from "node:child_process";
+          const fixture="tests/corpus/evolving-let-socket-optional-reads.cjs";
+          const head="0e17511aaa44ede74b06d6483a0f802d30e7846e";
+          const wanted=["evolving-let-socket-optional-reads.cjs","6251-net-connect-poll-phase-order.ts","net-server-socket-peer-close.cjs"].sort();
+          const report={head,upstreamFixtureCommit:"10c1f11c8e27477fcb774a23f6261dd60abd4b03",fixtureSha256:"5ee4721dd45713aea592c88f81735ddccf181ddb7a904499a53d758a1023afac",nativeArtifact:{run:41079002760,id:12989416775},node:process.version,status:"failed",flavors:[]};
+          const git=args=>execFileSync("git",args,{encoding:"utf8"}).trim();
+          try{
+            if(git(["rev-parse","HEAD"])!==head)throw Error("head changed");
+            if(git(["diff","--name-only","HEAD"])!==fixture)throw Error("unexpected source changes");
+            if(createHash("sha256").update(readFileSync(fixture)).digest("hex")!==report.fixtureSha256)throw Error("fixture changed");
+            for(const flavor of ["plain","san"]){
+              const data=JSON.parse(readFileSync(process.env.RUNNER_TEMP+"/socket-"+flavor+".json","utf8"));
+              const cases=data.testResults.flatMap(s=>s.assertionResults).filter(t=>t.status!=="pending"&&t.status!=="skipped"&&t.status!=="todo");
+              report.flavors.push({flavor,success:data.success,cases:cases.map(t=>({name:t.fullName,status:t.status,failures:t.failureMessages}))});
+              const names=cases.map(t=>wanted.find(n=>t.fullName.endsWith(" "+n))).sort();
+              if(!data.success||cases.some(t=>t.status!=="passed")||JSON.stringify(names)!==JSON.stringify(wanted))throw Error("socket coverage failed: "+flavor);
+            }
+            report.status="passed";
+          }catch(error){report.error=String(error);process.exitCode=1;}
+          finally{
+            try{
+              execFileSync("git",["restore","--source=HEAD","--",fixture]);
+              git(["diff","--exit-code","HEAD"]);
+              report.sourceRestored=true;
+            }catch(error){report.status="failed";report.restoreError=String(error);process.exitCode=1;}
+            writeFileSync(process.env.RUNNER_TEMP+"/socket-fix-summary.json",JSON.stringify(report,null,2)+"\n");
+            console.log(JSON.stringify(report));
+            if(process.exitCode)console.error("[scriptc-socket-fix] FAILED (exit 1)");
+          }
+          PROOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-socket-fix-proof
+          path: ${{ runner.temp }}/socket-fix-summary.json
+          if-no-files-found: error
+          retention-days: 1
