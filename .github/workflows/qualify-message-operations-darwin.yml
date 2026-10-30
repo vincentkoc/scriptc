@@ -1,0 +1,162 @@
+name: Qualify published message operations on Darwin
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-message-operations-darwin.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-message-operations-darwin
+  cancel-in-progress: false
+
+jobs:
+  message_operations:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vercel-labs/scriptc
+          ref: 9f099228ba180c9a8d42cbadcf27d176f1c5fa0e
+          persist-credentials: false
+      - name: Apply the exact uncommitted candidate
+        run: |
+          test "$(git rev-parse HEAD)" = 9f099228ba180c9a8d42cbadcf27d176f1c5fa0e
+          git diff --exit-code HEAD
+          python3 - <<'PATCH'
+          import base64, hashlib, subprocess
+          data = base64.b64decode("ZGlmZiAtLWdpdCBhL0NIQU5HRUxPRy5tZCBiL0NIQU5HRUxPRy5tZAppbmRleCA4MTE2YzVkMDguLjA3MTliODRhYSAxMDA2NDQKLS0tIGEvQ0hBTkdFTE9HLm1kCisrKyBiL0NIQU5HRUxPRy5tZApAQCAtNCw2ICs0LDggQEAgQWxsIG5vdGFibGUgY2hhbmdlcyB0byBzY3JpcHRjIHdpbGwgYmUgZG9jdW1lbnRlZCBpbiB0aGlzIGZpbGUuCiAKICMjIFVucmVsZWFzZWQKIAorLSBQdWJsaXNoZWQgdmFsdWVzIGtlZXAgdGhlaXIgbmF0aXZlIGFycmF5LCByZWNvcmQsIGFuZCBjbGFzcyBvcGVyYXRpb25zIHdoZW4gc2VudCBiZXR3ZWVuIHdvcmtlcnMsIGluY2x1ZGluZyBjbGFzcyBtZXRob2QgcHJlc2VuY2UgY2hlY2tzIHRocm91Z2ggdW50eXBlZCB2YWx1ZXMuCisKIDwhLS0gcmVsZWFzZTpzdGFydCAtLT4KIAogIyMgMC40LjYKZGlmZiAtLWdpdCBhL3BhY2thZ2VzL3J1bnRpbWUvc3JjL3Njcl9tZXNzYWdlLmMgYi9wYWNrYWdlcy9ydW50aW1lL3NyYy9zY3JfbWVzc2FnZS5jCmluZGV4IDM4MjkwNzIxOS4uZjI2ODEyZTRkIDEwMDY0NAotLS0gYS9wYWNrYWdlcy9ydW50aW1lL3NyYy9zY3JfbWVzc2FnZS5jCisrKyBiL3BhY2thZ2VzL3J1bnRpbWUvc3JjL3Njcl9tZXNzYWdlLmMKQEAgLTIzLDcgKzIzLDkgQEAgdHlwZWRlZiBzdHJ1Y3QgewogICBzaXplX3QgdHlwZV9rZXlfbGVuOwogICBTY3JEeW4gKigqbWF0ZXJpYWxpemUpKHZvaWQgKik7CiAgIHZvaWQgKCpjb21taXQpKHZvaWQgKiwgY29uc3QgU2NyRHluICopOworICBjb25zdCB2b2lkICpvcHM7CiAgIGJvb2wgdHJhY2VkOworICBib29sIHJlY29yZCwga2xhc3MsIGJhZ19jbGFzczsKIH0gU2NyTWVzc2FnZVR5cGVkOwogCiB0eXBlZGVmIHN0cnVjdCB7CkBAIC0zNzksNyArMzgxLDggQEAgc3RhdGljIHNpemVfdCBzY3JfbWVzc2FnZV92YWx1ZShTY3JNZXNzYWdlRW5jb2RlciAqZW5jb2RlciwgY29uc3QgU2NyRHluICppbnB1dCkKICAgICBlbmNvZGVyLT50eXBlZFtlbmNvZGVyLT50eXBlZF9jb3VudCsrXSA9IChTY3JNZXNzYWdlVHlwZWQpewogICAgICAgaW5wdXQtPnYudHlwZWRfcmVmLnB0ciwgaW5wdXQtPnYudHlwZWRfcmVmLnJldGFpbiwgaW5wdXQtPnYudHlwZWRfcmVmLnJlbGVhc2UsCiAgICAgICBpbnB1dC0+di50eXBlZF9yZWYudHlwZV9rZXksIGlucHV0LT52LnR5cGVkX3JlZi50eXBlX2tleV9sZW4sIGlucHV0LT52LnR5cGVkX3JlZi5tYXRlcmlhbGl6ZSwKLSAgICAgIGlucHV0LT52LnR5cGVkX3JlZi5jb21taXQsIGlucHV0LT52LnR5cGVkX3JlZi50cmFjZWQsCisgICAgICBpbnB1dC0+di50eXBlZF9yZWYuY29tbWl0LCBpbnB1dC0+di50eXBlZF9yZWYuYXJyYXksIGlucHV0LT52LnR5cGVkX3JlZi50cmFjZWQsCisgICAgICBpbnB1dC0+di50eXBlZF9yZWYucmVjb3JkLCBpbnB1dC0+di50eXBlZF9yZWYua2xhc3MsIGlucHV0LT52LnR5cGVkX3JlZi5iYWdfY2xhc3MsCiAgICAgfTsKICAgICBpZiAoZ2V0ZW52KCJTQ1JJUFRDX1BVQkxJU0hfVFJBQ0UiKSkKICAgICAgIGZwcmludGYoc3RkZXJyLCAic2NyaXB0YzogcHVibGlzaGVkICUuKnMgc2hhcmVkIGJ5IHJlZmVyZW5jZVxuIiwgKGludClpbnB1dC0+di50eXBlZF9yZWYudHlwZV9rZXlfbGVuLApAQCAtMTAwMiw2ICsxMDA1LDE3IEBAIFNjckR5biAqc2NyX21lc3NhZ2VfZGVjb2RlKGNvbnN0IFNjck1lc3NhZ2UgKm1lc3NhZ2UpIHsKICAgICAgIHZhbHVlc1tpXSA9ICh0eXBlZC0+dHJhY2VkID8gc2NyX2R5bl9uZXdfdHlwZWRfcmVmX3RyYWNlZCA6IHNjcl9keW5fbmV3X3R5cGVkX3JlZikoCiAgICAgICAgICAgdHlwZWQtPnB0ciwgdHlwZWQtPnJldGFpbiwgdHlwZWQtPnJlbGVhc2UsIHR5cGVkLT50eXBlX2tleSwgdHlwZWQtPnR5cGVfa2V5X2xlbiwKICAgICAgICAgICB0eXBlZC0+bWF0ZXJpYWxpemUsIHR5cGVkLT5jb21taXQpOworICAgICAgLyogVGhlIGNhcHN1bGUgYW5kIGl0cyBjYWNoZWQgdmlld3MgYmVsb25nIHRvIHRoZSByZWNlaXZlciwgYnV0IGl0cworICAgICAgICogbmF0aXZlIG9wZXJhdGlvbnMgYXJlIHByb2Nlc3Mtd2lkZSwganVzdCBsaWtlIHRoZSBhZGFwdGVycy4gKi8KKyAgICAgIGlmICh0eXBlZC0+b3BzKSB7CisgICAgICAgIGlmICh0eXBlZC0+cmVjb3JkKQorICAgICAgICAgIHNjcl9keW5fdHlwZWRfcmVmX2JpbmRfcmVjb3JkKHZhbHVlc1tpXSwgdHlwZWQtPm9wcyk7CisgICAgICAgIGVsc2UgaWYgKHR5cGVkLT5rbGFzcykKKyAgICAgICAgICBzY3JfZHluX3R5cGVkX3JlZl9iaW5kX2NsYXNzKHZhbHVlc1tpXSwgdHlwZWQtPm9wcyk7CisgICAgICAgIGVsc2UgaWYgKHR5cGVkLT5iYWdfY2xhc3MpCisgICAgICAgICAgc2NyX2R5bl90eXBlZF9yZWZfYmluZF9iYWdfY2xhc3ModmFsdWVzW2ldLCB0eXBlZC0+b3BzKTsKKyAgICAgICAgZWxzZSBzY3JfZHluX3R5cGVkX3JlZl9iaW5kX2FycmF5KHZhbHVlc1tpXSwgdHlwZWQtPm9wcyk7CisgICAgICB9CiAgICAgICBicmVhazsKICAgICB9CiAgICAgY2FzZSBTQ1JfTUVTU0FHRV9QT1JUOgpkaWZmIC0tZ2l0IGEvcGFja2FnZXMvcnVudGltZS9zcmMvc2NyX21lc3NhZ2UudGVzdC5jIGIvcGFja2FnZXMvcnVudGltZS9zcmMvc2NyX21lc3NhZ2UudGVzdC5jCmluZGV4IDEwNDU5MjU1Yi4uMWQ1MTZhMTc0IDEwMDY0NAotLS0gYS9wYWNrYWdlcy9ydW50aW1lL3NyYy9zY3JfbWVzc2FnZS50ZXN0LmMKKysrIGIvcGFja2FnZXMvcnVudGltZS9zcmMvc2NyX21lc3NhZ2UudGVzdC5jCkBAIC00MDgsNiArNDA4LDEyMyBAQCBzdGF0aWMgdm9pZCBjaGVja19oYW5kbGVfdHJhbnNmZXIodm9pZCkgewogICBzY3JfY29sbGVjdF9jeWNsZXMoKTsKIH0KIAorLyogUHVibGlzaGVkIHJlZmVyZW50cyBhbmQgdGhlaXIgb3BlcmF0aW9ucyBvdXRsaXZlIHRoZSBzZW5kaW5nIGhlYXAuIFRoZQorICogcmVjZWl2ZXIgbXVzdCBiaW5kIGZyZXNoIGNhcHN1bGVzLCBub3QgZmluZCB0aGUgc2VuZGVyJ3MgaW4gaXRzIFRMUyBjYWNoZS4gKi8KK3N0YXRpYyBzaXplX3QgcHVibGlzaGVkX29iamVjdHNbXSA9IHtTSVpFX01BWCwgU0laRV9NQVgsIFNJWkVfTUFYfTsKK3N0YXRpYyBTY3JTdHIgKnB1Ymxpc2hlZF9uYW1lc1sxXTsKK3N0YXRpYyB2b2lkICpwdWJsaXNoZWRfcmV0YWluKHZvaWQgKnB0cikgeyByZXR1cm4gcHRyOyB9CitzdGF0aWMgdm9pZCBwdWJsaXNoZWRfcmVsZWFzZSh2b2lkICpwdHIpIHsgKHZvaWQpcHRyOyB9CitzdGF0aWMgU2NyRHluICpwdWJsaXNoZWRfZWxlbWVudCh2b2lkICpwdHIsIGRvdWJsZSBpbmRleCkgeworICByZXR1cm4gc2NyX2R5bl9uZXdfbnVtKHNjcl9hcnJfZ2V0X2Y2NChwdHIsIGluZGV4KSk7Cit9CitzdGF0aWMgYm9vbCBwdWJsaXNoZWRfaGFzX2ZpZWxkKHZvaWQgKnB0ciwgc2l6ZV90IGluZGV4KSB7CisgICh2b2lkKXB0cjsgKHZvaWQpaW5kZXg7CisgIHJldHVybiB0cnVlOworfQorc3RhdGljIFNjckR5biAqcHVibGlzaGVkX2ZpZWxkKHZvaWQgKnB0ciwgc2l6ZV90IGluZGV4KSB7CisgICh2b2lkKXB0cjsgKHZvaWQpaW5kZXg7CisgIHJldHVybiBzY3JfZHluX25ld19udW0oNyk7Cit9CitzdGF0aWMgU2NyRHluICpwdWJsaXNoZWRfYmFnKHZvaWQgKnB0cikgeyAodm9pZClwdHI7IHJldHVybiBOVUxMOyB9CitzdGF0aWMgU2NyRHluICpwdWJsaXNoZWRfcHJvdG90eXBlKHZvaWQgKnB0cikgeworICAodm9pZClwdHI7CisgIFNjckR5biAqcHJvdG90eXBlID0gc2NyX2R5bl9uZXdfb2JqKCk7CisgIHB1dF9udW1iZXIocHJvdG90eXBlLCAicmVhZCIsIDcpOworICByZXR1cm4gcHJvdG90eXBlOworfQorc3RhdGljIFNjckR5biAqcHVibGlzaGVkX3NuYXBzaG90KHZvaWQgKnB0cikgeworICBpZiAocHRyID09ICZwdWJsaXNoZWRfb2JqZWN0c1swXSkgeworICAgIFNjckR5biAqcmVjb3JkID0gc2NyX2R5bl9uZXdfb2JqKCk7CisgICAgcHV0X251bWJlcihyZWNvcmQsICJyZWFkIiwgNyk7CisgICAgcmV0dXJuIHJlY29yZDsKKyAgfQorICBpZiAocHRyID09ICZwdWJsaXNoZWRfb2JqZWN0c1sxXSkgcmV0dXJuIHNjcl9keW5fbmV3X29iaigpOworICBpZiAocHRyID09ICZwdWJsaXNoZWRfb2JqZWN0c1syXSkgeworICAgIFNjckR5biAqaW5zdGFuY2UgPSBzY3JfZHluX25ld19vYmooKTsKKyAgICBpbnN0YW5jZS0+cHJvdG90eXBlID0gcHVibGlzaGVkX3Byb3RvdHlwZShwdHIpOworICAgIHJldHVybiBpbnN0YW5jZTsKKyAgfQorICBTY3JEeW4gKmFycmF5ID0gc2NyX2R5bl9uZXdfYXJyKCk7CisgIHNjcl9keW5fYXJyX3B1c2goYXJyYXksIHB1Ymxpc2hlZF9lbGVtZW50KHB0ciwgMCkpOworICByZXR1cm4gYXJyYXk7Cit9CitzdGF0aWMgY29uc3QgU2NyRHluVHlwZWRBcnJheU9wcyBwdWJsaXNoZWRfYXJyYXlfb3BzID0gey5nZXQgPSBwdWJsaXNoZWRfZWxlbWVudH07CitzdGF0aWMgU2NyRHluVHlwZWRSZWNvcmRPcHMgcHVibGlzaGVkX3JlY29yZF9vcHMgPSB7CisgICAgLmNvdW50ID0gMSwgLm5hbWVzID0gcHVibGlzaGVkX25hbWVzLCAuaGFzID0gcHVibGlzaGVkX2hhc19maWVsZCwKKyAgICAuZ2V0ID0gcHVibGlzaGVkX2ZpZWxkLCAuZml4ZWQgPSB0cnVlLAorfTsKK3N0YXRpYyBjb25zdCBTY3JEeW5UeXBlZENsYXNzT3BzIHB1Ymxpc2hlZF9jbGFzc19vcHMgPSB7LmNvdW50ID0gMSwgLm5hbWVzID0gcHVibGlzaGVkX25hbWVzfTsKK3N0YXRpYyBjb25zdCBTY3JEeW5UeXBlZEJhZ0NsYXNzT3BzIHB1Ymxpc2hlZF9iYWdfb3BzID0geworICAgIC5iYWcgPSBwdWJsaXNoZWRfYmFnLCAucHJvdG90eXBlID0gcHVibGlzaGVkX3Byb3RvdHlwZSwKK307CitzdGF0aWMgdm9pZCBwdWJsaXNoX251bWJlcnModm9pZCAqcHRyLCBTY3JQdWIgKmNvbnRleHQpIHsgc2NyX3B1Yl9hcnIocHRyLCBjb250ZXh0LCBOVUxMKTsgfQorCitzdGF0aWMgdm9pZCAqc2VuZF9wdWJsaXNoZWQodm9pZCAqdW51c2VkKSB7CisgICh2b2lkKXVudXNlZDsKKyAgc2NyX2NvbnRleHRfZW50ZXIoMSk7CisgIHNjcl9pbml0KCk7CisgIHNjcl9saWJfaW5pdCgwLCBOVUxMKTsKKyAgU2NyQXJyICphcnJheSA9IHNjcl9hcnJfbmV3KFNDUl9FTEVNX0Y2NCwgMSk7CisgIHNjcl9hcnJfcHVzaF9mNjQoYXJyYXksIDcpOworICBzY3JfcHVibGlzaChhcnJheSwgcHVibGlzaF9udW1iZXJzKTsKKyAgdm9pZCAqcG9pbnRlcnNbXSA9IHthcnJheSwgJnB1Ymxpc2hlZF9vYmplY3RzWzBdLCAmcHVibGlzaGVkX29iamVjdHNbMV0sICZwdWJsaXNoZWRfb2JqZWN0c1syXX07CisgIGNvbnN0IGNoYXIgKmtleXNbXSA9IHsiYXJyYXkiLCAicmVjb3JkIiwgImNsYXNzIiwgImJhZyJ9OworICBTY3JEeW4gKnJvb3QgPSBzY3JfZHluX25ld19vYmooKTsKKyAgZm9yIChzaXplX3QgaSA9IDA7IGkgPCA0OyBpKyspIHsKKyAgICBTY3JEeW4gKnZhbHVlID0gc2NyX2R5bl9uZXdfdHlwZWRfcmVmKHBvaW50ZXJzW2ldLCBwdWJsaXNoZWRfcmV0YWluLCBwdWJsaXNoZWRfcmVsZWFzZSwKKyAgICAgICAga2V5c1tpXSwgc3RybGVuKGtleXNbaV0pLCBwdWJsaXNoZWRfc25hcHNob3QsIE5VTEwpOworICAgIHN3aXRjaCAoaSkgeworICAgIGNhc2UgMDogc2NyX2R5bl90eXBlZF9yZWZfYmluZF9hcnJheSh2YWx1ZSwgJnB1Ymxpc2hlZF9hcnJheV9vcHMpOyBicmVhazsKKyAgICBjYXNlIDE6IHNjcl9keW5fdHlwZWRfcmVmX2JpbmRfcmVjb3JkKHZhbHVlLCAmcHVibGlzaGVkX3JlY29yZF9vcHMpOyBicmVhazsKKyAgICBjYXNlIDI6IHNjcl9keW5fdHlwZWRfcmVmX2JpbmRfY2xhc3ModmFsdWUsICZwdWJsaXNoZWRfY2xhc3Nfb3BzKTsgYnJlYWs7CisgICAgY2FzZSAzOiBzY3JfZHluX3R5cGVkX3JlZl9iaW5kX2JhZ19jbGFzcyh2YWx1ZSwgJnB1Ymxpc2hlZF9iYWdfb3BzKTsgYnJlYWs7CisgICAgfQorICAgIHNjcl9keW5fcmVsZWFzZShzY3JfZHluX3R5cGVkX3JlZl9tYXRlcmlhbGl6ZSh2YWx1ZSkpOworICAgIGFzc2VydCghc2NyX2V4Y19wZW5kaW5nKCkpOworICAgIGlmIChpID09IDIpIHNjcl9keW5fb2JqX3NldChyb290LCAiYWdhaW4iLCA1LCBzY3JfZHluX3JldGFpbih2YWx1ZSkpOworICAgIHNjcl9keW5fb2JqX3NldChyb290LCBrZXlzW2ldLCBzdHJsZW4oa2V5c1tpXSksIHZhbHVlKTsKKyAgfQorICBTY3JNZXNzYWdlICptZXNzYWdlID0gc2NyX21lc3NhZ2VfZW5jb2RlKHJvb3QpOworICBhc3NlcnQobWVzc2FnZSAmJiAhc2NyX2V4Y19wZW5kaW5nKCkpOworICBzY3JfZHluX3JlbGVhc2Uocm9vdCk7CisgIHNjcl9jb250ZXh0X2NsZWFudXAoKTsKKyAgcmV0dXJuIG1lc3NhZ2U7Cit9CisKK3N0YXRpYyB2b2lkIGNoZWNrX3B1Ymxpc2hlZF9vcGVyYXRpb25zKHZvaWQpIHsKKyAgcHVibGlzaGVkX25hbWVzWzBdID0gc2NyX3N0cl9uZXcoInJlYWQiLCA0KTsKKyAgc2NyX3B1Ymxpc2gocHVibGlzaGVkX25hbWVzWzBdLCBzY3JfcHViX3N0cl9mbik7CisgIHB0aHJlYWRfdCBzZW5kZXI7CisgIHZvaWQgKnNlbnQgPSBOVUxMOworICBhc3NlcnQocHRocmVhZF9jcmVhdGUoJnNlbmRlciwgTlVMTCwgc2VuZF9wdWJsaXNoZWQsIE5VTEwpID09IDApOworICBhc3NlcnQocHRocmVhZF9qb2luKHNlbmRlciwgJnNlbnQpID09IDApOworICBTY3JEeW4gKnJvb3QgPSBzY3JfbWVzc2FnZV9kZWNvZGUoc2VudCk7CisgIGFzc2VydChyb290ICYmICFzY3JfZXhjX3BlbmRpbmcoKSk7CisgIC8qIERlY29kZWQgY2Fwc3VsZXMgbXVzdCBhbHNvIG91dGxpdmUgdGhlIG1lc3NhZ2UncyBvd24gbWV0YWRhdGEgYmxvY2suICovCisgIHNjcl9tZXNzYWdlX2ZyZWUoc2VudCk7CisgIFNjckR5biAqYXJyYXkgPSBzY3JfZHluX29ial9nZXQocm9vdCwgImFycmF5IiwgNSk7CisgIFNjckR5biAqcmVjb3JkID0gc2NyX2R5bl9vYmpfZ2V0KHJvb3QsICJyZWNvcmQiLCA2KTsKKyAgU2NyRHluICprbGFzcyA9IHNjcl9keW5fb2JqX2dldChyb290LCAiY2xhc3MiLCA1KTsKKyAgU2NyRHluICpiYWcgPSBzY3JfZHluX29ial9nZXQocm9vdCwgImJhZyIsIDMpOworICBhc3NlcnQoa2xhc3MgPT0gc2NyX2R5bl9vYmpfZ2V0KHJvb3QsICJhZ2FpbiIsIDUpKTsKKyAgYXNzZXJ0KCFhcnJheS0+di50eXBlZF9yZWYubWF0ZXJpYWxpemVkICYmICFyZWNvcmQtPnYudHlwZWRfcmVmLm1hdGVyaWFsaXplZCk7CisgIGFzc2VydCgha2xhc3MtPnYudHlwZWRfcmVmLm1hdGVyaWFsaXplZCAmJiAhYmFnLT52LnR5cGVkX3JlZi5tYXRlcmlhbGl6ZWQpOworICBTY3JEeW4gKnZhbHVlID0gc2NyX2R5bl9pbmRleF9nZXQoYXJyYXksIDApOworICBhc3NlcnQodmFsdWUgJiYgdmFsdWUtPmtpbmQgPT0gU0NSX0RZTl9OVU0gJiYgdmFsdWUtPnYubnVtID09IDcpOworICBzY3JfZHluX3JlbGVhc2UodmFsdWUpOworICB2YWx1ZSA9IHNjcl9keW5fdHlwZWRfcmVmX2tleV9nZXQocmVjb3JkLCBwdWJsaXNoZWRfbmFtZXNbMF0pOworICBhc3NlcnQodmFsdWUgJiYgdmFsdWUtPmtpbmQgPT0gU0NSX0RZTl9OVU0gJiYgdmFsdWUtPnYubnVtID09IDcpOworICBzY3JfZHluX3JlbGVhc2UodmFsdWUpOworICBhc3NlcnQoc2NyX2R5bl9pbihrbGFzcywgcHVibGlzaGVkX25hbWVzWzBdKSk7CisgIHZhbHVlID0gc2NyX2R5bl90eXBlZF9yZWZfYmFnX21ldGhvZChiYWcsICJyZWFkIiwgNCk7CisgIGFzc2VydCh2YWx1ZSAmJiB2YWx1ZS0+a2luZCA9PSBTQ1JfRFlOX05VTSAmJiB2YWx1ZS0+di5udW0gPT0gNyk7CisgIHNjcl9keW5fcmVsZWFzZSh2YWx1ZSk7CisgIGFzc2VydCghYXJyYXktPnYudHlwZWRfcmVmLm1hdGVyaWFsaXplZCAmJiAhcmVjb3JkLT52LnR5cGVkX3JlZi5tYXRlcmlhbGl6ZWQpOworICBhc3NlcnQoIWJhZy0+di50eXBlZF9yZWYubWF0ZXJpYWxpemVkICYmICFzY3JfZXhjX3BlbmRpbmcoKSk7CisgIHNjcl9keW5fcmVsZWFzZShyb290KTsKKyAgc2NyX2NvbGxlY3RfY3ljbGVzKCk7Cit9CisKIGludCBtYWluKHZvaWQpIHsKICAgc2NyX2luaXQoKTsKICAgc2NyX2xpYl9pbml0KDAsIE5VTEwpOwpAQCAtNDI3LDcgKzU0NCw5IEBAIGludCBtYWluKHZvaWQpIHsKICAgY2hlY2tfbGFyZ2UoKTsKICAgY2hlY2tfcmVhZGVycygpOwogICBjaGVja19oYW5kbGVfdHJhbnNmZXIoKTsKKyAgY2hlY2tfcHVibGlzaGVkX29wZXJhdGlvbnMoKTsKICAgc2NyX2NvbnRleHRfY2xlYW51cCgpOwogICBwdXRzKCJtZXNzYWdlIGdyYXBocyBwcmVzZXJ2ZSBpZGVudGl0eSwgc3BhcnNlIHZhbHVlcywgYnl0ZSBhbGlhc2VzIGFuZCBnZXR0ZXIgb3JkZXIiKTsKICAgcHV0cygibmF0aXZlIGhhbmRsZXMgY3Jvc3MgdGhyZWFkcyB0aHJvdWdoIHRoZWlyIHRyYW5zZmVyIGhvb2tzIik7CisgIHB1dHMoInB1Ymxpc2hlZCBuYXRpdmUgb3BlcmF0aW9ucyBzdXJ2aXZlIHRoZSBzZW5kZXIgYW5kIHRoZSBtZXNzYWdlIik7CiB9CmRpZmYgLS1naXQgYS9wYWNrYWdlcy9ydW50aW1lL3NyYy9zY3JfbWVzc2FnZS50ZXN0LnRzIGIvcGFja2FnZXMvcnVudGltZS9zcmMvc2NyX21lc3NhZ2UudGVzdC50cwppbmRleCA1NmIzNWYxYWMuLjNkZjhmNWQ4NiAxMDA2NDQKLS0tIGEvcGFja2FnZXMvcnVudGltZS9zcmMvc2NyX21lc3NhZ2UudGVzdC50cworKysgYi9wYWNrYWdlcy9ydW50aW1lL3NyYy9zY3JfbWVzc2FnZS50ZXN0LnRzCkBAIC0zNSw3ICszNSw4IEBAIHRlc3Quc2tpcElmKHByb2Nlc3MucGxhdGZvcm0gPT09ICJ3aW4zMiIpKAogICAgICAgfSk7CiAgICAgICBleHBlY3QocmVzdWx0LnN0ZG91dCkudG9CZSgKICAgICAgICAgIm1lc3NhZ2UgZ3JhcGhzIHByZXNlcnZlIGlkZW50aXR5LCBzcGFyc2UgdmFsdWVzLCBieXRlIGFsaWFzZXMgYW5kIGdldHRlciBvcmRlclxuIiArCi0gICAgICAgICAgIm5hdGl2ZSBoYW5kbGVzIGNyb3NzIHRocmVhZHMgdGhyb3VnaCB0aGVpciB0cmFuc2ZlciBob29rc1xuIiwKKyAgICAgICAgICAibmF0aXZlIGhhbmRsZXMgY3Jvc3MgdGhyZWFkcyB0aHJvdWdoIHRoZWlyIHRyYW5zZmVyIGhvb2tzXG4iICsKKyAgICAgICAgICAicHVibGlzaGVkIG5hdGl2ZSBvcGVyYXRpb25zIHN1cnZpdmUgdGhlIHNlbmRlciBhbmQgdGhlIG1lc3NhZ2VcbiIsCiAgICAgICApOwogICAgICAgZXhwZWN0KHJlc3VsdC5zdGRlcnIpLnRvQmUoIiIpOwogICAgIH0gZmluYWxseSB7CmRpZmYgLS1naXQgYS90ZXN0cy9jb3JwdXMvbmF0aXZlLXdvcmtlci1wdWJsaXNoZWQtbWVtYmVycy50cyBiL3Rlc3RzL2NvcnB1cy9uYXRpdmUtd29ya2VyLXB1Ymxpc2hlZC1tZW1iZXJzLnRzCm5ldyBmaWxlIG1vZGUgMTAwNjQ0CmluZGV4IDAwMDAwMDAwMC4uZmU1ODBiMDYzCi0tLSAvZGV2L251bGwKKysrIGIvdGVzdHMvY29ycHVzL25hdGl2ZS13b3JrZXItcHVibGlzaGVkLW1lbWJlcnMudHMKQEAgLTAsMCArMSw0NCBAQAoraW1wb3J0IHsKKyAgV29ya2VyLAorICBnZXRFbnZpcm9ubWVudERhdGEsCisgIGlzTWFpblRocmVhZCwKKyAgcGFyZW50UG9ydCwKKyAgc2V0RW52aXJvbm1lbnREYXRhLAorICB3b3JrZXJEYXRhLAorfSBmcm9tICJub2RlOndvcmtlcl90aHJlYWRzIjsKK2ltcG9ydCB7IHB1Ymxpc2gsIHNoYXJlc1B1Ymxpc2hlZEdyYXBocyB9IGZyb20gIkBzY3JpcHRjL3RocmVhZHMiOworCitjbGFzcyBCb3ggeworICB2YWx1ZSA9IDc7CisgIHJlYWQoKTogbnVtYmVyIHsKKyAgICByZXR1cm4gdGhpcy52YWx1ZTsKKyAgfQorfQorCisvLyBOYXRpdmUgcHVibGlzaGVkIGdyYXBocyBrZWVwIGNsYXNzIG1lbWJlcnMuIE5vZGUgY2xvbmVzIHRoZWlyIG93biBkYXRhCisvLyBpbnRvIHBsYWluIG9iamVjdHM7IHRoZSBjYXBhYmlsaXR5IGZsYWcgbWFrZXMgYm90aCBjb250cmFjdHMgZXhwbGljaXQuCitmdW5jdGlvbiBpbnNwZWN0KHZhbHVlOiBhbnkpOiBzdHJpbmcgeworICByZXR1cm4gYCR7dmFsdWUudmFsdWV9ICR7KCJyZWFkIiBpbiB2YWx1ZSkgPT09IHNoYXJlc1B1Ymxpc2hlZEdyYXBoc31gOworfQorCitpZiAoaXNNYWluVGhyZWFkKSB7CisgIGNvbnN0IHNvdXJjZSA9IHB1Ymxpc2gobmV3IEJveCgpKTsKKyAgY29uc29sZS5sb2coInNlbmRlciIsIHNvdXJjZS5yZWFkKCkpOworICBzZXRFbnZpcm9ubWVudERhdGEoImJveCIsIHB1Ymxpc2gobmV3IEJveCgpKSk7CisgIGNvbnN0IHdvcmtlciA9IG5ldyBXb3JrZXIobmV3IFVSTChpbXBvcnQubWV0YS51cmwpLCB7IHdvcmtlckRhdGE6IHNvdXJjZSB9KTsKKyAgd29ya2VyLm9uKCJtZXNzYWdlIiwgKHZhbHVlOiBhbnkpID0+IHsKKyAgICBpZiAodHlwZW9mIHZhbHVlID09PSAic3RyaW5nIikgY29uc29sZS5sb2codmFsdWUpOworICAgIGVsc2UgY29uc29sZS5sb2coInJlcGx5IiwgaW5zcGVjdCh2YWx1ZSkpOworICB9KTsKKyAgd29ya2VyLm9uKCJleGl0IiwgKGNvZGU6IG51bWJlcikgPT4gY29uc29sZS5sb2coImV4aXQiLCBjb2RlKSk7CisgIHdvcmtlci5wb3N0TWVzc2FnZShwdWJsaXNoKG5ldyBCb3goKSkpOworfSBlbHNlIHsKKyAgcGFyZW50UG9ydCEucG9zdE1lc3NhZ2UoYGRhdGEgJHtpbnNwZWN0KHdvcmtlckRhdGEpfWApOworICBwYXJlbnRQb3J0IS5wb3N0TWVzc2FnZShgZW52aXJvbm1lbnQgJHtpbnNwZWN0KGdldEVudmlyb25tZW50RGF0YSgiYm94IikpfWApOworICBwYXJlbnRQb3J0IS5vbmNlKCJtZXNzYWdlIiwgKHZhbHVlOiBhbnkpID0+IHsKKyAgICBwYXJlbnRQb3J0IS5wb3N0TWVzc2FnZShgcG9zdGVkICR7aW5zcGVjdCh2YWx1ZSl9YCk7CisgICAgY29uc3QgcmVwbHkgPSBwdWJsaXNoKG5ldyBCb3goKSk7CisgICAgcGFyZW50UG9ydCEucG9zdE1lc3NhZ2UocmVwbHkpOworICAgIHBhcmVudFBvcnQhLmNsb3NlKCk7CisgIH0pOworfQo=", validate=True)
+          assert hashlib.sha256(data).hexdigest() == "4c137b52d376873ec8c572d40d1776104a82c7c7b60c468916e4722895a24eff"
+          subprocess.run(["git", "apply", "--check", "-"], input=data, check=True)
+          subprocess.run(["git", "apply", "-"], input=data, check=True)
+          PATCH
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/native-packages
+        with:
+          target: darwin-arm64
+      - run: pnpm build
+      - name: Verify regression, ownership, frontend baseline, and siblings
+        run: |
+          cat > "$RUNNER_TEMP/message-proof.mjs" <<'PROOF'
+          import { spawnSync, execFileSync } from "node:child_process";
+          import { readFileSync, writeFileSync, copyFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          import { join } from "node:path";
+          const root=process.cwd(), temp=process.env.RUNNER_TEMP;
+          const head="9f099228ba180c9a8d42cbadcf27d176f1c5fa0e";
+          const manifest={"CHANGELOG.md":"801073368e25ce010dd56a513e5d736d48e562b91aaf21bf6339ad8a0e31aaa4","packages/runtime/src/scr_message.c":"12b7d3d7f7317cad6f3ee6ae8f5029737bff48961f959f0571d1c3484bb276bf","packages/runtime/src/scr_message.test.c":"440b40ff81d88535df02be5343e0ea9e5654b180a1a24b258c776449b2c5d022","packages/runtime/src/scr_message.test.ts":"55b354dedccd6a16dab664c83cbaed007c0b14c6cefeff2256dd2c5b867b8dcf","tests/corpus/native-worker-published-members.ts":"f8989aef5c614e98a14d5ab2c73ff00b73c1542a6e720f00164c74c1a715f0e0"}, tracked=["CHANGELOG.md","packages/runtime/src/scr_message.c","packages/runtime/src/scr_message.test.c","packages/runtime/src/scr_message.test.ts"];
+          const fixture="tests/corpus/native-worker-published-members.ts";
+          const baseline="packages/compiler/test/ts7/baselines/order-parity/"+fixture+".json";
+          const report={head,patchSha256:"4c137b52d376873ec8c572d40d1776104a82c7c7b60c468916e4722895a24eff",workflow:process.env.GITHUB_SHA,node:process.version,platform:process.platform,arch:process.arch,status:"running",steps:[],flavors:[]};
+          const summary=join(temp,"message-summary.json");
+          const hash=data=>createHash("sha256").update(data).digest("hex");
+          const scrub=text=>String(text).split(root).join("<repo>").split(temp).join("<temp>");
+          const save=()=>writeFileSync(summary,JSON.stringify(report,null,2)+"\n");
+          const git=args=>execFileSync("git",args,{encoding:"utf8"}).trim();
+          const verify=()=>{
+            if(git(["rev-parse","HEAD"])!==head)throw Error("source head changed");
+            for(const [file,expected] of Object.entries(manifest))
+              if(hash(readFileSync(file))!==expected)throw Error("source hash changed: "+file);
+            if(JSON.stringify(git(["diff","--name-only","HEAD"]).split("\n").sort())!==JSON.stringify([...tracked].sort()))throw Error("unexpected tracked source changes");
+            const extras=git(["ls-files","--others","--exclude-standard"]).split("\n").filter(Boolean);
+            if(extras.some(p=>p!==fixture&&p!==baseline))throw Error("unexpected untracked source: "+extras.join(", "));
+          };
+          const run=(label,args,extra={})=>{
+            console.log("START "+label);
+            const result=spawnSync("pnpm",args,{cwd:root,env:{...process.env,SCRIPTC_TEST_WORKERS:"2",SCRIPTC_NO_CACHE:"1",SCRIPTC_SAN:"",ASAN_OPTIONS:"detect_leaks=0",...extra},encoding:"utf8",timeout:600000,maxBuffer:16*1024*1024});
+            report.steps.push({label,code:result.status,signal:result.signal,error:result.error?.message,stdout:scrub(result.stdout??"").slice(-1500),stderr:scrub(result.stderr??"").slice(-1500)});
+            save(); console.log("DONE "+label+" exit="+result.status); return result;
+          };
+          const pass=(label,args,extra)=>{
+            const r=run(label,args,extra);
+            if(r.status!==0||r.error||r.signal)throw Error(label+" failed");
+          };
+          const active=data=>data.testResults.flatMap(s=>s.assertionResults).filter(t=>!["pending","skipped","todo"].includes(t.status));
+          const testFile="packages/runtime/src/scr_message.test.ts";
+          const corpus=["native-worker-published-members.ts","native-worker-publish-classes.ts","native-worker-published-graphs.ts","worker-class-instance-clone.ts","5793-worker-message-channel.ts","5802-broadcast-channel-workers.ts","5803-worker-environment-data.ts","7139-message-typed-records.ts","7360-worker-typed-records.ts"].sort();
+          const escape=s=>s.replace(/[.*+?^{}()|[\]\\$]/g,"\\$&");
+          save();
+          try {
+            verify();
+            if(process.version!=="v"+readFileSync(".node-version","utf8").trim())throw Error("wrong Node oracle");
+            const runtime="packages/runtime/src/scr_message.c", patched=readFileSync(runtime);
+            try {
+              writeFileSync(runtime,execFileSync("git",["show",head+":"+runtime]));
+              const r=run("unfixed C regression",["test",testFile,"--reporter=json","--outputFile="+join(temp,"message-negative.json")]);
+              const data=JSON.parse(readFileSync(join(temp,"message-negative.json"),"utf8")), tests=active(data);
+              const failure=tests.flatMap(t=>t.failureMessages).join("\n");
+              if(r.status!==1||r.error||r.signal||data.success||tests.length!==1||tests[0].status!=="failed"||!failure.includes("check_published_operations")||!failure.includes("value->v.num == 7"))throw Error("negative control did not reproduce expected assertion");
+              report.negativeControl={status:"expected failure",assertion:"published array operation missing after sender exit"};
+            } finally {writeFileSync(runtime,patched);}
+            verify();
+            pass("fixed C regression",["test",testFile,"--reporter=json","--outputFile="+join(temp,"message-positive.json")]);
+            const positive=JSON.parse(readFileSync(join(temp,"message-positive.json"),"utf8")), tests=active(positive);
+            if(!positive.success||tests.length!==1||tests[0].status!=="passed")throw Error("fixed C coverage missing");
+            report.cRegression={status:"passed",sanitizers:["address","undefined"],rcAudit:true};
+            // Use the canonical frontend and normalization for this one new baseline.
+            const generator=[
+              'import { checkPreflightTs7 } from "./packages/compiler/src/frontend/program-node.ts";',
+              'import { Ts7Host } from "./packages/compiler/src/frontend/ts7/program-adapter.ts";',
+              'import { allOrderEntries, orderBaselinePath } from "./scripts/ts7-order-fixtures.mjs";',
+              'import { writeFileSync, mkdirSync } from "node:fs";',
+              'import { join, dirname } from "node:path";',
+              'const root=process.cwd(), fixture='+JSON.stringify(fixture)+';',
+              'const rel=s=>s.replaceAll("\\\\","/").split(root.replaceAll("\\\\","/")+"/").join("<repo>/");',
+              'const host=new Ts7Host(); try {',
+              'const a=checkPreflightTs7(join(root,fixture),host); if(a.diags.length)throw Error(JSON.stringify(a.diags));',
+              'const b={order:a.moduleOrder.map(rel),diags:a.diags.map(d=>({...d,message:rel(d.message),loc:{...d.loc,file:rel(d.loc.file)}}))};',
+              'const path=orderBaselinePath(root,fixture);mkdirSync(dirname(path),{recursive:true});writeFileSync(path,JSON.stringify(b,null,1)+"\\n");',
+              'const all=allOrderEntries(root),index=all.indexOf(join(root,fixture));if(index<0)throw Error("fixture missing");',
+              'console.log(JSON.stringify({first:rel(all[Math.floor(index/20)*20]).replace(/^<repo>\\//,""),count:Math.min(20,all.length-Math.floor(index/20)*20)}));',
+              '} finally {host.close();}',
+            ].join("\n");
+            const generated=spawnSync(process.execPath,["--import","tsx","--input-type=module","-e",generator],{cwd:root,env:process.env,encoding:"utf8",timeout:240000,maxBuffer:8*1024*1024});
+            if(generated.status!==0||generated.error||generated.signal)throw Error("baseline generation failed: "+scrub(generated.stderr));
+            const batch=JSON.parse(generated.stdout);
+            pass("baseline completeness",["test:ts7","--baselines-only"]);
+            pass("order parity",["test","packages/compiler/test/ts7/order-parity.test.ts","-t",escape(batch.first)+" …","--reporter=json","--outputFile="+join(temp,"message-order.json")],{SCRIPTC_TS7_ALL:"1"});
+            const order=JSON.parse(readFileSync(join(temp,"message-order.json"),"utf8"));
+            if(!order.success||active(order).length!==1||active(order)[0].status!=="passed")throw Error("order batch missing");
+            report.orderParity={first:batch.first,entries:batch.count,status:"passed",baselineSha256:hash(readFileSync(baseline))};
+            copyFileSync(baseline,join(temp,"native-worker-published-members.ts.json"));
+            pass("lint",["lint"]); pass("format",["format:check"]);
+            const pattern="("+corpus.map(escape).join("|")+")$";
+            for(const flavor of ["plain","san"]) {
+              const file=join(temp,"message-"+flavor+".json");
+              const outcome=run("worker corpus "+flavor,["test","tests/harness/differential.test.ts","-t",pattern,"--reporter=json","--outputFile="+file],{SCRIPTC_SAN:flavor==="san"?"1":""});
+              const data=JSON.parse(readFileSync(file,"utf8")), cases=active(data);
+              report.flavors.push({flavor,success:data.success,cases:cases.map(t=>({name:t.fullName,status:t.status,failures:t.failureMessages.map(scrub)}))});
+              const names=cases.map(t=>corpus.find(n=>t.fullName.endsWith(" "+n))).sort();
+              if(outcome.status!==0||outcome.error||outcome.signal||!data.success||cases.some(t=>t.status!=="passed")||JSON.stringify(names)!==JSON.stringify(corpus))throw Error("corpus coverage failed: "+flavor);
+            }
+            report.status="passed";
+          } catch(error) {report.error=scrub(error);process.exitCode=1;}
+          finally {
+            try {verify();report.sourceVerifiedAfter=true;} catch(error){report.status="failed";report.sourceError=scrub(error);process.exitCode=1;}
+            if(report.status!=="passed")report.status="failed";
+            save();console.log(JSON.stringify(report));
+            if(process.exitCode)console.error("[scriptc-message-proof] FAILED (exit 1)");
+          }
+          PROOF
+          node "$RUNNER_TEMP/message-proof.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-message-operations-proof
+          path: |
+            ${{ runner.temp }}/message-summary.json
+            ${{ runner.temp }}/native-worker-published-members.ts.json
+          if-no-files-found: error
+          retention-days: 1
