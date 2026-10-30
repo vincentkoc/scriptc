@@ -1,0 +1,98 @@
+name: Qualify published message dev builds on Darwin
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-message-dev-darwin.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-message-dev-darwin
+  cancel-in-progress: false
+
+jobs:
+  message_dev:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: fb5d7912e6d0ba2db64ba2df212d2d2db6977490
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/native-packages
+        with:
+          target: darwin-arm64
+      - run: pnpm build
+      - name: Verify dev builds and record the fixture cost
+        run: |
+          cat > "$RUNNER_TEMP/message-dev-proof.mjs" <<'PROOF'
+          import { spawnSync, execFileSync } from "node:child_process";
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const head="fb5d7912e6d0ba2db64ba2df212d2d2db6977490",root=process.cwd(),temp=process.env.RUNNER_TEMP;
+          const report={head,workflow:process.env.GITHUB_SHA,node:process.version,platform:process.platform,arch:process.arch,status:"running",groups:[]};
+          const summary=join(temp,"message-dev-summary.json"), costs={};
+          const scrub=s=>String(s).split(root).join("<repo>").split(temp).join("<temp>");
+          const git=args=>execFileSync("git",args,{encoding:"utf8"}).trim();
+          const verify=()=>{
+            if(git(["rev-parse","HEAD"])!==head||git(["status","--porcelain"])!=="")throw Error("source changed");
+            if(process.version!=="v"+readFileSync(".node-version","utf8").trim())throw Error("wrong Node oracle");
+          };
+          const save=()=>writeFileSync(summary,JSON.stringify(report,null,2)+"\n");
+          const corpus=["native-worker-published-members.ts","native-worker-publish-classes.ts","native-worker-published-graphs.ts","worker-class-instance-clone.ts","5793-worker-message-channel.ts","5802-broadcast-channel-workers.ts","5803-worker-environment-data.ts","7139-message-typed-records.ts","7360-worker-typed-records.ts"].sort();
+          const fixture="native-worker-published-members.ts",escape=s=>s.replace(/[.*+?^{}()|[\]\\$]/g,"\\$&");
+          save();
+          try{
+            verify();
+            for(const flavor of ["plain","san"]){
+              let elapsed=0;
+              for(const mode of ["dev","release"]){
+                const selected=mode==="dev"?corpus:[fixture],output=join(temp,"message-"+flavor+"-"+mode+".json");
+                const file=mode==="dev"?"tests/harness/llvm-differential.test.ts":"tests/harness/differential.test.ts";
+                const args=["test",file,"-t","("+selected.map(escape).join("|")+")$","--reporter=json","--outputFile="+output];
+                console.log("START "+flavor+" "+mode);
+                const r=spawnSync("pnpm",args,{cwd:root,env:{...process.env,SCRIPTC_TEST_WORKERS:"2",SCRIPTC_NO_CACHE:"1",SCRIPTC_SAN:flavor==="san"?"1":"",SCRIPTC_LLVM_TEST_MODE:"dev",ASAN_OPTIONS:"detect_leaks=0"},encoding:"utf8",timeout:600000,maxBuffer:16*1024*1024});
+                const data=JSON.parse(readFileSync(output,"utf8")),cases=data.testResults.flatMap(s=>s.assertionResults).filter(t=>!["pending","todo","skipped"].includes(t.status));
+                report.groups.push({flavor,mode,code:r.status,signal:r.signal,error:r.error?.message,success:data.success,cases:cases.map(t=>({name:t.fullName,status:t.status,duration:t.duration,failures:t.failureMessages.map(scrub)}))});
+                save();
+                const names=cases.map(t=>selected.find(n=>t.fullName.endsWith(" "+n))).sort();
+                if(r.status!==0||r.error||r.signal||!data.success||cases.some(t=>t.status!=="passed")||JSON.stringify(names)!==JSON.stringify(selected))throw Error("coverage failed: "+flavor+" "+mode);
+                const own=cases.find(t=>t.fullName.endsWith(" "+fixture));
+                if(!own||typeof own.duration!=="number")throw Error("fixture duration missing");
+                elapsed+=own.duration;
+                console.log("DONE "+flavor+" "+mode);
+              }
+              costs[flavor]=Math.ceil(elapsed);
+            }
+            writeFileSync(join(temp,fixture+".json"),JSON.stringify(costs,null,2)+"\n");
+            report.costs=costs;report.status="passed";
+          }catch(error){report.status="failed";report.error=scrub(error);process.exitCode=1;}
+          finally{
+            try{verify();report.sourceVerifiedAfter=true;}catch(error){report.status="failed";report.sourceError=scrub(error);process.exitCode=1;}
+            save();console.log(JSON.stringify(report));
+            if(process.exitCode)console.error("[scriptc-message-dev-proof] FAILED (exit 1)");
+          }
+          PROOF
+          node "$RUNNER_TEMP/message-dev-proof.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-message-dev-proof
+          path: |
+            ${{ runner.temp }}/message-dev-summary.json
+            ${{ runner.temp }}/native-worker-published-members.ts.json
+          if-no-files-found: error
+          retention-days: 1
