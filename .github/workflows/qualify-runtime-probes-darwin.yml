@@ -1,0 +1,146 @@
+name: Observe runtime hypotheses on Darwin
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-runtime-probes-darwin.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qualify-runtime-probes-darwin
+  cancel-in-progress: false
+
+jobs:
+  probes:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: |
+          test "$(git rev-parse HEAD)" = 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          git diff --exit-code HEAD
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-darwin-arm64
+          path: ${{ runner.temp }}/region-native
+          run-id: 41079002760
+          github-token: ${{ github.token }}
+      - run: |
+          tar -xzf "$RUNNER_TEMP/region-native/native-darwin-arm64.tar.gz"
+          node packages/runtime-darwin-arm64/scripts/verify.mjs
+          pnpm build
+      - name: Observe pinned Node and native plain and sanitizer behavior
+        run: |
+          cat > "$RUNNER_TEMP/runtime-probes.mjs" <<'RUNTIME_PROBES'
+          import { spawnSync, execFileSync } from "node:child_process";
+          import { accessSync, constants, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          import { join } from "node:path";
+          const expectedHead="0e17511aaa44ede74b06d6483a0f802d30e7846e";
+          const root=process.cwd();
+          const verifySource=()=>{
+            if(execFileSync("git",["rev-parse","HEAD"],{encoding:"utf8"}).trim()!==expectedHead)throw Error("head mismatch");
+            execFileSync("git",["diff","--exit-code","HEAD"],{stdio:"inherit"});
+          };
+          verifySource();
+          const nodePin=readFileSync(join(root,".node-version"),"utf8").trim();
+          if(process.version!=="v"+nodePin)throw Error("Node oracle does not match source pin");
+          const probes=[{"name":"published-class-members","source":"import { Worker, isMainThread, parentPort, workerData } from \"node:worker_threads\";\nimport { publish, sharesPublishedGraphs } from \"@scriptc/threads\";\nclass Box {\n  value = 7;\n  read(): number { return this.value; }\n}\nif (isMainThread) {\n  const source = publish(new Box());\n  console.log(\"sender\", source.read());\n  const worker = new Worker(new URL(import.meta.url), { workerData: source });\n  worker.on(\"message\", (ok: boolean) => console.log(\"worker\", ok));\n} else {\n  parentPort!.postMessage((\"read\" in workerData) === sharesPublishedGraphs);\n  parentPort!.close();\n}\n","expected":"sender 7\nworker true\n"},{"name":"frozen-sparse-mutators","source":"export {};\n{\nconst a: number[] = [];\na.length = 2;\nObject.freeze(a);\ntry { console.log(\"holes reverse\", a.reverse() === a); }\ncatch (e) { console.log(\"holes reverse\", (e as Error).name); }\nconsole.log(\"holes reverse state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n{\nconst a: number[] = [];\na.length = 2;\nObject.freeze(a);\ntry { console.log(\"holes copyWithin\", a.copyWithin(0, 1) === a); }\ncatch (e) { console.log(\"holes copyWithin\", (e as Error).name); }\nconsole.log(\"holes copyWithin state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n{\nconst a: number[] = [];\na.length = 2;\nObject.freeze(a);\ntry { console.log(\"holes sort\", a.sort() === a); }\ncatch (e) { console.log(\"holes sort\", (e as Error).name); }\nconsole.log(\"holes sort state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n{\nconst a: number[] = [];\na.length = 2;\nObject.freeze(a);\ntry { console.log(\"holes comparator sort\", a.sort((left, right) => left - right) === a); }\ncatch (e) { console.log(\"holes comparator sort\", (e as Error).name); }\nconsole.log(\"holes comparator sort state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n{\nconst a: number[] = [];\na.length = 3;\na[1] = 7;\nObject.freeze(a);\ntry { console.log(\"center reverse\", a.reverse() === a); }\ncatch (e) { console.log(\"center reverse\", (e as Error).name); }\nconsole.log(\"center reverse state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n{\nconst a: number[] = [];\na.length = 3;\na[1] = 7;\nObject.freeze(a);\ntry { console.log(\"center sort\", a.sort() === a); }\ncatch (e) { console.log(\"center sort\", (e as Error).name); }\nconsole.log(\"center sort state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n{\nconst a: number[] = [1, 2];\nObject.freeze(a);\ntry { console.log(\"dense copyWithin same\", a.copyWithin(0, 0) === a); }\ncatch (e) { console.log(\"dense copyWithin same\", (e as Error).name); }\nconsole.log(\"dense copyWithin same state\", a.length, 0 in a, 1 in a, 2 in a, JSON.stringify(a));\n}\n","expected":"holes reverse true\nholes reverse state 2 false false false [null,null]\nholes copyWithin true\nholes copyWithin state 2 false false false [null,null]\nholes sort true\nholes sort state 2 false false false [null,null]\nholes comparator sort true\nholes comparator sort state 2 false false false [null,null]\ncenter reverse true\ncenter reverse state 3 false true false [null,7,null]\ncenter sort TypeError\ncenter sort state 3 false true false [null,7,null]\ndense copyWithin same TypeError\ndense copyWithin same state 2 true true false [1,2]\n"}];
+
+          const out=join(root,"reports/next-runtime-probes");
+          mkdirSync(out,{recursive:true});
+          const summary=join(out,"summary.json");
+          rmSync(summary,{force:true});
+          const ledger={version:3,head:expectedHead,node:process.version,platform:process.platform,arch:process.arch,status:"observing",probes:[]};
+          const save=()=>writeFileSync(summary,JSON.stringify(ledger,null,2)+"\n");
+          const observe=(probe,label,command,args)=>{
+            console.log("START "+probe+" "+label);
+            const result=spawnSync(command,args,{cwd:root,env:{...process.env,SCRIPTC_SAN:"",SCRIPTC_NO_CACHE:"1",ASAN_OPTIONS:"detect_leaks=0"},encoding:"utf8",input:"",timeout:180000,maxBuffer:8*1024*1024});
+            return {label,code:result.status,signal:result.signal,error:result.error?.message,stdout:result.stdout??"",stderr:result.stderr??""};
+          };
+          save();
+          try {
+            for(const probe of probes){
+              const dir=join(out,probe.name);
+              mkdirSync(dir,{recursive:true});
+              const entry=join(dir,"main.ts");
+              writeFileSync(entry,probe.source);
+              const item={name:probe.name,sourceSha256:createHash("sha256").update(probe.source).digest("hex"),expected:probe.expected,flavors:[],classification:"pending"};
+              ledger.probes.push(item);save();
+              const oracle=observe(probe.name,"node",process.execPath,["--import","tsx",entry]);
+              item.oracle=oracle;
+              if(oracle.code!==0||oracle.signal||oracle.error||oracle.stdout!==probe.expected||oracle.stderr!==""){
+                item.classification="oracle-inconclusive";save();continue;
+              }
+              for(const flavor of ["plain","san"]){
+                const binary=join(dir,"native-"+flavor);rmSync(binary,{force:true});
+                const sample={flavor,runs:[],classification:"pending"};item.flavors.push(sample);
+                const args=["packages/cli/dist/main.js","build",entry,"--backend","llvm","--optimization","release","--print=diagnostics","-o",binary];
+                if(flavor==="san")args.push("--sanitize");
+                const build=observe(probe.name,flavor+"-build",process.execPath,args);sample.runs.push(build);
+                try { sample.buildEnvelope=JSON.parse(build.stdout); } catch { sample.buildEnvelopeInvalid=true; }
+                if(build.code!==0||build.signal||build.error){
+                  sample.classification=sample.buildEnvelope?.command==="build" && sample.buildEnvelope.success===false
+                    ? "compiler-"+sample.buildEnvelope.phase+"-failure" : "build-inconclusive";
+                }else if(sample.buildEnvelope?.success!==true||sample.buildEnvelope.phase!=="complete"||sample.buildEnvelope.artifact!==binary){
+                  sample.classification="build-inconclusive";
+                }else{
+                  accessSync(binary,constants.X_OK);
+                  const native=observe(probe.name,flavor+"-native",binary,[]);sample.runs.push(native);
+                  sample.classification=native.error ? "execution-inconclusive"
+                    : native.code!==0||native.signal ? "native-runtime-failure"
+                    : native.stdout===oracle.stdout&&native.stderr===oracle.stderr ? "matches-oracle" : "runtime-mismatch";
+                }
+                save();
+                console.log("OBSERVATION "+JSON.stringify({name:item.name,flavor,classification:sample.classification,sourceSha256:item.sourceSha256,runs:sample.runs.map(r=>({...r,stdout:r.stdout.slice(-4000),stderr:r.stderr.slice(-4000)}))}));
+              }
+              item.classification="observed";save();
+            }
+            ledger.status="observed";
+          } catch(error) {
+            ledger.status="harness-failed";ledger.error=String(error);process.exitCode=1;
+          } finally {
+            try{verifySource();ledger.sourceVerifiedAfter=true;}catch(error){ledger.status="harness-failed";ledger.sourceError=String(error);process.exitCode=1;}
+            save();
+            if(process.exitCode)console.error("[scriptc-runtime-probes] FAILED (exit 1)");
+          }
+          RUNTIME_PROBES
+          node "$RUNNER_TEMP/runtime-probes.mjs"
+      - name: Report observations without hiding failures
+        if: always()
+        run: |
+          node --input-type=module <<'VERDICT'
+          import { readFileSync, appendFileSync } from "node:fs";
+          const report=JSON.parse(readFileSync("reports/next-runtime-probes/summary.json","utf8"));
+          const rows=report.probes.flatMap(p=>p.flavors.length?p.flavors.map(f=>[p.name,f.flavor,f.classification]):[[p.name,"oracle",p.classification]]);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY,"| probe | flavor | observation |\n|---|---|---|\n"+rows.map(r=>"| "+r.join(" | ")+" |").join("\n")+"\n");
+          if(report.head!=="0e17511aaa44ede74b06d6483a0f802d30e7846e"||report.platform!=="darwin"||report.arch!=="arm64"||!report.sourceVerifiedAfter)throw Error("probe identity or source verification differs");
+          if(report.status!=="observed"||report.probes.length!==2||report.probes.some(p=>p.classification!=="observed"||p.flavors.length!==2||p.flavors.some(f=>f.classification!=="matches-oracle"))){
+            console.error("[scriptc-runtime-probes] FAILED (exit 1): observed mismatch or inconclusive proof; inspect artifact");
+            process.exitCode=1;
+          }
+          VERDICT
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-runtime-probe-observations
+          path: reports/next-runtime-probes/summary.json
+          if-no-files-found: error
+          retention-days: 1
