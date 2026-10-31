@@ -1,0 +1,90 @@
+name: Measure hosted proof capacity
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-proof-capacity.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  capacity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Measure the fresh runner without changing installed tools
+        shell: python
+        run: |
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          paths = {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+              "swapDirectory": "/mnt",
+          }
+          filesystems = {}
+          for name, path in paths.items():
+              info = os.statvfs(path)
+              filesystems[name] = {
+                  "device": os.stat(path).st_dev,
+                  "bytes": info.f_blocks * info.f_frsize,
+                  "availableBytes": info.f_bavail * info.f_frsize,
+                  "availableInodes": info.f_favail,
+              }
+
+          sizes = {}
+          errors = {}
+          for path in [
+              "/usr/local/lib/android",
+              "/usr/share/dotnet",
+              "/usr/local/share/powershell",
+              "/usr/local/share/chromium",
+              "/usr/share/swift",
+              "/opt/ghc",
+              "/opt/az",
+              "/opt/microsoft",
+              "/opt/hostedtoolcache",
+          ]:
+              if not os.path.exists(path):
+                  continue
+              try:
+                  result = subprocess.run(
+                      ["du", "-s", "-x", "-B1", "--", path],
+                      capture_output=True, text=True, timeout=30,
+                  )
+              except subprocess.TimeoutExpired:
+                  errors[path] = "measurement exceeded 30 seconds"
+                  continue
+              if result.returncode:
+                  errors[path] = result.stderr.strip()[:2000]
+                  continue
+              sizes[path] = int(result.stdout.split()[0])
+
+          report = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ["RUNNER_OS"],
+              "runnerArch": os.environ["RUNNER_ARCH"],
+              "filesystems": filesystems,
+              "installedToolBytes": sizes,
+              "installedToolErrors": errors,
+              "meminfo": pathlib.Path("/proc/meminfo").read_text(),
+              "mutatedInstalledTools": False,
+              "testsExecuted": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          pathlib.Path(os.environ["RUNNER_TEMP"], "proof-capacity.json").write_text(text)
+          print(text)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hosted-proof-capacity
+          path: ${{ runner.temp }}/proof-capacity.json
+          if-no-files-found: error
+          retention-days: 1
