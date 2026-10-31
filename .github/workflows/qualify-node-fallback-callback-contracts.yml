@@ -1,0 +1,536 @@
+name: Qualify Node fallback callback contracts
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-node-fallback-callback-contracts.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-node-fallback-callback-contracts
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      PROOF_CAPACITY_NAME: callback-contracts-capacity
+      CALLBACK_SOURCE: 1b9a1c3d97c343743203004581e0be58ce54ddf6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 1b9a1c3d97c343743203004581e0be58ce54ddf6
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = "$CALLBACK_SOURCE"
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
+      - uses: ./.github/actions/llvm-linux
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - uses: ./.github/actions/libnode
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Run focused callback qualification
+        run: |
+          cat > "$RUNNER_TEMP/callback-contracts.mjs" <<'PROOF'
+          import assert from "node:assert/strict";
+          import { spawn, spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+          import { join, relative } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+
+          const root = process.cwd(), temp = process.env.RUNNER_TEMP;
+          const head = "1b9a1c3d97c343743203004581e0be58ce54ddf6", work = join(temp, "callback-contracts-work"), out = join(temp, "callback-contracts-proof");
+          const payload = fileURLToPath(import.meta.url), summaryPath = join(out, "summary.json");
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT };
+          const sourcePins = {".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44",".oxfmtrc.jsonc":"39e3e80a4b4aaabdac8b12e5a56ebc6f130a99c271d8e0bc1965a68dff0b60fb",".oxlintrc.jsonc":"8b843dbb8fbf3620f77f82c107e5e4834d3b991f4e6b8fdcb2c6d9d078bf5161","AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c","CHANGELOG.md":"b48db0e2f6bf7a8bc69a9b2216fbf019b748b0f63a6e6d925481eac6e264cdfc","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/compiler/ambient/node-fallback/fs.d.ts":"49e8fe8c619c5b18634c387620016792d803a85a10a1984ef925f11726f193db","packages/compiler/ambient/scriptc-node-fallback.d.ts":"7aefc784b652db9bff48ae619ef2ac5552c073e0480ba9f8546468202baa70ce","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/backend/native/session.ts":"b82407816ed96933fee39c9cd5dd7f47bb0be6a4a025bd1841e7c3ca2baf56ce","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/frontend/lowering/builtins/filesystem-calls.ts":"88d2e3b54a631af751db64a59672841fb7ab28ec66ccc29bc22b7998169fba9c","packages/compiler/src/frontend/lowering/builtins/process.ts":"c6a0ce9b6a0160cc3fca75f1be0db85f9d46ad492c63631dcebdc4cfc56bb793","packages/compiler/src/frontend/lowering/expressions/narrowing.ts":"3e776d5064b5334b7ab08d036aa8f10e6c3d14abaad3189dee3e4ded88fa8fbc","packages/compiler/src/frontend/lowering/lower-stmts.ts":"d7357f9f7384a03072e27008d9f3913fbeeead7326d44830435ff76a71a395a7","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/program-node.ts":"4a52e964e293c313f2d70007e277330d6ce095912f6056e5aaaf6da7ba11e45d","packages/compiler/src/frontend/program.ts":"1ac6c387f4cf31771057d44c7e088f6b943763dc3d035e887449e8059d1f7bac","packages/compiler/src/frontend/ts7/checker.ts":"26486e5436d12b04db79da573ceccd83a36a392b8884885305abb285de439f87","packages/compiler/src/frontend/type-mapper.ts":"853cdfd4fe6f540d4b4e54404ba4cfe3bdebce57b846bef036e8e7b25e955541","packages/compiler/src/ir/ir.ts":"3d42a34f9ce9e224216480f2915156cf884476e2f7f3f2cb27a53b4304dfc4a7","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/ir/traverse.ts":"c8a7e22241209ef1e5209909e32cd0035089ef08d4d9df8249b5f3cb8cfabe95","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/compiler/test/node-fallback-callbacks.test.ts":"04c5ba9c4c1ed756f9fe5a2cc007708f1620c3b722a0f7d00399bbba28763f9e","packages/compiler/test/process-listener-int32-emission.test.ts":"4e44281fa18276ea7e7ef153cb771596f2c329e047a75600005f1dfc7574b8b4","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6805-node-island-exit-code/main.ts.json":"66ced69941dbb6f5d0f1f179ade1152d86efa0525fa5a521d33b0236287dc369","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6806-node-island-exit-in-call/main.ts.json":"e159862bfe10fe8db667af62eaaa19351a561cb96fcb84195d844acb37923a48","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6807-node-island-exit-in-island-timer/main.ts.json":"2254d679e07b6adf6699a8895d1b42a687db10a10a15226e973b4c8600bf845f","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6808-node-island-exit-from-program/main.ts.json":"91f540f1b2e64f22090dbf6330b3a0c8d70e7c0c7e1fa766e193a8e801c66e4a","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6809-node-island-stdio/main.ts.json":"110f518e0c331fab68da8bf37f83b53468a435c63f98e506dba81fa2b7a86565","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6810-node-island-children/main.ts.json":"0d7e0dde69410cbb444d4fcdc077255eb073baa74cb90ce3845fb048fe358985","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6811-node-island-uncaught-listener/main.mjs.json":"9e51edca9cfdf8362f907f58381d813306e02006f72dcc8f452ff6442accb542","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6812-node-island-handles/main.mjs.json":"1002b6220ef8664fdc570321ef54db9ca6593c4463e38aee90dd0ae58ba0ad77","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6813-node-island-handle-errors/main.mjs.json":"be8def25f058dfadf0267a250f9f084dcea59b1fe9b5eddbea7f16f49b2e714c","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6814-node-island-handle-bytes/main.mjs.json":"c15e4de613a9f1a42709173cc404102a70e634ccd5dc18beac785d8d7e78463c","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6815-node-island-handle-promises/main.mjs.json":"f631e30e8286c316229763100589a181c0bab5904d068f5bea8e3ed5b7b42dbf","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6816-node-island-objects/main.ts.json":"9b995c8ea698acefbb24dd33a573393b5753de0b6fa177067352b9b4a1fdc8b7","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6817-node-island-esm/main.ts.json":"3f62c708073821f657c574a33bcabc448e152d5a8b3cd1e4c5405178571fe640","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6818-node-island-mixed/main.ts.json":"805d78cc82351d182926b242e125d5b175e92b736bee398dcd7e86dba2df276f","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6819-node-island-fenced/main.ts.json":"2ce59de16fde3f21f8f33530ee17bf78033d34a4c1d02b54aba621702c6fcf25","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6821-stream-write-nullable-chunks.cjs.json":"283fb9133afafde7c587a63834308d7ac8478a50e28514d45d3d488e7d4cdcff","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6822-jsx-classic-runtime/main.ts.json":"b770513e2cc4ef11a1ad38fea2a089168aac0923b5db911564e22a7904309e28","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6822-node-island-gc/main.ts.json":"8a63ea557eb33a20af7e4621b5bea84a8af5c6051339013bcb33e4cd5af5e3e8","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6823-node-island-nested-stack/main.ts.json":"52e2fa9696ce132aaefea7224c7018b68bed4bb489c3e2f54ade2cb392089cb9","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/6824-jsx-automatic-runtime/main.ts.json":"aa89cf667fb7b6637012fcc5c07a8fdc128423d07caa4cbd07b08119f72957db","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-win32-relative-case.cjs.json":"b4a70e45f7effd83ac72dc1897791c37d3801e0b4c72478686de83c25c407206","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/pick-alias-view-modules/main.ts.json":"6fa9e81da311c14c540e1aa65c53d74669e813894f7347e2c21417a1ffed1ce7","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/primitive-and-function-descriptors.js.json":"18c9b0938e0b3c093692211066c553731427ed691291f4bfd32778ac94ce1be8","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/private-in-checked-primitives.js.json":"28dd81991875ca53b9c26e607ac417542e411a30e1d24d8e8cfa65139ecbaade","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-builtin-values.js.json":"eab9a81fc195de3e1fd41f68d4bc4b0e36e91e0bfbdcc9078a9acbe0e597698e","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-name-thread.mjs.json":"a60c4c15385be798b613f89a1773c80eab1e9875d99242d09a8a46938de74b46","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-value.cjs.json":"7e7fcfd24a7673e1ba5f008506f8aa82fbcd71f59502d37af2fdba5da938fd65","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-value.mjs.json":"7abce02f9d5bbe704230d319f5f9afd12886e4e9e563064a227d9439ca643381","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-emit-warning-arguments.cjs.json":"18bb5756b3ef77f2726d6adc809941f65f43cbd180fd425bb00ccfc36b520acf","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-env-computed-keys.js.json":"702b9b805a7a771d28d42e322134894737b286f2e391c1cccc1fa0ccb8e09d57","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-hrtime.js.json":"cdc91ae1386c3f40a62da3ec3ec4766d1035bcaf67d1a476aa6323ee3692297b","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-kill-chdir-errors.cjs.json":"ffc5e8e2913524e24158456bfc26acb76a5e5ddf77a9d5ac2580e90f6dbc2d10","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-memory-usage-array-buffers.cjs.json":"d237003d829b05e2a97aa306eccfb54f3d89e23ea07c3b83d5ed929bd958949b","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-named-signals.cjs.json":"8e3ea10e8c9ff5f5e21e6fffe6e86d793b2ff0c542f78e45cc6f99e777a21b45","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-handler-throws.cjs.json":"73a52b8abee9c98c8cb3c7848ce2a1baf91cd696706fc066c8aac69d292edef0","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-loop.cjs.json":"b3b46dcddb370fef3339cebc0d94ac5f98dffd2272d4747a5a0d9f6ee6c73358","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-module.mjs.json":"18cb5cd26545d59ab95029fdfd441b408243c504569b9438ebac7b09512f5ab0","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-monitor.cjs.json":"e535f7d872966f2715f689e52887c692c2640441e2bf20272b2b5c71bea935cf","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-rejection.cjs.json":"5257e3d8fae10663c309c636f3cedf9ff4f7fa28e2b1418607e26daabdf6f3e6","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-sync.cjs.json":"c5a6f6fb4f47a1eb68d37696b58be72fbd06a7bc457814b9a7d44dd88e14235c","packages/compiler/test/ts7/order-parity.test.ts":"7bf12e7d4b9186846c69416b985d3bfad8ec5befb0f3e2e04f36e05748e13efc","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","scripts/test-ts7.mjs":"e776328473c679f9a6183c9d880a609f72dfb62fc80f58c8a7a085112ff1c80c","scripts/ts7-order-fixtures.mjs":"53b2f36fdf75a6436eb60af7259499ff6fd140f2ac14cc5e158dfd772befc34e","tests/corpus/2212-unhandled-rejection-listener.cjs":"14ebfec6d740bfea283712e2b8d51825f1f15e7317c3e8c066af7e01cdf4cca5","tests/corpus/2558-rejection-events.cjs":"0e6e72d3b8cf786db0eb44ce5e5ac2dc7f4ed3702a42831f1df9b95185ec05ea","tests/corpus/2654-top-level-await-unrelated-rejection.ts":"1250bc4d1ecd7edff7544339c128fa2a75159ae1feb9832404c3738412b137df","tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts":"e7b6f366715e28b4404805773c5d4556d8eb817ac9df28dc934a0462a1312a07","tests/corpus/5747-fs-stat-throw-if-no-entry.ts":"59084acec7b57911bf53885fe30aa1b34f05e8a475fe89c9ecda9025dcbdc7a7","tests/corpus/5748-fs-stat-throw-if-no-entry-js.cjs":"6377a20590cf0817ec9079c4e85babd8e6c04f57b53fdfae7ac4c239429d11ab","tests/corpus/5808-worker-unhandled-rejections.ts":"b7693e7a8648fb787f3c461ec28544a9c1826f3eb29a262c7c01523dead0697b","tests/corpus/5996-rejections-between-macrotasks.cjs":"b619c7f3e1d2088c8d38e2a6cf3e26780206f644569d4acb16c26e34117a993a","tests/corpus/6805-node-island-exit-code/main.ts":"e982ee5429a6b0fb3de0ca87ea2d930288711b9f1b73003d40577d5875946fb1","tests/corpus/6806-node-island-exit-in-call/main.ts":"1607eba9faca49d55ca4d4095c884139c2e4c2f9136f3eee20695321e5254ef5","tests/corpus/6807-node-island-exit-in-island-timer/main.ts":"91367ec98768eb49716e3920c8d754335c40810f17b4db5fd21df19829f09afa","tests/corpus/6808-node-island-exit-from-program/main.ts":"a364fe64766197c1ea07970bdecb4569d91ebd5ff31516449fa03e0ec17f2942","tests/corpus/6809-node-island-stdio/main.ts":"0efa6add138d044b89d354b013b880475e234927ac4ad06b6b0b207906f44b95","tests/corpus/6810-node-island-children/main.ts":"f5c8893319c40016514e10eee6612fd0e3b4d06f98bff816de299932b0c670ea","tests/corpus/6811-node-island-uncaught-listener/island.cjs":"199d0f712f9f8e2fa9aeb0e0c75a8e17bf1eca86808b9485372dd8be78f7f2c9","tests/corpus/6811-node-island-uncaught-listener/main.mjs":"3dbe00c405cb383497acb48361ac377a460f12057cca0c80888c633892ebec29","tests/corpus/6812-node-island-handles/main.mjs":"e008198ab5d4b103565c0a9af38f685db969820f0ff9836b86a7f5627ddd4d50","tests/corpus/6813-node-island-handle-errors/main.mjs":"d1addaac0f233b60ca045c1e71d0e12bd18be3da39ca9bf9bf0d53c62c87cb8d","tests/corpus/6814-node-island-handle-bytes/main.mjs":"d9cf0abf4bb9b20bd25728b981307296c188a935d5df93919db266cd1ab681c9","tests/corpus/6815-node-island-handle-promises/main.mjs":"f6604930bc5d7a59241028d991b8a83284515adb35cd615aea44aef4eb7794d9","tests/corpus/6816-node-island-objects/main.ts":"3e2d4e920e678d9c788ac817743017865bba533806ed77f58f2b5d8237ed70a1","tests/corpus/6817-node-island-esm/main.ts":"512240bc2d3111d32e4e82ef877a81eef372b22a591742e6a736882447c3709a","tests/corpus/6818-node-island-mixed/main.ts":"a848ab196a82a8a02c56d7f87045664f66ea18a43b1658c7acd9af67cd478201","tests/corpus/6819-node-island-fenced/main.ts":"0841ac5a5e376c016628bcfa0a808902a4031a27e8eac05cb99a92442e8bd698","tests/corpus/6821-stream-write-nullable-chunks.cjs":"ef4334478f519123e55e0c59f09ab8861fdc07a39eb8b466283b924cd4520070","tests/corpus/6822-jsx-classic-runtime/main.ts":"c47d4a3ee7a627190e7137bd69405855def35193bb8cc08b462b3aae60e22e61","tests/corpus/6822-node-island-gc/main.ts":"ace4423c6a489434bc5761740cba08f9dacb70e76785c050290a62ee1e7e5283","tests/corpus/6823-node-island-nested-stack/main.ts":"6e63cb1bbb837e8e057cc4fa3d056bbe72723623e85280618a6983dd45ee397e","tests/corpus/6824-jsx-automatic-runtime/main.ts":"d69a5e9532d96305bfd75e990781c15fd0e5e1d294c69e00e9f068b17b8dfdea","tests/corpus/7018-bigint-stats.ts":"4f4550950fdd30aafb5c94a6ea26ceff19b578b32b33bcd124bac89e09a7cb8e","tests/corpus/path-win32-relative-case.cjs":"c07da86935197b01c2d5c4b1ae50aa22b5eeb8fc9898a932e9bfcbfea32d6d6a","tests/corpus/pick-alias-view-modules/main.ts":"abb0d9df1e14a2d6ad82a873581f3609f41cd18bae96f5aa0cc9a64d2aa0a576","tests/corpus/primitive-and-function-descriptors.js":"bc6e006906cdb4ab1f2ed24408e4fab5a7725c8ea1cea4f4c68bb8a21c80b0df","tests/corpus/private-in-checked-primitives.js":"774fdb2f43acfb80de79384545e045a4f457e083a6d9b69ea0c86118e82bef8f","tests/corpus/process-builtin-values.js":"353ae0dfa4de344648dbb181b9bacffe1ae19994261458ff183bc16b811afd5a","tests/corpus/process-cwd-name-thread.mjs":"46ab955100a23c047773ef96f0bb3f0af26709635473262701db54ecf566ca7b","tests/corpus/process-cwd-value.cjs":"10c457bc1181df78ba57986ba322b82d03314fd2c5f05263043811aa0fdc0eaf","tests/corpus/process-cwd-value.mjs":"9baaf4ba1c1301e968688f63f231575fdc721ebe312a91897557d0956be20532","tests/corpus/process-emit-warning-arguments.cjs":"ad000aff327843c17c6e6c5058d692cd8190d3df37704b5eb0bc22465ec22085","tests/corpus/process-env-computed-keys.js":"943764dbb3e0229b17f8b53eea90a980dfcda03cc5cc58fd04ca720581c62960","tests/corpus/process-hrtime.js":"521406c8cdf2776f929e40dd63167c060df81bebd4b75be3c8ba475f09aa1e3d","tests/corpus/process-kill-chdir-errors.cjs":"686dc436924277cac830f6b2caf0bcbed2d043f812735add2589d060f15bcbad","tests/corpus/process-memory-usage-array-buffers.cjs":"52c8b5a6efb5ce755a5a8c1ad1756837b3ee11ae444f78ca9dba66e0f4c2f1c0","tests/corpus/process-named-signals.cjs":"ad21ebfc952bf8939207fba2c7d0be4da8163f9bed207acb03b857bc5f8c3dd2","tests/corpus/process-uncaught-handler-throws.cjs":"605c36e9c136aece99b155e419d02d990d8ce73f0e295472c2639b621ac0a4ef","tests/corpus/process-uncaught-loop.cjs":"ade72040e8a399d67ae705df64fad69ccf06106b76447ce89988285ab9a42cec","tests/corpus/process-uncaught-module.mjs":"89ca3547f60672a89978f895adad9278a40a96b59ea32539360723de6a6bc6ea","tests/corpus/process-uncaught-monitor.cjs":"3249d562dd9da6d2bfe3c5d61aed81387760b5f7d69056bd4b4f94872b9feaee","tests/corpus/process-uncaught-rejection.cjs":"89b94dbf9c3b9bb220218f1f4583ff8e4692d901e219583f13121343d238d606","tests/corpus/process-uncaught-sync.cjs":"917c4edfd8ffb745dea493ad0e6c6931a28d0c789ce7b5169700def8b4412e4b","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/jsx-oracle.ts":"c4642f02da794f548bebe8d6e23ec4b48380e25cc803c4154c47dc1bfede76f8","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/harness/oracle-env.ts":"f16a4f44e97d1cb16a43421c20886effebf1b478d2d02ccebcaf13f7aa6fdcf6","tests/harness/shard.ts":"8ef5234e8fcf13672e7e1d774eaa4ff58e264c06e85be16e5f77eda5a66467bd","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32"};
+          const gateSpecs = [{"id":"lint","args":["exec","oxlint","--deny-warnings","packages/compiler/ambient/node-fallback/fs.d.ts","packages/compiler/ambient/scriptc-node-fallback.d.ts","packages/compiler/src/frontend/lowering/expressions/narrowing.ts","packages/compiler/src/frontend/type-mapper.ts","packages/compiler/test/node-fallback-callbacks.test.ts","packages/compiler/test/process-listener-int32-emission.test.ts"],"seconds":300},{"id":"format","args":["exec","oxfmt","--check","packages/compiler/ambient/node-fallback/fs.d.ts","packages/compiler/ambient/scriptc-node-fallback.d.ts","packages/compiler/src/frontend/lowering/expressions/narrowing.ts","packages/compiler/src/frontend/type-mapper.ts","packages/compiler/test/node-fallback-callbacks.test.ts","packages/compiler/test/process-listener-int32-emission.test.ts"],"seconds":300},{"id":"baselines","command":"node","args":["scripts/test-ts7.mjs","--baselines-only"],"seconds":60},{"id":"fallback-units","args":["exec","vitest","run","packages/compiler/test/node-fallback-callbacks.test.ts","packages/compiler/test/process-listener-int32-emission.test.ts"],"files":["packages/compiler/test/node-fallback-callbacks.test.ts","packages/compiler/test/process-listener-int32-emission.test.ts"],"collect":true,"expectedByFile":{"packages/compiler/test/node-fallback-callbacks.test.ts":["fallback global rejection listeners infer promises and unknown reasons","fallback global exception listeners infer errors and origins","fallback global rejection reasons still require narrowing","fallback process rejection listeners infer promises and unknown reasons","fallback process exception listeners infer errors and origins","fallback process rejection reasons still require narrowing","fallback node:process rejection listeners infer promises and unknown reasons","fallback node:process exception listeners infer errors and origins","fallback node:process rejection reasons still require narrowing","fallback fs stat callbacks infer option-selected snapshots","fallback fs stat callbacks reject the wrong numeric representation","fallback node:fs stat callbacks infer option-selected snapshots","fallback node:fs stat callbacks reject the wrong numeric representation","fallback global callback parameters lower through native process listeners","fallback process callback parameters lower through native process listeners","fallback node:process callback parameters lower through native process listeners","fallback fs error-only stat callbacks lower through native filesystem calls","fallback node:fs error-only stat callbacks lower through native filesystem calls","JavaScript contextual uncaughtException parameters stay dynamic when passed and logged","JavaScript contextual exit parameters stay dynamic when passed and logged","JavaScript contextual user-defined number parameters stay dynamic when passed and logged","JavaScript unknown callback parameters retain Error and string flow narrowing","JavaScript contextual Error callbacks keep an authored instanceof guard","JavaScript contextual uncaughtException parameters are checked by a typed Error consumer","JavaScript contextual exit parameters are checked by a typed number consumer","fallback fs StatOptions aliases keep mutations on the shared option bag","fallback node:fs StatOptions aliases keep mutations on the shared option bag","user StatOptions interfaces keep their native record representation"],"packages/compiler/test/process-listener-int32-emission.test.ts":["signals listeners keep int32 fields of classes that reach dynamic code","unhandledRejection listeners keep int32 fields of classes that reach dynamic code","rejectionHandled listeners keep int32 fields of classes that reach dynamic code","warning listeners keep int32 fields of classes that reach dynamic code"]},"seconds":600},{"id":"order-parity","args":["exec","vitest","run","packages/compiler/test/ts7/order-parity.test.ts","-t","(?:tests/corpus/6805-node-island-exit-code/main\\.ts … \\+19|tests/corpus/path-win32-relative-case\\.cjs … \\+19)$"],"files":["packages/compiler/test/ts7/order-parity.test.ts"],"tests":["tests/corpus/6805-node-island-exit-code/main.ts … +19","tests/corpus/path-win32-relative-case.cjs … +19"],"collect":false,"seconds":600},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts|process\\-uncaught\\-loop\\.cjs|5747\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\.ts|5748\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\-js\\.cjs|7018\\-bigint\\-stats\\.ts|6811\\-node\\-island\\-uncaught\\-listener/main\\.mjs)$"],"files":["tests/harness/differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts","process-uncaught-loop.cjs","5747-fs-stat-throw-if-no-entry.ts","5748-fs-stat-throw-if-no-entry-js.cjs","7018-bigint-stats.ts","6811-node-island-uncaught-listener/main.mjs"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts|process\\-uncaught\\-loop\\.cjs|5747\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\.ts|5748\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\-js\\.cjs|7018\\-bigint\\-stats\\.ts|6811\\-node\\-island\\-uncaught\\-listener/main\\.mjs)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts","process-uncaught-loop.cjs","5747-fs-stat-throw-if-no-entry.ts","5748-fs-stat-throw-if-no-entry-js.cjs","7018-bigint-stats.ts","6811-node-island-uncaught-listener/main.mjs"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts|process\\-uncaught\\-loop\\.cjs|5747\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\.ts|5748\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\-js\\.cjs|7018\\-bigint\\-stats\\.ts|6811\\-node\\-island\\-uncaught\\-listener/main\\.mjs)$"],"files":["tests/harness/differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts","process-uncaught-loop.cjs","5747-fs-stat-throw-if-no-entry.ts","5748-fs-stat-throw-if-no-entry-js.cjs","7018-bigint-stats.ts","6811-node-island-uncaught-listener/main.mjs"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts|process\\-uncaught\\-loop\\.cjs|5747\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\.ts|5748\\-fs\\-stat\\-throw\\-if\\-no\\-entry\\-js\\.cjs|7018\\-bigint\\-stats\\.ts|6811\\-node\\-island\\-uncaught\\-listener/main\\.mjs)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts","process-uncaught-loop.cjs","5747-fs-stat-throw-if-no-entry.ts","5748-fs-stat-throw-if-no-entry-js.cjs","7018-bigint-stats.ts","6811-node-island-uncaught-listener/main.mjs"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const orderBatches = [{"name":"tests/corpus/6805-node-island-exit-code/main.ts … +19","entries":["tests/corpus/6805-node-island-exit-code/main.ts","tests/corpus/6806-node-island-exit-in-call/main.ts","tests/corpus/6807-node-island-exit-in-island-timer/main.ts","tests/corpus/6808-node-island-exit-from-program/main.ts","tests/corpus/6809-node-island-stdio/main.ts","tests/corpus/6810-node-island-children/main.ts","tests/corpus/6811-node-island-uncaught-listener/main.mjs","tests/corpus/6812-node-island-handles/main.mjs","tests/corpus/6813-node-island-handle-errors/main.mjs","tests/corpus/6814-node-island-handle-bytes/main.mjs","tests/corpus/6815-node-island-handle-promises/main.mjs","tests/corpus/6816-node-island-objects/main.ts","tests/corpus/6817-node-island-esm/main.ts","tests/corpus/6818-node-island-mixed/main.ts","tests/corpus/6819-node-island-fenced/main.ts","tests/corpus/6821-stream-write-nullable-chunks.cjs","tests/corpus/6822-jsx-classic-runtime/main.ts","tests/corpus/6822-node-island-gc/main.ts","tests/corpus/6823-node-island-nested-stack/main.ts","tests/corpus/6824-jsx-automatic-runtime/main.ts"]},{"name":"tests/corpus/path-win32-relative-case.cjs … +19","entries":["tests/corpus/path-win32-relative-case.cjs","tests/corpus/pick-alias-view-modules/main.ts","tests/corpus/primitive-and-function-descriptors.js","tests/corpus/private-in-checked-primitives.js","tests/corpus/process-builtin-values.js","tests/corpus/process-cwd-name-thread.mjs","tests/corpus/process-cwd-value.cjs","tests/corpus/process-cwd-value.mjs","tests/corpus/process-emit-warning-arguments.cjs","tests/corpus/process-env-computed-keys.js","tests/corpus/process-hrtime.js","tests/corpus/process-kill-chdir-errors.cjs","tests/corpus/process-memory-usage-array-buffers.cjs","tests/corpus/process-named-signals.cjs","tests/corpus/process-uncaught-handler-throws.cjs","tests/corpus/process-uncaught-loop.cjs","tests/corpus/process-uncaught-module.mjs","tests/corpus/process-uncaught-monitor.cjs","tests/corpus/process-uncaught-rejection.cjs","tests/corpus/process-uncaught-sync.cjs"]}];
+          const nativeExpected = {"count":1051,"sha256":"f1654081b6897ec22687f9a65aed2292f19285f9cfdbfe9cd799764522539768"};
+          const sha = value => createHash("sha256").update(value).digest("hex");
+          const hash = file => sha(readFileSync(file));
+          const scrub = value => String(value).replaceAll(root, "<repo>").replaceAll(temp, "<temp>");
+          const modeDeadline = Date.now() + 75 * 60_000;
+          mkdirSync(out, { recursive: true });
+          let report = existsSync(summaryPath) ? JSON.parse(readFileSync(summaryPath, "utf8")) : {
+            ...owner, head, scope: "node-fallback-callback-contracts", completeSuite: false,
+            priorProofReused: false, nativeRoute: "source-keyed native-packages action for this checkout",
+            status: "incomplete", qualificationComplete: false, gatesComplete: false,
+            expectedUnits: 32, expectedDifferentialSelections: 48, expectedOrderBatches: 2,
+            steps: [], gates: [], startedAt: new Date().toISOString(),
+          };
+          const save = () => writeFileSync(summaryPath, scrub(JSON.stringify(report, null, 2)) + "\n");
+          const ownerPath = join(work, ".owner.json");
+          const harnessLink = join(root, "node_modules/.cache/scriptc-tests");
+          const harnessOutput = join(work, "harness-output");
+          const assertOwner = () => assert.deepEqual(JSON.parse(readFileSync(ownerPath, "utf8")), owner);
+          const readJson = file => { assert.ok(statSync(file).size <= 32 * 1024 ** 2, "JSON evidence exceeds bound"); return JSON.parse(readFileSync(file, "utf8")); };
+          const artifact = file => ({ path: relative(out, file), bytes: statSync(file).size, sha256: hash(file) });
+          const pause = ms => new Promise(done => setTimeout(done, ms));
+          const capture = (command, args, cwd = root) => {
+            const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 ** 2 });
+            assert.equal(result.error, undefined, command + ": " + String(result.error));
+            assert.equal(result.status, 0, command + ": " + (result.stderr ?? "").slice(-4000));
+            return result.stdout.trim();
+          };
+          let active;
+          let interrupted;
+          for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
+            interrupted = signal;
+            active?.stop();
+          });
+
+          // Each subprocess owns one detached group. Drain at leader exit,
+          // not pipe closure; descendants can otherwise keep the runner alive.
+          async function execute(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(interrupted, undefined, "runner interrupted");
+            const timeoutMs = Math.min(minutes * 60_000, modeDeadline - Date.now());
+            assert.ok(timeoutMs > 0, "qualification phase deadline expired");
+            const step = { label, command, args: args.map(scrub), cwd: scrub(cwd), startedAt: new Date().toISOString() };
+            report.steps.push(step); save();
+            const log = openSync(join(out, label + ".log"), "wx");
+            const started = Date.now();
+            const result = await new Promise(resolveResult => {
+              let timedOut = false, overflow = false, closed = false, settled = false, exited = false;
+              let force, pipeDeadline, hardDeadline;
+              let code = null, signal = null, error;
+              let bytes = 0;
+              const child = spawn(command, args, {
+                cwd, env: { ...process.env, ...env }, detached: true, stdio: ["ignore", "pipe", "pipe"],
+              });
+              const alive = () => {
+                if (!child.pid) return false;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, 0); return true; }
+                catch (failure) { if (failure.code === "ESRCH") return false; throw failure; }
+              };
+              const kill = sig => {
+                if (!child.pid) return;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, sig); }
+                catch (failure) { if (failure.code !== "ESRCH") throw failure; }
+              };
+              const finish = group => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer); clearTimeout(force); clearTimeout(pipeDeadline); clearTimeout(hardDeadline);
+                active = undefined;
+                child.stdout.destroy(); child.stderr.destroy();
+                child.unref();
+                closeSync(log);
+                resolveResult({ code, signal, error, timedOut, overflow, ...group, elapsedMs: Date.now() - started });
+              };
+              const stop = () => {
+                kill("SIGTERM");
+                if (!force) force = setTimeout(() => kill("SIGKILL"), 1000);
+                if (!hardDeadline) hardDeadline = setTimeout(() => finish({ groupDrained: false, cleanupDeadline: true }), 15_000);
+              };
+              active = { stop };
+              const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
+              const output = data => {
+                if (settled) return;
+                bytes += data.length;
+                if (bytes > 128 * 1024 ** 2) { overflow = true; stop(); return; }
+                writeSync(log, data);
+              };
+              child.stdout.on("data", output); child.stderr.on("data", output);
+              child.once("error", failure => {
+                error = String(failure);
+                if (!child.pid) finish({ groupDrained: true });
+              });
+              let drained;
+              child.once("exit", (exitCode, exitSignal) => {
+                exited = true; code = exitCode; signal = exitSignal;
+                drained = (async () => {
+                  await pause(100);
+                  const leftoverChildren = alive();
+                  if (leftoverChildren) {
+                    kill("SIGTERM");
+                    const gentle = Date.now() + 1000;
+                    while (alive() && Date.now() < gentle) await pause(100);
+                    if (alive()) kill("SIGKILL");
+                    const deadline = Date.now() + 9000;
+                    while (alive() && Date.now() < deadline) await pause(100);
+                  }
+                  return { leftoverChildren, groupDrained: !alive() };
+                })().catch(failure => ({ groupDrained: false, cleanupError: String(failure) }));
+                drained.then(group => {
+                  if (closed) finish(group);
+                  else pipeDeadline = setTimeout(() => finish({ ...group, groupDrained: false, unresolvedPipe: true }), 1000);
+                });
+              });
+              child.once("close", () => {
+                closed = true;
+                if (exited) drained.then(finish);
+                else if (error) finish({ groupDrained: !child.pid });
+              });
+            });
+            Object.assign(step, result, { finishedAt: new Date().toISOString(), log: label + ".log",
+              logSha256: hash(join(out, label + ".log")), logBytes: statSync(join(out, label + ".log")).size }); save();
+            assert.equal(interrupted, undefined, "runner interrupted");
+            assert.ok(result.groupDrained && !result.leftoverChildren && !result.timedOut &&
+              !result.overflow && !result.error && result.signal === null, label + ": incomplete subprocess " + JSON.stringify(result));
+            return result.code;
+          }
+          async function checked(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(await execute(label, command, args, cwd, minutes, env), 0, label + " failed");
+          }
+
+          const verifyGateData = (spec, data, collection) => {
+            assert.ok(Array.isArray(data.testResults));
+            const fileOf = value => {
+              const matches = spec.files.filter(file => value === file || value.endsWith("/" + file));
+              assert.equal(matches.length, 1, "unexpected test file: " + value); return matches[0];
+            };
+            const rows = data.testResults.flatMap(suite => suite.assertionResults.map(row => {
+              assert.ok(Array.isArray(row.ancestorTitles) && typeof row.title === "string");
+              // Vitest list uses " > "; the JSON reporter's fullName uses spaces.
+              return { file: fileOf(suite.name), name: row.fullName, status: row.status,
+                collectedName: [...row.ancestorTitles, row.title].join(" > ") };
+            }));
+            assert.deepEqual([...new Set(data.testResults.map(suite => fileOf(suite.name)))].sort(), [...spec.files].sort());
+            const executed = rows.filter(row => !["pending", "skipped", "todo"].includes(row.status));
+            let selected;
+            if (spec.collect) {
+              assert.ok(Array.isArray(collection) && collection.length > 0, "empty collection");
+              const inventory = collection.map(row => ({ file: fileOf(row.file), name: row.name }));
+              const key = row => row.file + "\u0000" + ("collectedName" in row ? row.collectedName : row.name);
+              assert.equal(new Set(inventory.map(key)).size, inventory.length, "duplicate collected test");
+              assert.deepEqual([...new Set(inventory.map(row => row.file))].sort(), [...spec.files].sort());
+              assert.deepEqual(rows.map(key).sort(), inventory.map(key).sort(), "collected/run inventory mismatch");
+              assert.equal(executed.length, inventory.length, "unit skipped or missing");
+              assert.equal(data.numTotalTests, inventory.length);
+              selected = executed;
+            } else {
+              selected = spec.tests.flatMap(name => rows.filter(row => row.name === name || row.name.endsWith(" " + name)));
+              for (const name of spec.tests) {
+                const found = selected.filter(row => row.name === name || row.name.endsWith(" " + name));
+                assert.equal(found.length, 1, "missing or duplicate test: " + name);
+              }
+              assert.equal(executed.length, spec.tests.length, "unexpected executed tests");
+              if (!spec.args.includes("-t")) {
+                assert.equal(rows.length, spec.tests.length, "unexpected test inventory");
+                assert.equal(data.numTotalTests, spec.tests.length);
+              }
+            }
+            if (spec.expectedByFile) for (const file of spec.files)
+              assert.deepEqual(selected.filter(row => row.file === file).map(row => row.name).sort(), [...spec.expectedByFile[file]].sort(), "exact focused unit inventory");
+            assert.ok(selected.every(row => row.status === "passed"), "test did not pass");
+            assert.equal(data.success, true); assert.equal(data.numFailedTests, 0); assert.equal(data.numFailedTestSuites, 0);
+            assert.equal(data.numPassedTests, selected.length);
+            if (spec.llvmModes) for (const row of selected)
+              assert.ok(/^llvm differential corpus \([^)]*, release\+dev(?:,|\))/.test(row.name), "both LLVM modes must run");
+            return { tests: selected, executedCount: executed.length,
+              fileCounts: Object.fromEntries(spec.files.map(file => [file, selected.filter(row => row.file === file).length])) };
+          };
+
+
+          function source() {
+            assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("git", ["status", "--porcelain", "--untracked-files=all"]), "", "source changed");
+            assert.equal(capture("git", ["diff", "--exit-code", "HEAD"]), "");
+            const files = Object.fromEntries(Object.keys(sourcePins).map(file => [file, hash(join(root, file))]));
+            assert.deepEqual(files, sourcePins); return files;
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const name = row.slice(row.indexOf("\t") + 1);
+              return name.startsWith("native/llvm-codegen/") ||
+                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+                  "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
+            });
+            assert.equal(rows.length, nativeExpected.count);
+            assert.equal(sha(rows.join("\n")), nativeExpected.sha256);
+            return rows;
+          }
+          function tool(command, args = ["--version"]) {
+            const file = realpathSync(capture("sh", ["-c", 'command -v "$1"', "callback-proof", command]));
+            return { command, path: file, sha256: hash(file), version: capture(command, args) };
+          }
+          function sameTools() {
+            for (const item of Object.values(report.tools)) assert.equal(hash(item.path), item.sha256);
+            assert.equal(hash("node_modules/.pnpm/lock.yaml"), report.installedLockSha256);
+          }
+          function inventoryFiles(base) {
+            return readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(entry => {
+              const file = join(base, entry.name), info = lstatSync(file);
+              assert.ok(!info.isSymbolicLink(), "unexpected proof symlink");
+              return info.isDirectory() ? inventoryFiles(file) : [artifact(file)];
+            });
+          }
+
+          async function main() {
+            assert.equal(process.env.CALLBACK_SOURCE, head);
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
+            assert.equal(process.version, "v24.22.1");
+            assert.deepEqual({ workflow: report.workflow, run: report.run, attempt: report.attempt }, owner);
+            mkdirSync(work, { mode: 0o700 });
+            writeFileSync(ownerPath, JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+            report.runnerSha256 = hash(payload);
+            copyFileSync(payload, join(out, "runner.mjs"));
+            report.image = { os: process.env.ImageOS, version: process.env.ImageVersion };
+            report.orderBatches = orderBatches; save();
+            let verifyInputs;
+            try {
+              report.sourceBefore = source();
+              report.nativeInputs = nativeInputs();
+              writeFileSync(join(out, "native-inputs.txt"), report.nativeInputs.join("\n") + "\n");
+              report.nativeInputSha256 = nativeExpected.sha256;
+              report.tools = {
+                node: tool("node"), pnpm: tool("pnpm"), llvm: tool("llvm-config", ["--version"]),
+                zig: tool("zig", ["version"]), clang: tool("clang"), cxx: tool("g++"), strip: tool("strip"),
+              };
+              assert.equal(report.tools.node.version, "v24.22.1"); assert.equal(report.tools.pnpm.version, "11.1.3");
+              assert.equal(report.tools.llvm.version, "22.1.8"); assert.equal(report.tools.zig.version, "0.16.0");
+              assert.match(report.tools.clang.version, /clang version 22\.1\.8/);
+              report.installedLockSha256 = hash("node_modules/.pnpm/lock.yaml");
+              report.vitest = JSON.parse(readFileSync("node_modules/vitest/package.json", "utf8")).version;
+              assert.equal(report.vitest, "3.2.7");
+              const runtimePath = "packages/runtime-linux-x64-gnu/runtime-pack.json";
+              await checked("verify-runtime-before", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], root, 2);
+              report.runtimeManifest = artifactAfterCopy(runtimePath, "runtime-pack.json");
+              report.helper = JSON.parse(capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+              assert.equal(report.helper.ok, true); assert.equal(report.helper.protocol_version, "1");
+              assert.equal(report.helper.llvm_version, "22.1.8");
+              assert.equal(report.helper.scriptc_package_version, JSON.parse(readFileSync("packages/llvm-linux-x64-gnu/package.json", "utf8")).version);
+              report.helperSha256 = hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen");
+              const setupTemp = join(work, "setup-tmp"); mkdirSync(setupTemp, { mode: 0o700 });
+              await checked("workspace-build", "pnpm", ["build"], root, 10, { TMPDIR: setupTemp });
+              const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
+              const packRoot = process.env.SCRIPTC_LIBNODE;
+              assert.ok(packRoot && packRoot.startsWith("/"), "CI requires an absolute libnode pack");
+              const pack = readLibnodePack(packRoot, { verifyHashes: true });
+              assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
+              assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
+              report.libnode = { manifest: pack.manifest, receipt: artifactAfterCopy(join(packRoot, "manifest.json"), "libnode-pack.json"),
+                route: "canonical source-keyed libnode action; no historical bridge byte-identity claim" };
+              verifyInputs = async () => {
+                await checked("verify-runtime-after", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], root, 2);
+                assert.equal(hash(runtimePath), report.runtimeManifest.sha256);
+                assert.equal(hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen"), report.helperSha256);
+                assert.deepEqual(readLibnodePack(packRoot, { verifyHashes: true }).manifest, pack.manifest);
+                assert.deepEqual(nativeInputs(), report.nativeInputs); sameTools();
+                assert.equal(hash(payload), report.runnerSha256);
+                report.nativeVerifiedAfter = true;
+              };
+              assert.equal(hash(runtimePath), report.runtimeManifest.sha256);
+              assert.equal(hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen"), report.helperSha256);
+              assert.deepEqual(source(), report.sourceBefore); sameTools();
+              assert.equal(lstatSync(harnessLink, { throwIfNoEntry: false }), undefined, "harness cache already owned");
+              mkdirSync(harnessOutput, { mode: 0o700 });
+              mkdirSync(join(root, "node_modules/.cache"), { recursive: true });
+              symlinkSync(harnessOutput, harnessLink, "dir");
+              mkdirSync(join(out, "gates"));
+              const capacityScript = join(temp, process.env.PROOF_CAPACITY_NAME, "capacity.py");
+              assert.equal(hash(capacityScript), "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");
+              await checked("pre-proof-capacity", "python3", [capacityScript, "pre-proof"], root, 1);
+              for (const spec of gateSpecs) {
+                const gate = { id: spec.id, status: "running" }; report.gates.push(gate); save();
+                const scratch = join(work, spec.id); mkdirSync(scratch, { mode: 0o700 });
+                for (const name of ["cache", "tmp", "xdg"]) mkdirSync(join(scratch, name), { mode: 0o700 });
+                const env = { SCRIPTC_TEST_WORKERS: "2", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1",
+                  SCRIPTC_SAN: spec.sanitize ? "1" : "", SCRIPTC_CACHE_DIR: join(scratch, "cache"),
+                  XDG_CACHE_HOME: join(scratch, "xdg"), TMPDIR: join(scratch, "tmp"), ASAN_OPTIONS: "detect_leaks=0",
+                  SCRIPTC_LIBNODE: packRoot };
+                gate.environment = { ...env, llvmTestMode: null, testOptimization: null, shard: null, cpuDispatch: null };
+                const jsonPath = join(out, "gates", spec.id + ".json"), collectionPath = join(out, "gates", spec.id + ".collection.json");
+                try {
+                  let collection;
+                  if (spec.collect) {
+                    await checked("collect-" + spec.id, "pnpm", ["exec", "vitest", "list", ...spec.files, "--json=" + collectionPath], root, 5, env);
+                    collection = readJson(collectionPath); gate.collection = artifact(collectionPath);
+                  }
+                  const args = spec.files ? [...spec.args, "--reporter=json", "--outputFile=" + jsonPath] : spec.args;
+                  gate.code = await execute("gate-" + spec.id, spec.command ?? "pnpm", args, root, spec.seconds / 60, env);
+                  if (spec.files) {
+                    gate.result = artifact(jsonPath);
+                    gate.inventory = verifyGateData(spec, readJson(jsonPath), collection);
+                  }
+                  assert.equal(gate.code, 0, "canonical gate failed"); gate.status = "passed";
+                } catch (error) { gate.status = "failed"; gate.error = scrub(error.stack ?? error); }
+                finally { save(); }
+                if (interrupted || report.steps.some(step => step.groupDrained !== true)) break;
+              }
+              assert.equal(readlinkSync(harnessLink), harnessOutput);
+              report.gatesComplete = report.gates.length === gateSpecs.length && report.gates.every(gate => gate.status === "passed");
+              assert.deepEqual(report.gates.map(gate => gate.id), gateSpecs.map(spec => spec.id));
+              report.units = report.gates.find(gate => gate.id === "fallback-units")?.inventory?.executedCount ?? 0;
+              report.differentialSelections = report.gates.filter(gate => /^(llvm-)?differential-/.test(gate.id))
+                .reduce((sum, gate) => sum + (gate.inventory?.executedCount ?? 0), 0);
+              report.orderBatchCount = report.gates.find(gate => gate.id === "order-parity")?.inventory?.executedCount ?? 0;
+              assert.equal(report.units, 32); assert.equal(report.differentialSelections, 48); assert.equal(report.orderBatchCount, 2);
+              report.status = report.gatesComplete ? "passed" : "failed";
+            } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
+            finally {
+              try {
+                assert.ok(verifyInputs, "native preparation incomplete"); await verifyInputs();
+                report.sourceAfter = source(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+                report.sourceVerifiedAfter = true;
+              } catch (error) { report.status = "failed"; report.inputError = scrub(error.stack ?? error); }
+              report.qualificationComplete = report.status === "passed" && report.gatesComplete &&
+                report.nativeVerifiedAfter === true && report.sourceVerifiedAfter === true &&
+                report.steps.every(step => step.groupDrained === true && !step.leftoverChildren);
+              report.finishedAt = new Date().toISOString(); save();
+            }
+            if (!report.qualificationComplete) throw new Error("callback qualification failed");
+          }
+          function artifactAfterCopy(file, name) {
+            const target = join(out, name); copyFileSync(file, target); return artifact(target);
+          }
+          function finish() {
+            const cleanup = { ...owner, work: "absent", payload: "absent", passed: false };
+            try {
+              assert.deepEqual({ workflow: report.workflow, run: report.run, attempt: report.attempt }, owner);
+              if (existsSync(work)) {
+                assertOwner();
+                assert.ok(report.steps.every(step => step.groupDrained === true), "unresolved spawned process; retain scratch");
+                const link = lstatSync(harnessLink, { throwIfNoEntry: false });
+                if (link) {
+                  assert.equal(link.isSymbolicLink(), true); assert.equal(readlinkSync(harnessLink), harnessOutput);
+                  rmSync(harnessLink); cleanup.harnessLink = "removed";
+                }
+                rmSync(work, { recursive: true }); cleanup.work = "removed";
+              }
+              report.sourceAfterCleanup = source();
+              assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+              assert.equal(hash(payload), report.runnerSha256);
+              rmSync(payload); cleanup.payload = "removed"; cleanup.passed = true;
+            } catch (error) { cleanup.error = scrub(error.stack ?? error); report.qualificationComplete = false; }
+            report.cleanup = cleanup;
+            report.qualificationComplete &&= cleanup.passed;
+            report.status = report.qualificationComplete ? "passed" : "failed"; save();
+            writeFileSync(join(out, "cleanup.json"), JSON.stringify(cleanup, null, 2) + "\n");
+            writeFileSync(join(out, "artifact-manifest.json"), JSON.stringify(inventoryFiles(out).filter(item => item.path !== "artifact-manifest.json"), null, 2) + "\n");
+            if (!report.qualificationComplete) throw new Error("callback qualification incomplete or failed");
+          }
+          for (const key of ["FORCE_COLOR", "NO_COLOR", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_OPTIMIZATION", "SCRIPTC_TEST_SHARD",
+            "SCRIPTC_CPU_DISPATCH", "SCRIPTC_UPDATE_BASELINES", "SCRIPTC_TS7_ALL", "SCRIPTC_NO_CACHE", "SCRIPTC_CC", "SCRIPTC_TARGET"])
+            delete process.env[key];
+          try { if (process.argv[2] === "finish") finish(); else await main(); }
+          catch (error) { console.error(scrub(error.stack ?? error)); console.error("[callback-contracts] FAILED (exit 1)"); process.exitCode = 1; }
+
+          PROOF
+          ulimit -c 0
+          node "$RUNNER_TEMP/callback-contracts.mjs"
+      - name: Verify inputs and remove owned scratch
+        if: always()
+        run: |
+          if test ! -f "$RUNNER_TEMP/callback-contracts.mjs"; then
+            echo '[callback-contracts] FAILED (exit 1): setup did not reach qualification' >&2
+            exit 1
+          fi
+          node "$RUNNER_TEMP/callback-contracts.mjs" finish
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: node-fallback-callback-contracts
+          path: ${{ runner.temp }}/callback-contracts-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: callback-contracts-capacity
+          path: ${{ runner.temp }}/callback-contracts-capacity
+          if-no-files-found: error
+          retention-days: 1

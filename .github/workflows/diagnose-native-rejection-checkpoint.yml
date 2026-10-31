@@ -18,13 +18,14 @@ jobs:
     timeout-minutes: 120
     env:
       NODE_OPTIONS: --max-old-space-size=4096
-      DIAGNOSTIC_SOURCE: 02e8c33c5af924dc24dae8c6f0029e5b5b545390
+      PROOF_CAPACITY_NAME: native-rejection-checkpoint-capacity
+      DIAGNOSTIC_SOURCE: 01301dab3ec1bd3792f24068c3133b8038225e5e
       DIAGNOSTIC_LABEL: late-queue-qualification
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 02e8c33c5af924dc24dae8c6f0029e5b5b545390
+          ref: 01301dab3ec1bd3792f24068c3133b8038225e5e
           persist-credentials: false
       - name: Verify source before setup
         run: |
@@ -37,7 +38,88 @@ jobs:
         with:
           node-version: 24.22.1
           cache: pnpm
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
       - uses: ./.github/actions/llvm-linux
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
       - run: pnpm install --frozen-lockfile
       - uses: ./.github/actions/zig
       - uses: ./.github/actions/native-packages
@@ -71,6 +153,7 @@ jobs:
             excludedCheckpointCases: ["native-next-tick", "hosted-next-tick", "hosted-macrotask-next-tick", "hosted-direct-catch"],
             priorCombinedQualification: { runId: "41237107401", source: "23222d50b8ed293c360d9ed8122f1abd3a2f4cee", disposition: "historical combined-branch proof; not substituted for this narrow branch" },
             parentCallbackContracts: { source: "1b9a1c3d97c343743203004581e0be58ce54ddf6", disposition: "separate callback-only proof; this run exercises changed runtime and upstream timer siblings" },
+            priorSetupFailure: { runId: "41239202995", source: "02e8c33c5af924dc24dae8c6f0029e5b5b545390", surface: "GitHub runner disk exhausted during LLVM setup; no tests executed" },
             expectedExecutionAttempts: 32, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [], gates: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -693,7 +776,7 @@ jobs:
             return { tests: selected, executedCount: executed.length,
               fileCounts: Object.fromEntries(spec.files.map(file => [file, selected.filter(row => row.file === file).length])) };
           };
-          const sourcePins = {"packages/compiler/src/index.ts":"d41310098b22397b62ce0bbea07926f41a270c5f783f92549be72f90ab939184","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/diagnostics/diagnostic.ts":"f6151c4b9c3ef455225d3c431b0105c26b550c466175ac7b0a8152dfa50fb9a3","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/lowering/lower-calls.ts":"286e15d1e21de0b8b521b8d49e21fe2adcbf21b5bdf6ee5ab17ad12b5081bc32","packages/compiler/src/frontend/lowering/lower-exprs.ts":"21912d733d3728c8c28d821951ac10d6bb686fb7ae16dc3bd2132fe9bb16e03f","packages/compiler/src/frontend/lowering/lower-timers.ts":"60b575cb24a4dbe48faa20c3902ad5aba958743dec43c062602be3e352ed6006","packages/compiler/src/frontend/lowering/builtins/process.ts":"bab00a5f3d96bb7ed83e156194a751c95a9169b551f7840920183ac19c2f392b","packages/compiler/src/frontend/lowering/builtins/async-context.ts":"9d078abd4a635e71b3792bc26a974fb23bb96486500cfdb4120173568badc1d2","packages/compiler/src/frontend/lowering/lower-node-island.ts":"e24b6e158ccd48a54ca959fea8caaf6f5acf8694d6a58f9c2218190790a8651f","packages/compiler/src/frontend/lowering/lower-modules.ts":"e0c52ed22a75d9e686521035fd034ab4e651abe12d2a0208b77893f4c8133ffe","packages/compiler/src/ir/ir.ts":"3d42a34f9ce9e224216480f2915156cf884476e2f7f3f2cb27a53b4304dfc4a7","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/llvm/emit-module.ts":"7f4aaf92765acbc976c777e69b6b038af8f8294289cb9375c307845248e6ef8e","packages/compiler/src/backend/llvm/lib-shared.ts":"28040a84108ae08052fcba16b408257ffe5e934550aad9e6e83d72dead058f05","packages/compiler/src/backend/llvm/lib-dispatch.ts":"b7a41843af487802b7b1d72a26340175bb266c5193a835e7413b5cac1ac8e25c","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/policy.ts":"e651aac43783cb63c37654d0d4e678db79569d22eb096ed91cfb061e9d338dcc","packages/compiler/src/node-islands/snapshot.ts":"a84a9a5ca422f65f2d87dceceb3e96aaa7e17e1b451a9aa5294cc95ca80a9a94","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/runtime/src/scr_async.c":"b791e8bc16ef59d869530e488e8e2897e3666472399bb01aa272603f80d92c34","packages/runtime/src/scr_async.h":"227e01b808b736ce74c9a5504d56fcad2d0660170236366e84607d2d644cee16","packages/runtime/src/scr_async_dyn.c":"8581ef781977bb9640b6e18c91bf246471e012db0beabb3f276412d9109f50d4","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island_boot.c":"9d819bff68f0df27bf7b7a7ca8a6fa5e7520a1dfe2a75a2406845a8051b2922d","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","native/llvm-codegen/src/target.h":"6e814839b13df133fbd8b19898862334dac7f5e96b47501333e62738d68a7bac","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e","packages/compiler/src/backend/native-codegen-core.ts":"dab5c5a2de6a4ac34a191eaaf82412f504641148b14d2b39634944dfb8d92a54","tests/harness/node-island-order.test.ts":"d65d90ae809161d8cd88ccd6eebc08933c11d51d657703433dbb8de61b25268d","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/lowering/builtins/filesystem-calls.ts":"88d2e3b54a631af751db64a59672841fb7ab28ec66ccc29bc22b7998169fba9c","packages/compiler/src/frontend/lowering/builtins/module-calls.ts":"ee354ecd973579c449e3d8d14d61386624135c2013c8c505a47e63f29f5dbd5c","packages/compiler/src/node-islands/report.ts":"a5a478c8b659075ff122445153538cd256a2b5d74b2c6ca24eca861df83aefdb","packages/compiler/src/ir/builtin-signatures.ts":"ead0a0ef55bb6f27da1952c5c63b6c6ae09489f55d3c165898b22857cd8ce135","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/runtime/src/scr_async.test.ts":"2a8f27a39d08a92beb6e4333a62ac8ebffe99674b0000522f0bfbbdc54e5c275","packages/runtime/src/scr_async.test.c":"5d3747715bcad651cdada822607344d75f299f416505421ea877f3fe4589f85b","packages/runtime/src/scr_console.c":"2f76b45128cd44f6871b72dc68790f2b23687569fdb00217a49f075a2ccddd90","packages/runtime/src/scr_dyn_invoke.c":"ead567d20d0cf5144191aa6f65000ecc099d6f155dfcca494bdec38357572875","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/corpus/2558-rejection-events.cjs":"0e6e72d3b8cf786db0eb44ce5e5ac2dc7f4ed3702a42831f1df9b95185ec05ea","tests/corpus/2212-unhandled-rejection-listener.cjs":"14ebfec6d740bfea283712e2b8d51825f1f15e7317c3e8c066af7e01cdf4cca5","tests/corpus/5996-rejections-between-macrotasks.cjs":"b619c7f3e1d2088c8d38e2a6cf3e26780206f644569d4acb16c26e34117a993a","tests/corpus/process-uncaught-rejection.cjs":"89b94dbf9c3b9bb220218f1f4583ff8e4692d901e219583f13121343d238d606","tests/corpus/2654-top-level-await-unrelated-rejection.ts":"1250bc4d1ecd7edff7544339c128fa2a75159ae1feb9832404c3738412b137df","tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts":"e7b6f366715e28b4404805773c5d4556d8eb817ac9df28dc934a0462a1312a07","tests/corpus/5808-worker-unhandled-rejections.ts":"b7693e7a8648fb787f3c461ec28544a9c1826f3eb29a262c7c01523dead0697b","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"17a1144990227554d0018284bfc9cd443bf64c167ed983722a53a32ce857bbba","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/frontend/type-mapper.ts":"853cdfd4fe6f540d4b4e54404ba4cfe3bdebce57b846bef036e8e7b25e955541","packages/compiler/src/frontend/program.ts":"1ac6c387f4cf31771057d44c7e088f6b943763dc3d035e887449e8059d1f7bac","packages/compiler/ambient/scriptc-node-fallback.d.ts":"79ed691d22b3014535358a178e839b22cf4500108e281b515da6bdf447ae1bb7","packages/compiler/ambient/node-fallback/fs.d.ts":"49e8fe8c619c5b18634c387620016792d803a85a10a1984ef925f11726f193db","packages/compiler/test/node-fallback-callbacks.test.ts":"04c5ba9c4c1ed756f9fe5a2cc007708f1620c3b722a0f7d00399bbba28763f9e","packages/compiler/test/process-listener-int32-emission.test.ts":"4e44281fa18276ea7e7ef153cb771596f2c329e047a75600005f1dfc7574b8b4","packages/runtime/src/scr_bytes_io.c":"9383b53d7a03154d5f2c01054d4cfaa1b0242814046e84b8280d60d19053efaa","packages/compiler/src/frontend/lowering/class-dynamic-dispatch.ts":"b9329695faa67ea5fe4d8559e2a5e716cd2b8694b01c5560622cdee513dcf385","packages/compiler/src/frontend/lowering/caught-value-dispatch.ts":"2b5979c747e290892e58f0af504c5916444f60231179d9d4f1d97e1a7279badb","packages/compiler/src/frontend/lowering/expressions/narrowing.ts":"3e776d5064b5334b7ab08d036aa8f10e6c3d14abaad3189dee3e4ded88fa8fbc","packages/compiler/src/frontend/lowering/call-signatures.ts":"622f7e16eeded2fb552fb5b8d17b699b7416cd5919de02c39b402c677570bc63","packages/compiler/src/frontend/lowering/expressions/identifiers.ts":"4c9caba278acc4e6afc1056981ffdb3cab820e0cce1d01f03d2460e9349223e7","packages/compiler/src/frontend/lowering/expressions/relational.ts":"2eff4bcc08f7704bd1e7b2ee57e0e76615ff9d3d235d0fb39243f11e0104cbe6","packages/compiler/src/frontend/ts7/checker.ts":"26486e5436d12b04db79da573ceccd83a36a392b8884885305abb285de439f87","packages/compiler/src/frontend/ts7/semantic-model.ts":"3153f9d9706f2709bc03a1c26b0cbbeda02c49fe67fbab7ae26c1b9674ea081f","packages/compiler/src/frontend/lowering/builtins/filesystem.ts":"1d957bd8524cfdb48b6ad9307868d766782e1cdcc4c4373ad6f9f764216c3eb5","tests/corpus/process-uncaught-loop.cjs":"ade72040e8a399d67ae705df64fad69ccf06106b76447ce89988285ab9a42cec","tests/corpus/5747-fs-stat-throw-if-no-entry.ts":"59084acec7b57911bf53885fe30aa1b34f05e8a475fe89c9ecda9025dcbdc7a7","tests/corpus/5748-fs-stat-throw-if-no-entry-js.cjs":"6377a20590cf0817ec9079c4e85babd8e6c04f57b53fdfae7ac4c239429d11ab","tests/corpus/7018-bigint-stats.ts":"4f4550950fdd30aafb5c94a6ea26ceff19b578b32b33bcd124bac89e09a7cb8e","tests/corpus/6811-node-island-uncaught-listener/main.mjs":"3dbe00c405cb383497acb48361ac377a460f12057cca0c80888c633892ebec29","tests/corpus/6811-node-island-uncaught-listener/island.cjs":"199d0f712f9f8e2fa9aeb0e0c75a8e17bf1eca86808b9485372dd8be78f7f2c9","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","packages/compiler/test/ts7/order-parity.test.ts":"7bf12e7d4b9186846c69416b985d3bfad8ec5befb0f3e2e04f36e05748e13efc","scripts/test-ts7.mjs":"e776328473c679f9a6183c9d880a609f72dfb62fc80f58c8a7a085112ff1c80c","scripts/ts7-order-fixtures.mjs":"53b2f36fdf75a6436eb60af7259499ff6fd140f2ac14cc5e158dfd772befc34e","tests/corpus/path-function-values.cjs":"1692d230dd1284bf314d811f44cf2ac1933ece7bb3ab4d963fdb5cc65c12af03","tests/corpus/path-module-values-untyped.cjs":"21b1054be3c68ade28bb431da082484c08356a2f36bc99c96fb27b6a87b22af5","tests/corpus/path-namespace-spreads.js":"1689ab9a7c56a0e1fa543de60f6d99b1f391c38a0f700a862012de205d4e6b83","tests/corpus/path-untyped-calls.cjs":"d46be4895106d127e9b46d334e6641984410db1953170900f7ace6ce566907be","tests/corpus/path-win32-relative-case.cjs":"c07da86935197b01c2d5c4b1ae50aa22b5eeb8fc9898a932e9bfcbfea32d6d6a","tests/corpus/pick-alias-view-modules/main.ts":"abb0d9df1e14a2d6ad82a873581f3609f41cd18bae96f5aa0cc9a64d2aa0a576","tests/corpus/primitive-and-function-descriptors.js":"bc6e006906cdb4ab1f2ed24408e4fab5a7725c8ea1cea4f4c68bb8a21c80b0df","tests/corpus/private-in-checked-primitives.js":"774fdb2f43acfb80de79384545e045a4f457e083a6d9b69ea0c86118e82bef8f","tests/corpus/process-builtin-values.js":"353ae0dfa4de344648dbb181b9bacffe1ae19994261458ff183bc16b811afd5a","tests/corpus/process-cwd-value.cjs":"10c457bc1181df78ba57986ba322b82d03314fd2c5f05263043811aa0fdc0eaf","tests/corpus/process-cwd-value.mjs":"9baaf4ba1c1301e968688f63f231575fdc721ebe312a91897557d0956be20532","tests/corpus/process-emit-warning-arguments.cjs":"ad000aff327843c17c6e6c5058d692cd8190d3df37704b5eb0bc22465ec22085","tests/corpus/process-env-computed-keys.js":"943764dbb3e0229b17f8b53eea90a980dfcda03cc5cc58fd04ca720581c62960","tests/corpus/process-hrtime.js":"521406c8cdf2776f929e40dd63167c060df81bebd4b75be3c8ba475f09aa1e3d","tests/corpus/process-kill-chdir-errors.cjs":"686dc436924277cac830f6b2caf0bcbed2d043f812735add2589d060f15bcbad","tests/corpus/process-memory-usage-array-buffers.cjs":"52c8b5a6efb5ce755a5a8c1ad1756837b3ee11ae444f78ca9dba66e0f4c2f1c0","tests/corpus/process-named-signals.cjs":"ad21ebfc952bf8939207fba2c7d0be4da8163f9bed207acb03b857bc5f8c3dd2","tests/corpus/process-uncaught-handler-throws.cjs":"605c36e9c136aece99b155e419d02d990d8ce73f0e295472c2639b621ac0a4ef","tests/corpus/process-uncaught-module.mjs":"89ca3547f60672a89978f895adad9278a40a96b59ea32539360723de6a6bc6ea","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-function-values.cjs.json":"83fe139a8d6dc7c146b44d64393daf2346652c97d8657fe52f65ffd041c63b41","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-module-values-untyped.cjs.json":"01bb6bacaafbd3d8a38c4910deb6a8d48fe879f40bf09b8443343f65b117e53a","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-namespace-spreads.js.json":"170ec93e08bea8c69b5fa3af71ccf30dd889024dde57eed3234c9e487c91ef65","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-untyped-calls.cjs.json":"e59fde919c49e03300a6b6f798ff2673a74314cebd1992c51d974874c3f9f0b9","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-win32-relative-case.cjs.json":"b4a70e45f7effd83ac72dc1897791c37d3801e0b4c72478686de83c25c407206","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/pick-alias-view-modules/main.ts.json":"6fa9e81da311c14c540e1aa65c53d74669e813894f7347e2c21417a1ffed1ce7","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/primitive-and-function-descriptors.js.json":"18c9b0938e0b3c093692211066c553731427ed691291f4bfd32778ac94ce1be8","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/private-in-checked-primitives.js.json":"28dd81991875ca53b9c26e607ac417542e411a30e1d24d8e8cfa65139ecbaade","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-builtin-values.js.json":"eab9a81fc195de3e1fd41f68d4bc4b0e36e91e0bfbdcc9078a9acbe0e597698e","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-value.cjs.json":"7e7fcfd24a7673e1ba5f008506f8aa82fbcd71f59502d37af2fdba5da938fd65","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-value.mjs.json":"7abce02f9d5bbe704230d319f5f9afd12886e4e9e563064a227d9439ca643381","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-emit-warning-arguments.cjs.json":"18bb5756b3ef77f2726d6adc809941f65f43cbd180fd425bb00ccfc36b520acf","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-env-computed-keys.js.json":"702b9b805a7a771d28d42e322134894737b286f2e391c1cccc1fa0ccb8e09d57","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-hrtime.js.json":"cdc91ae1386c3f40a62da3ec3ec4766d1035bcaf67d1a476aa6323ee3692297b","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-kill-chdir-errors.cjs.json":"ffc5e8e2913524e24158456bfc26acb76a5e5ddf77a9d5ac2580e90f6dbc2d10","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-memory-usage-array-buffers.cjs.json":"d237003d829b05e2a97aa306eccfb54f3d89e23ea07c3b83d5ed929bd958949b","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-named-signals.cjs.json":"8e3ea10e8c9ff5f5e21e6fffe6e86d793b2ff0c542f78e45cc6f99e777a21b45","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-handler-throws.cjs.json":"73a52b8abee9c98c8cb3c7848ce2a1baf91cd696706fc066c8aac69d292edef0","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-loop.cjs.json":"b3b46dcddb370fef3339cebc0d94ac5f98dffd2272d4747a5a0d9f6ee6c73358","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-module.mjs.json":"18cb5cd26545d59ab95029fdfd441b408243c504569b9438ebac7b09512f5ab0","tests/corpus/pick-alias-view-modules/ctx.ts":"f9be9086ae384bffcc1831faaece081d31be7e158e32b13099768b1e4b55cdbe","tests/corpus/pick-alias-view-modules/globals.ts":"d8bb5df5e28f82ca5ea333ecc58df0e7f76325511576addffb892876f84c49a4","tests/corpus/pick-alias-view-modules/registry.ts":"b229675c8def57d3292e76a2f80462a22ba1dafb7e739d5056721fb57b33a5e3","packages/compiler/src/frontend/lowering/lower-stmts.ts":"d7357f9f7384a03072e27008d9f3913fbeeead7326d44830435ff76a71a395a7","packages/compiler/src/frontend/lowering/expressions/array-literals.ts":"a69c00a92d11127804d2bcd35e3d423b7f222a3167ab9fd8c4b7c70ce8f0de68","tests/harness/node-island-late-rejection-handling.test.ts":"e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c","tests/harness/timers-this-emission.test.ts":"feee8597a440864ae32305905f3a3195490b03519bf9210a8b7f44f029f90ca4","tests/corpus/timers-callback-this.cjs":"0b4459d6c83e1192b77d995739e70cb268df3a965c5469c034badcbf3f5ad7c6","tests/corpus/timer-this-hosted-loop/lib.cjs":"51dbc76f2a161e0fec66e27043893bf36da38819e8d31f9553d032201404fa50","tests/corpus/timer-this-hosted-loop/main.mjs":"3975adec10ae88790328206b086c09df59fdea3d7013ac3a6a5a40e70628ff89"};
+          const sourcePins = {"packages/compiler/src/index.ts":"d41310098b22397b62ce0bbea07926f41a270c5f783f92549be72f90ab939184","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/diagnostics/diagnostic.ts":"f6151c4b9c3ef455225d3c431b0105c26b550c466175ac7b0a8152dfa50fb9a3","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/lowering/lower-calls.ts":"286e15d1e21de0b8b521b8d49e21fe2adcbf21b5bdf6ee5ab17ad12b5081bc32","packages/compiler/src/frontend/lowering/lower-exprs.ts":"21912d733d3728c8c28d821951ac10d6bb686fb7ae16dc3bd2132fe9bb16e03f","packages/compiler/src/frontend/lowering/lower-timers.ts":"60b575cb24a4dbe48faa20c3902ad5aba958743dec43c062602be3e352ed6006","packages/compiler/src/frontend/lowering/builtins/process.ts":"bab00a5f3d96bb7ed83e156194a751c95a9169b551f7840920183ac19c2f392b","packages/compiler/src/frontend/lowering/builtins/async-context.ts":"9d078abd4a635e71b3792bc26a974fb23bb96486500cfdb4120173568badc1d2","packages/compiler/src/frontend/lowering/lower-node-island.ts":"e24b6e158ccd48a54ca959fea8caaf6f5acf8694d6a58f9c2218190790a8651f","packages/compiler/src/frontend/lowering/lower-modules.ts":"e0c52ed22a75d9e686521035fd034ab4e651abe12d2a0208b77893f4c8133ffe","packages/compiler/src/ir/ir.ts":"3d42a34f9ce9e224216480f2915156cf884476e2f7f3f2cb27a53b4304dfc4a7","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/llvm/emit-module.ts":"7f4aaf92765acbc976c777e69b6b038af8f8294289cb9375c307845248e6ef8e","packages/compiler/src/backend/llvm/lib-shared.ts":"28040a84108ae08052fcba16b408257ffe5e934550aad9e6e83d72dead058f05","packages/compiler/src/backend/llvm/lib-dispatch.ts":"b7a41843af487802b7b1d72a26340175bb266c5193a835e7413b5cac1ac8e25c","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/policy.ts":"e651aac43783cb63c37654d0d4e678db79569d22eb096ed91cfb061e9d338dcc","packages/compiler/src/node-islands/snapshot.ts":"a84a9a5ca422f65f2d87dceceb3e96aaa7e17e1b451a9aa5294cc95ca80a9a94","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/runtime/src/scr_async.c":"b791e8bc16ef59d869530e488e8e2897e3666472399bb01aa272603f80d92c34","packages/runtime/src/scr_async.h":"227e01b808b736ce74c9a5504d56fcad2d0660170236366e84607d2d644cee16","packages/runtime/src/scr_async_dyn.c":"8581ef781977bb9640b6e18c91bf246471e012db0beabb3f276412d9109f50d4","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island_boot.c":"9d819bff68f0df27bf7b7a7ca8a6fa5e7520a1dfe2a75a2406845a8051b2922d","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","native/llvm-codegen/src/target.h":"6e814839b13df133fbd8b19898862334dac7f5e96b47501333e62738d68a7bac","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e","packages/compiler/src/backend/native-codegen-core.ts":"dab5c5a2de6a4ac34a191eaaf82412f504641148b14d2b39634944dfb8d92a54","tests/harness/node-island-order.test.ts":"d65d90ae809161d8cd88ccd6eebc08933c11d51d657703433dbb8de61b25268d","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/lowering/builtins/filesystem-calls.ts":"88d2e3b54a631af751db64a59672841fb7ab28ec66ccc29bc22b7998169fba9c","packages/compiler/src/frontend/lowering/builtins/module-calls.ts":"ee354ecd973579c449e3d8d14d61386624135c2013c8c505a47e63f29f5dbd5c","packages/compiler/src/node-islands/report.ts":"a5a478c8b659075ff122445153538cd256a2b5d74b2c6ca24eca861df83aefdb","packages/compiler/src/ir/builtin-signatures.ts":"ead0a0ef55bb6f27da1952c5c63b6c6ae09489f55d3c165898b22857cd8ce135","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/runtime/src/scr_async.test.ts":"2a8f27a39d08a92beb6e4333a62ac8ebffe99674b0000522f0bfbbdc54e5c275","packages/runtime/src/scr_async.test.c":"5d3747715bcad651cdada822607344d75f299f416505421ea877f3fe4589f85b","packages/runtime/src/scr_console.c":"2f76b45128cd44f6871b72dc68790f2b23687569fdb00217a49f075a2ccddd90","packages/runtime/src/scr_dyn_invoke.c":"ead567d20d0cf5144191aa6f65000ecc099d6f155dfcca494bdec38357572875","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/corpus/2558-rejection-events.cjs":"0e6e72d3b8cf786db0eb44ce5e5ac2dc7f4ed3702a42831f1df9b95185ec05ea","tests/corpus/2212-unhandled-rejection-listener.cjs":"14ebfec6d740bfea283712e2b8d51825f1f15e7317c3e8c066af7e01cdf4cca5","tests/corpus/5996-rejections-between-macrotasks.cjs":"b619c7f3e1d2088c8d38e2a6cf3e26780206f644569d4acb16c26e34117a993a","tests/corpus/process-uncaught-rejection.cjs":"89b94dbf9c3b9bb220218f1f4583ff8e4692d901e219583f13121343d238d606","tests/corpus/2654-top-level-await-unrelated-rejection.ts":"1250bc4d1ecd7edff7544339c128fa2a75159ae1feb9832404c3738412b137df","tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts":"e7b6f366715e28b4404805773c5d4556d8eb817ac9df28dc934a0462a1312a07","tests/corpus/5808-worker-unhandled-rejections.ts":"b7693e7a8648fb787f3c461ec28544a9c1826f3eb29a262c7c01523dead0697b","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"17a1144990227554d0018284bfc9cd443bf64c167ed983722a53a32ce857bbba","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/frontend/type-mapper.ts":"853cdfd4fe6f540d4b4e54404ba4cfe3bdebce57b846bef036e8e7b25e955541","packages/compiler/src/frontend/program.ts":"1ac6c387f4cf31771057d44c7e088f6b943763dc3d035e887449e8059d1f7bac","packages/compiler/ambient/scriptc-node-fallback.d.ts":"79ed691d22b3014535358a178e839b22cf4500108e281b515da6bdf447ae1bb7","packages/compiler/ambient/node-fallback/fs.d.ts":"49e8fe8c619c5b18634c387620016792d803a85a10a1984ef925f11726f193db","packages/compiler/test/node-fallback-callbacks.test.ts":"04c5ba9c4c1ed756f9fe5a2cc007708f1620c3b722a0f7d00399bbba28763f9e","packages/compiler/test/process-listener-int32-emission.test.ts":"4e44281fa18276ea7e7ef153cb771596f2c329e047a75600005f1dfc7574b8b4","packages/runtime/src/scr_bytes_io.c":"9383b53d7a03154d5f2c01054d4cfaa1b0242814046e84b8280d60d19053efaa","packages/compiler/src/frontend/lowering/class-dynamic-dispatch.ts":"b9329695faa67ea5fe4d8559e2a5e716cd2b8694b01c5560622cdee513dcf385","packages/compiler/src/frontend/lowering/caught-value-dispatch.ts":"2b5979c747e290892e58f0af504c5916444f60231179d9d4f1d97e1a7279badb","packages/compiler/src/frontend/lowering/expressions/narrowing.ts":"3e776d5064b5334b7ab08d036aa8f10e6c3d14abaad3189dee3e4ded88fa8fbc","packages/compiler/src/frontend/lowering/call-signatures.ts":"622f7e16eeded2fb552fb5b8d17b699b7416cd5919de02c39b402c677570bc63","packages/compiler/src/frontend/lowering/expressions/identifiers.ts":"4c9caba278acc4e6afc1056981ffdb3cab820e0cce1d01f03d2460e9349223e7","packages/compiler/src/frontend/lowering/expressions/relational.ts":"2eff4bcc08f7704bd1e7b2ee57e0e76615ff9d3d235d0fb39243f11e0104cbe6","packages/compiler/src/frontend/ts7/checker.ts":"26486e5436d12b04db79da573ceccd83a36a392b8884885305abb285de439f87","packages/compiler/src/frontend/ts7/semantic-model.ts":"3153f9d9706f2709bc03a1c26b0cbbeda02c49fe67fbab7ae26c1b9674ea081f","packages/compiler/src/frontend/lowering/builtins/filesystem.ts":"1d957bd8524cfdb48b6ad9307868d766782e1cdcc4c4373ad6f9f764216c3eb5","tests/corpus/process-uncaught-loop.cjs":"ade72040e8a399d67ae705df64fad69ccf06106b76447ce89988285ab9a42cec","tests/corpus/5747-fs-stat-throw-if-no-entry.ts":"59084acec7b57911bf53885fe30aa1b34f05e8a475fe89c9ecda9025dcbdc7a7","tests/corpus/5748-fs-stat-throw-if-no-entry-js.cjs":"6377a20590cf0817ec9079c4e85babd8e6c04f57b53fdfae7ac4c239429d11ab","tests/corpus/7018-bigint-stats.ts":"4f4550950fdd30aafb5c94a6ea26ceff19b578b32b33bcd124bac89e09a7cb8e","tests/corpus/6811-node-island-uncaught-listener/main.mjs":"3dbe00c405cb383497acb48361ac377a460f12057cca0c80888c633892ebec29","tests/corpus/6811-node-island-uncaught-listener/island.cjs":"199d0f712f9f8e2fa9aeb0e0c75a8e17bf1eca86808b9485372dd8be78f7f2c9","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","packages/compiler/test/ts7/order-parity.test.ts":"7bf12e7d4b9186846c69416b985d3bfad8ec5befb0f3e2e04f36e05748e13efc","scripts/test-ts7.mjs":"e776328473c679f9a6183c9d880a609f72dfb62fc80f58c8a7a085112ff1c80c","scripts/ts7-order-fixtures.mjs":"53b2f36fdf75a6436eb60af7259499ff6fd140f2ac14cc5e158dfd772befc34e","tests/corpus/path-function-values.cjs":"1692d230dd1284bf314d811f44cf2ac1933ece7bb3ab4d963fdb5cc65c12af03","tests/corpus/path-module-values-untyped.cjs":"21b1054be3c68ade28bb431da082484c08356a2f36bc99c96fb27b6a87b22af5","tests/corpus/path-namespace-spreads.js":"1689ab9a7c56a0e1fa543de60f6d99b1f391c38a0f700a862012de205d4e6b83","tests/corpus/path-untyped-calls.cjs":"d46be4895106d127e9b46d334e6641984410db1953170900f7ace6ce566907be","tests/corpus/path-win32-relative-case.cjs":"c07da86935197b01c2d5c4b1ae50aa22b5eeb8fc9898a932e9bfcbfea32d6d6a","tests/corpus/pick-alias-view-modules/main.ts":"abb0d9df1e14a2d6ad82a873581f3609f41cd18bae96f5aa0cc9a64d2aa0a576","tests/corpus/primitive-and-function-descriptors.js":"bc6e006906cdb4ab1f2ed24408e4fab5a7725c8ea1cea4f4c68bb8a21c80b0df","tests/corpus/private-in-checked-primitives.js":"774fdb2f43acfb80de79384545e045a4f457e083a6d9b69ea0c86118e82bef8f","tests/corpus/process-builtin-values.js":"353ae0dfa4de344648dbb181b9bacffe1ae19994261458ff183bc16b811afd5a","tests/corpus/process-cwd-value.cjs":"10c457bc1181df78ba57986ba322b82d03314fd2c5f05263043811aa0fdc0eaf","tests/corpus/process-cwd-value.mjs":"9baaf4ba1c1301e968688f63f231575fdc721ebe312a91897557d0956be20532","tests/corpus/process-emit-warning-arguments.cjs":"ad000aff327843c17c6e6c5058d692cd8190d3df37704b5eb0bc22465ec22085","tests/corpus/process-env-computed-keys.js":"943764dbb3e0229b17f8b53eea90a980dfcda03cc5cc58fd04ca720581c62960","tests/corpus/process-hrtime.js":"521406c8cdf2776f929e40dd63167c060df81bebd4b75be3c8ba475f09aa1e3d","tests/corpus/process-kill-chdir-errors.cjs":"686dc436924277cac830f6b2caf0bcbed2d043f812735add2589d060f15bcbad","tests/corpus/process-memory-usage-array-buffers.cjs":"52c8b5a6efb5ce755a5a8c1ad1756837b3ee11ae444f78ca9dba66e0f4c2f1c0","tests/corpus/process-named-signals.cjs":"ad21ebfc952bf8939207fba2c7d0be4da8163f9bed207acb03b857bc5f8c3dd2","tests/corpus/process-uncaught-handler-throws.cjs":"605c36e9c136aece99b155e419d02d990d8ce73f0e295472c2639b621ac0a4ef","tests/corpus/process-uncaught-module.mjs":"89ca3547f60672a89978f895adad9278a40a96b59ea32539360723de6a6bc6ea","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-function-values.cjs.json":"83fe139a8d6dc7c146b44d64393daf2346652c97d8657fe52f65ffd041c63b41","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-module-values-untyped.cjs.json":"01bb6bacaafbd3d8a38c4910deb6a8d48fe879f40bf09b8443343f65b117e53a","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-namespace-spreads.js.json":"170ec93e08bea8c69b5fa3af71ccf30dd889024dde57eed3234c9e487c91ef65","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-untyped-calls.cjs.json":"e59fde919c49e03300a6b6f798ff2673a74314cebd1992c51d974874c3f9f0b9","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/path-win32-relative-case.cjs.json":"b4a70e45f7effd83ac72dc1897791c37d3801e0b4c72478686de83c25c407206","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/pick-alias-view-modules/main.ts.json":"6fa9e81da311c14c540e1aa65c53d74669e813894f7347e2c21417a1ffed1ce7","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/primitive-and-function-descriptors.js.json":"18c9b0938e0b3c093692211066c553731427ed691291f4bfd32778ac94ce1be8","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/private-in-checked-primitives.js.json":"28dd81991875ca53b9c26e607ac417542e411a30e1d24d8e8cfa65139ecbaade","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-builtin-values.js.json":"eab9a81fc195de3e1fd41f68d4bc4b0e36e91e0bfbdcc9078a9acbe0e597698e","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-value.cjs.json":"7e7fcfd24a7673e1ba5f008506f8aa82fbcd71f59502d37af2fdba5da938fd65","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-cwd-value.mjs.json":"7abce02f9d5bbe704230d319f5f9afd12886e4e9e563064a227d9439ca643381","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-emit-warning-arguments.cjs.json":"18bb5756b3ef77f2726d6adc809941f65f43cbd180fd425bb00ccfc36b520acf","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-env-computed-keys.js.json":"702b9b805a7a771d28d42e322134894737b286f2e391c1cccc1fa0ccb8e09d57","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-hrtime.js.json":"cdc91ae1386c3f40a62da3ec3ec4766d1035bcaf67d1a476aa6323ee3692297b","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-kill-chdir-errors.cjs.json":"ffc5e8e2913524e24158456bfc26acb76a5e5ddf77a9d5ac2580e90f6dbc2d10","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-memory-usage-array-buffers.cjs.json":"d237003d829b05e2a97aa306eccfb54f3d89e23ea07c3b83d5ed929bd958949b","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-named-signals.cjs.json":"8e3ea10e8c9ff5f5e21e6fffe6e86d793b2ff0c542f78e45cc6f99e777a21b45","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-handler-throws.cjs.json":"73a52b8abee9c98c8cb3c7848ce2a1baf91cd696706fc066c8aac69d292edef0","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-loop.cjs.json":"b3b46dcddb370fef3339cebc0d94ac5f98dffd2272d4747a5a0d9f6ee6c73358","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/process-uncaught-module.mjs.json":"18cb5cd26545d59ab95029fdfd441b408243c504569b9438ebac7b09512f5ab0","tests/corpus/pick-alias-view-modules/ctx.ts":"f9be9086ae384bffcc1831faaece081d31be7e158e32b13099768b1e4b55cdbe","tests/corpus/pick-alias-view-modules/globals.ts":"d8bb5df5e28f82ca5ea333ecc58df0e7f76325511576addffb892876f84c49a4","tests/corpus/pick-alias-view-modules/registry.ts":"b229675c8def57d3292e76a2f80462a22ba1dafb7e739d5056721fb57b33a5e3","packages/compiler/src/frontend/lowering/lower-stmts.ts":"d7357f9f7384a03072e27008d9f3913fbeeead7326d44830435ff76a71a395a7","packages/compiler/src/frontend/lowering/expressions/array-literals.ts":"a69c00a92d11127804d2bcd35e3d423b7f222a3167ab9fd8c4b7c70ce8f0de68","tests/harness/node-island-late-rejection-handling.test.ts":"60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d","tests/harness/timers-this-emission.test.ts":"feee8597a440864ae32305905f3a3195490b03519bf9210a8b7f44f029f90ca4","tests/corpus/timers-callback-this.cjs":"0b4459d6c83e1192b77d995739e70cb268df3a965c5469c034badcbf3f5ad7c6","tests/corpus/timer-this-hosted-loop/lib.cjs":"51dbc76f2a161e0fec66e27043893bf36da38819e8d31f9553d032201404fa50","tests/corpus/timer-this-hosted-loop/main.mjs":"3975adec10ae88790328206b086c09df59fdea3d7013ac3a6a5a40e70628ff89"};
           const sourceFiles = Object.keys(sourcePins);
           const source = () => {
             assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
@@ -734,8 +817,8 @@ jobs:
               },
               "expected": "unhandled\nattach\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -755,8 +838,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -773,8 +856,8 @@ jobs:
               },
               "expected": "unhandled\nattach\nafter\ntick\ncaught first\ncaught second\nhandled\nhandled tick\nhandled microtask\nhandled immediate\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -791,8 +874,8 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ntick\ncaught\ncaught\nonce\non\non\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -809,8 +892,8 @@ jobs:
               },
               "expected": "unhandled\nunhandled\nattach\ncaught first\nhandled first\nhandled second\ncaught second\nhandled microtask\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -827,8 +910,8 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nhandled 2\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -845,8 +928,8 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nuncaught tick\nuncaught microtask\nhandled 2\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -863,8 +946,8 @@ jobs:
               },
               "expected": "unhandled\nattach\nafter\ntick\ncaught\nhandled\nuncaught listener failure\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -884,8 +967,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught first\ncaught second\nhandled\nhandled tick\nhandled microtask\nhandled immediate\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -905,8 +988,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\ntick\ncaught\ncaught\nonce\non\non\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -926,8 +1009,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\nattach\ncaught first\nhandled first\nhandled second\ncaught second\nhandled microtask\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -947,8 +1030,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nhandled 2\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -968,8 +1051,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nuncaught tick\nuncaught microtask\nhandled 2\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -989,8 +1072,8 @@ jobs:
               },
               "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught\nhandled\nuncaught listener failure\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -1013,8 +1096,8 @@ jobs:
               },
               "expected": "unhandled\nattach\nisland ready\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
@@ -1037,8 +1120,8 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ncaught first\nhandled first\nisland ready\nhandled second\ntick\ncaught second\nmicrotask\nio true\n",
               "origin": "tests/harness/node-island-late-rejection-handling.test.ts",
-              "fixtureSource": "02e8c33c5af924dc24dae8c6f0029e5b5b545390",
-              "fixtureSourceSha256": "e00dc5339a52d057eabb0b879b2bed72bd04d9865881974f4ef4e28ab55dc20c",
+              "fixtureSource": "01301dab3ec1bd3792f24068c3133b8038225e5e",
+              "fixtureSourceSha256": "60ba80636ebc2282ec5c806248975dd816212e2b4f46b5db2e8cc484ee63262d",
               "fixtureDefinitionSha256": "dff24b97e725ae803fed0c4a99d4ef6c8cd44552f3977f66b3197e49bfc8747d",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             }
@@ -1124,6 +1207,9 @@ jobs:
               assert.equal(hash(new URL(import.meta.url)), report.runner.sha256);
               report.nativeInputsVerifiedAfter = true;
             };
+            const capacityScript = join(process.env.RUNNER_TEMP, process.env.PROOF_CAPACITY_NAME, "capacity.py");
+            assert.equal(hash(capacityScript), "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");
+            requireSuccess(execute("pre-proof-capacity", "python3", [capacityScript, "pre-proof"], 60));
             for (const spec of specs) {
               const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, hosted: spec.hosted, deferredHost: spec.deferredHost, lateHandling: spec.lateHandling, fixtureSourceSha256: spec.fixtureSourceSha256, expectedStdoutSha256: digest(spec.expected), flavors: {} };
               report.cases.push(observed);
@@ -1312,5 +1398,12 @@ jobs:
         with:
           name: native-rejection-checkpoint-late-queue-qualification
           path: ${{ runner.temp }}/native-rejection-checkpoint-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-rejection-checkpoint-capacity
+          path: ${{ runner.temp }}/native-rejection-checkpoint-capacity
           if-no-files-found: error
           retention-days: 1
