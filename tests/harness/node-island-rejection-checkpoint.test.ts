@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -40,7 +40,18 @@ setImmediate(() => console.log("done"));
 `;
 }
 
-const cases = [
+interface CheckpointCase {
+  id: string;
+  hosted: boolean;
+  macrotask: boolean;
+  directCatch: boolean;
+  lateHandling?: boolean;
+  source?: string;
+  stdout?: string;
+  deferredHost?: boolean;
+}
+
+const cases: CheckpointCase[] = [
   { id: "native-next-tick", hosted: false, macrotask: false, directCatch: false },
   { id: "hosted-next-tick", hosted: true, macrotask: false, directCatch: false },
   { id: "hosted-macrotask-next-tick", hosted: true, macrotask: true, directCatch: false },
@@ -61,7 +72,223 @@ const cases = [
   },
 ];
 
-for (const { id, hosted, macrotask, directCatch, lateHandling = false } of cases) {
+const lifecycleCases = [
+  {
+    id: "late-listeners-and-work",
+    source: `const removed = () => console.log("removed");
+process.on("rejectionHandled", removed);
+process.on("unhandledRejection", (_reason, pending) => {
+  console.log("unhandled");
+  setImmediate(() => {
+    console.log("attach");
+    process.off("rejectionHandled", removed);
+    pending.catch(() => console.log("caught first"));
+    pending.catch(() => console.log("caught second"));
+    process.on("rejectionHandled", removed);
+    process.once("rejectionHandled", () => {
+      console.log("handled");
+      process.nextTick(() => console.log("handled tick"));
+      queueMicrotask(() => console.log("handled microtask"));
+      setImmediate(() => console.log("handled immediate"));
+    });
+    process.off("rejectionHandled", removed);
+    console.log("after");
+    process.nextTick(() => console.log("tick"));
+  });
+});
+Promise.reject("sentinel");
+`,
+    stdout:
+      "unhandled\nattach\nafter\ntick\ncaught first\ncaught second\nhandled\nhandled tick\nhandled microtask\nhandled immediate\n",
+  },
+  {
+    id: "late-once-two-promises",
+    source: `let reports = 0;
+process.once("rejectionHandled", () => console.log("once"));
+process.on("rejectionHandled", () => console.log("on"));
+process.on("unhandledRejection", (_reason, pending) => {
+  console.log("unhandled");
+  pending.catch(() => console.log("caught"));
+  if (++reports === 2) process.nextTick(() => console.log("tick"));
+});
+Promise.reject("first");
+Promise.reject("second");
+`,
+    stdout: "unhandled\nunhandled\ntick\ncaught\ncaught\nonce\non\non\n",
+  },
+  {
+    id: "late-reentrant-handling",
+    source: `const pending: any[] = [];
+process.on("unhandledRejection", (_reason, promise) => {
+  console.log("unhandled");
+  pending.push(promise);
+  if (pending.length === 2) setImmediate(() => {
+    console.log("attach");
+    pending[0].catch(() => console.log("caught first"));
+  });
+});
+process.on("rejectionHandled", (promise) => {
+  if (promise === pending[0]) {
+    console.log("handled first");
+    pending[1].catch(() => console.log("caught second"));
+    queueMicrotask(() => console.log("handled microtask"));
+  } else {
+    console.log("handled second");
+  }
+});
+Promise.reject("first");
+Promise.reject("second");
+`,
+    stdout:
+      "unhandled\nunhandled\nattach\ncaught first\nhandled first\nhandled second\ncaught second\nhandled microtask\n",
+  },
+  {
+    id: "late-recovery-without-jobs",
+    source: `let handled = 0;
+process.on("uncaughtException", () => console.log("uncaught"));
+process.on("rejectionHandled", () => {
+  console.log("handled", ++handled);
+  if (handled === 1) throw new Error("listener failure");
+});
+process.on("unhandledRejection", (_reason, pending) => {
+  console.log("unhandled");
+  pending.catch(() => console.log("caught"));
+});
+Promise.reject("first");
+Promise.reject("second");
+`,
+    stdout: "unhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nhandled 2\n",
+  },
+  {
+    id: "late-recovery-with-jobs",
+    source: `let handled = 0;
+process.on("uncaughtException", () => {
+  console.log("uncaught");
+  process.nextTick(() => console.log("uncaught tick"));
+  queueMicrotask(() => console.log("uncaught microtask"));
+});
+process.on("rejectionHandled", () => {
+  console.log("handled", ++handled);
+  if (handled === 1) throw new Error("listener failure");
+});
+process.on("unhandledRejection", (_reason, pending) => {
+  console.log("unhandled");
+  pending.catch(() => console.log("caught"));
+});
+Promise.reject("first");
+Promise.reject("second");
+`,
+    stdout:
+      "unhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nuncaught tick\nuncaught microtask\nhandled 2\n",
+  },
+  {
+    id: "late-listener-throw",
+    source: `process.on("uncaughtException", (error) => console.log("uncaught", error.message));
+process.on("rejectionHandled", () => {
+  console.log("handled");
+  throw new Error("listener failure");
+});
+process.on("unhandledRejection", (_reason, pending) => {
+  console.log("unhandled");
+  setImmediate(() => {
+    console.log("attach");
+    try {
+      pending.catch(() => console.log("caught"));
+    } catch {
+      console.log("attach threw");
+    }
+    console.log("after");
+    process.nextTick(() => console.log("tick"));
+  });
+});
+Promise.reject("sentinel");
+`,
+    stdout: "unhandled\nattach\nafter\ntick\ncaught\nhandled\nuncaught listener failure\n",
+  },
+];
+
+for (const hosted of [false, true]) {
+  for (const fixture of lifecycleCases) {
+    cases.push({
+      ...fixture,
+      id: `${hosted ? "hosted" : "native"}-${fixture.id}`,
+      hosted,
+      macrotask: false,
+      directCatch: false,
+      lateHandling: true,
+      stdout: (hosted ? "island ready\n" : "") + fixture.stdout,
+    });
+  }
+}
+
+cases.push({
+  id: "host-starts-with-late-event",
+  hosted: true,
+  deferredHost: true,
+  macrotask: false,
+  directCatch: false,
+  lateHandling: true,
+  source: `process.on("rejectionHandled", () => console.log("handled"));
+process.on("unhandledRejection", (_reason, pending) => {
+  console.log("unhandled");
+  setImmediate(() => {
+    console.log("attach");
+    pending.catch(() => console.log("caught"));
+    requireModule("checkpoint-host").start();
+    console.log("after");
+    process.nextTick(() => console.log("tick"));
+  });
+});
+Promise.reject("sentinel");
+`,
+  stdout: "unhandled\nattach\nisland ready\nafter\ntick\ncaught\nhandled\n",
+});
+
+cases.push({
+  id: "handled-listener-starts-host-with-io",
+  hosted: true,
+  deferredHost: true,
+  macrotask: false,
+  directCatch: false,
+  lateHandling: true,
+  source: `import { stat } from "node:fs";
+const pending: any[] = [];
+process.on("unhandledRejection", (_reason, promise) => {
+  console.log("unhandled");
+  pending.push(promise);
+  if (pending.length === 2) setImmediate(() => {
+    pending[0].catch(() => console.log("caught first"));
+  });
+});
+process.on("rejectionHandled", (promise) => {
+  if (promise === pending[0]) {
+    console.log("handled first");
+    pending[1].catch(() => console.log("caught second"));
+    stat(".", (error) => console.log("io", error === null));
+    requireModule("checkpoint-host").start();
+    process.nextTick(() => console.log("tick"));
+    queueMicrotask(() => console.log("microtask"));
+  } else {
+    console.log("handled second");
+  }
+});
+Promise.reject("first");
+Promise.reject("second");
+`,
+  stdout:
+    "unhandled\nunhandled\ncaught first\nhandled first\nisland ready\nhandled second\ntick\ncaught second\nmicrotask\nio true\n",
+});
+
+for (const {
+  id,
+  hosted,
+  macrotask,
+  directCatch,
+  lateHandling = false,
+  source,
+  stdout,
+  deferredHost,
+} of cases) {
   test.skipIf(hosted && pack === null)(
     lateHandling
       ? `late rejection events follow queued work (${id})`
@@ -79,11 +306,25 @@ for (const { id, hosted, macrotask, directCatch, lateHandling = false } of cases
             },
           }),
           "main.ts":
-            (hosted ? 'import { start } from "checkpoint-host";\nstart();\n' : "") +
-            (macrotask
-              ? `setImmediate(() => {\n${body(directCatch, lateHandling)}});\n`
-              : body(directCatch, lateHandling)),
+            (hosted
+              ? deferredHost
+                ? 'import { requireModule } from "@scriptc/node";\n'
+                : 'import { start } from "checkpoint-host";\nstart();\n'
+              : "") +
+            (source ??
+              (macrotask
+                ? `setImmediate(() => {\n${body(directCatch, lateHandling)}});\n`
+                : body(directCatch, lateHandling))),
         };
+        if (deferredHost) {
+          // Keep the Node oracle's explicit bridge entrypoint unchanged.
+          for (const name of ["package.json", "index.js", "index.d.ts"]) {
+            files[`node_modules/@scriptc/node/${name}`] = readFileSync(
+              new URL(`../../packages/node/${name}`, import.meta.url),
+              "utf8",
+            );
+          }
+        }
         if (hosted) {
           files["node_modules/checkpoint-host/package.json"] = JSON.stringify({
             name: "checkpoint-host",
@@ -107,10 +348,11 @@ for (const { id, hosted, macrotask, directCatch, lateHandling = false } of cases
           timeout: 20_000,
         });
         expect(expected.stdout).toBe(
-          (hosted ? "island ready\n" : "") +
-            (lateHandling
-              ? "unhandled\nattach\nafter\ntick\ncaught\nhandled\n"
-              : "microtask\n" + (directCatch ? "" : "tick\n") + "caught\ndone\n"),
+          stdout ??
+            (hosted ? "island ready\n" : "") +
+              (lateHandling
+                ? "unhandled\nattach\nafter\ntick\ncaught\nhandled\n"
+                : "microtask\n" + (directCatch ? "" : "tick\n") + "caught\ndone\n"),
         );
         expect(expected.stderr).toBe("");
 
