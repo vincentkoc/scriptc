@@ -1,0 +1,748 @@
+name: Qualify typed local JavaScript zero cost
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-typed-local-js-zero-cost.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-typed-local-js-zero-cost
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -eo pipefail {0}
+
+env:
+  BASE_SHA: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+  CAND_SHA: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ZC_JOB: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          persist-credentials: false
+      - name: Write the qualification runner
+        run: |
+          mkdir -p "$RUNNER_TEMP/zero-cost-assets" "$RUNNER_TEMP/zero-cost-native"
+          cat > "$RUNNER_TEMP/zero-cost-assets/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { spawn, spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import {
+            closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync,
+            readdirSync, readlinkSync, realpathSync, renameSync, statfsSync, statSync, writeFileSync, writeSync,
+          } from "node:fs";
+          import { availableParallelism, totalmem } from "node:os";
+          import { basename, dirname, join, relative, resolve } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+
+          const BASE = "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486";
+          const CAND = "923a57d63cc1a32324cd0a4d514935db3f2ad264";
+          const pins = {
+            "scripts/zero-cost-gate.mjs": "8c46165ba1a95338b010efcb425a6c03971fa883b0a2a7a57a077726c1f4a8f0",
+            "scripts/zero-cost-merge.mjs": "5ac0841a88b96575e62b8af12a195d654406096ac27eae4e5fbd3ca78c0eda08",
+            "scripts/zero-cost-compare.mjs": "5fbc96898aeec0cac4d10a6d8899600925910c81b8cdd78bd560deb1da9dfc14",
+            "benchmarks/runtime/workloads.mjs": "de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c",
+          };
+          const GiB = 1024 ** 3;
+          const task = process.env.ZC_JOB;
+          assert.ok(task === "native" || task === "merge" || /^(self|[1-8])$/.test(task ?? ""));
+          const mode = process.argv[2];
+          const modeDeadline = Date.now() + ({ prepare: 8, "install-native": 20, package: 22,
+            initialize: 8, build: 65, gate: 120, merge: 8, finish: 3 }[mode] ?? 1) * 60_000;
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const temp = process.env.RUNNER_TEMP;
+          const assets = join(temp, "zero-cost-assets");
+          const out = join(temp, "zero-cost-" + task);
+          const candidate = task === "native" ? workspace : join(workspace, "candidate");
+          const baseline = join(workspace, "baseline");
+          const pack = join(temp, "zero-cost-libnode");
+          mkdirSync(out, { recursive: true });
+          const summaryPath = join(out, "summary.json");
+          const report = existsSync(summaryPath) ? JSON.parse(readFileSync(summaryPath, "utf8")) : {
+            schema: 1, task, baseline: BASE, candidate: CAND, workflow: process.env.GITHUB_SHA,
+            run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", complete: false, startedAt: new Date().toISOString(), steps: [],
+          };
+          assert.equal(report.workflow, process.env.GITHUB_SHA);
+          assert.equal(report.run, process.env.GITHUB_RUN_ID);
+          assert.equal(report.attempt, process.env.GITHUB_RUN_ATTEMPT);
+          const sha = data => createHash("sha256").update(data).digest("hex");
+          const hash = file => sha(readFileSync(file));
+          const scrub = value => String(value).replaceAll(workspace, "<workspace>").replaceAll(temp, "<temp>");
+          const save = () => writeFileSync(summaryPath, JSON.stringify(report, null, 2) + "\n");
+          const pause = ms => new Promise(done => setTimeout(done, ms));
+          const capture = (command, args, cwd = candidate) => {
+            const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 ** 2 });
+            assert.equal(result.error, undefined, command + ": " + String(result.error));
+            assert.equal(result.status, 0, command + ": " + (result.stderr ?? "").slice(-4000));
+            return result.stdout.trim();
+          };
+          let active;
+          let interrupted;
+          for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
+            interrupted = signal;
+            active?.stop();
+          });
+
+          // Each subprocess owns one detached group. Drain at leader exit,
+          // not pipe closure; descendants can otherwise keep the runner alive.
+          async function execute(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(interrupted, undefined, "runner interrupted");
+            const timeoutMs = Math.min(minutes * 60_000, modeDeadline - Date.now());
+            assert.ok(timeoutMs > 0, "qualification phase deadline expired");
+            const step = { label, command, args: args.map(scrub), cwd: scrub(cwd), startedAt: new Date().toISOString() };
+            report.steps.push(step); save();
+            const log = openSync(join(out, label + ".log"), "wx");
+            const started = Date.now();
+            const result = await new Promise(resolveResult => {
+              let timedOut = false, overflow = false, closed = false, settled = false, exited = false;
+              let force, pipeDeadline, hardDeadline;
+              let code = null, signal = null, error;
+              let bytes = 0;
+              const child = spawn(command, args, {
+                cwd, env: { ...process.env, ...env }, detached: true, stdio: ["ignore", "pipe", "pipe"],
+              });
+              const alive = () => {
+                if (!child.pid) return false;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, 0); return true; }
+                catch (failure) { if (failure.code === "ESRCH") return false; throw failure; }
+              };
+              const kill = sig => {
+                if (!child.pid) return;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, sig); }
+                catch (failure) { if (failure.code !== "ESRCH") throw failure; }
+              };
+              const finish = group => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer); clearTimeout(force); clearTimeout(pipeDeadline); clearTimeout(hardDeadline);
+                active = undefined;
+                child.stdout.destroy(); child.stderr.destroy();
+                child.unref();
+                closeSync(log);
+                resolveResult({ code, signal, error, timedOut, overflow, ...group, elapsedMs: Date.now() - started });
+              };
+              const stop = () => {
+                kill("SIGTERM");
+                if (!force) force = setTimeout(() => kill("SIGKILL"), 1000);
+                if (!hardDeadline) hardDeadline = setTimeout(() => finish({ groupDrained: false, cleanupDeadline: true }), 15_000);
+              };
+              active = { stop };
+              const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
+              const output = data => {
+                if (settled) return;
+                bytes += data.length;
+                if (bytes > 128 * 1024 ** 2) { overflow = true; stop(); return; }
+                writeSync(log, data);
+              };
+              child.stdout.on("data", output); child.stderr.on("data", output);
+              child.once("error", failure => {
+                error = String(failure);
+                if (!child.pid) finish({ groupDrained: true });
+              });
+              let drained;
+              child.once("exit", (exitCode, exitSignal) => {
+                exited = true; code = exitCode; signal = exitSignal;
+                drained = (async () => {
+                  await pause(100);
+                  const leftoverChildren = alive();
+                  if (leftoverChildren) {
+                    kill("SIGTERM");
+                    const gentle = Date.now() + 1000;
+                    while (alive() && Date.now() < gentle) await pause(100);
+                    if (alive()) kill("SIGKILL");
+                    const deadline = Date.now() + 9000;
+                    while (alive() && Date.now() < deadline) await pause(100);
+                  }
+                  return { leftoverChildren, groupDrained: !alive() };
+                })().catch(failure => ({ groupDrained: false, cleanupError: String(failure) }));
+                drained.then(group => {
+                  if (closed) finish(group);
+                  else pipeDeadline = setTimeout(() => finish({ ...group, groupDrained: false, unresolvedPipe: true }), 1000);
+                });
+              });
+              child.once("close", () => {
+                closed = true;
+                if (exited) drained.then(finish);
+                else if (error) finish({ groupDrained: !child.pid });
+              });
+            });
+            Object.assign(step, result, { finishedAt: new Date().toISOString() }); save();
+            assert.equal(interrupted, undefined, "runner interrupted");
+            assert.ok(result.groupDrained && !result.leftoverChildren && !result.timedOut &&
+              !result.overflow && !result.error && result.signal === null, label + ": incomplete subprocess " + JSON.stringify(result));
+            return result.code;
+          }
+          async function checked(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(await execute(label, command, args, cwd, minutes, env), 0, label + " failed");
+          }
+          function source(root, expected) {
+            assert.equal(capture("git", ["rev-parse", "HEAD"], root), expected);
+            assert.equal(capture("git", ["status", "--porcelain", "--untracked-files=all"], root), "", "dirty source");
+            const files = capture("git", ["ls-files", "-s", "-z"], root).split("\0").filter(Boolean);
+            const content = createHash("sha256");
+            for (const row of files) {
+              const tab = row.indexOf("\t"), name = row.slice(tab + 1), mode = row.slice(0, 6);
+              assert.ok(tab > 0 && !name.startsWith("/") && !name.split("/").includes(".."));
+              const path = join(root, name), info = lstatSync(path);
+              const bytes = info.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : readFileSync(path);
+              content.update(mode + "\0" + name + "\0" + sha(bytes) + "\0");
+            }
+            for (const [name, expectedHash] of Object.entries(pins)) assert.equal(hash(join(root, name)), expectedHash, name);
+            return { head: expected, tree: capture("git", ["rev-parse", "HEAD^{tree}"], root), files: files.length, contentSha256: content.digest("hex") };
+          }
+          function sources() {
+            return task === "native" ? { candidate: source(candidate, CAND) }
+              : { baseline: source(baseline, BASE), candidate: source(candidate, CAND) };
+          }
+          function nativeInputs(root, ref) {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", ref], root).split("\n");
+            return rows.filter(row => {
+              const name = row.slice(row.indexOf("\t") + 1);
+              return name.startsWith("native/llvm-codegen/") ||
+                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+                  "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
+            });
+          }
+          function memory() {
+            const fields = Object.fromEntries(readFileSync("/proc/meminfo", "utf8").trim().split("\n").map(line => {
+              const [name, amount] = line.split(/:\s*/); return [name, Number(amount.split(/\s/)[0]) * 1024];
+            }));
+            const disk = statfsSync(temp);
+            return { total: totalmem(), available: fields.MemAvailable, swapTotal: fields.SwapTotal,
+              swapFree: fields.SwapFree, diskFree: Number(disk.bavail) * Number(disk.bsize),
+              cores: availableParallelism(), swaps: readFileSync("/proc/swaps", "utf8") };
+          }
+          function admit(createSwap) {
+            const before = memory();
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
+            assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, "insufficient physical runner capacity");
+            const minimum = task === "self" && before.total >= 40 * GiB ? 40 : 28;
+            const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));
+            if (createSwap && missing > 0) {
+              assert.ok(missing <= 24, "swap requirement exceeds the task budget");
+              assert.ok(before.diskFree >= (missing + 16) * GiB, "insufficient disk for swap and builds");
+              const path = join(temp, "zero-cost-" + process.env.GITHUB_RUN_ID + "-" + task + ".swap");
+              assert.ok(!existsSync(path), "owned swap path already exists");
+              report.swap = { path, bytes: missing * GiB, originalSwaps: before.swaps, active: false }; save();
+              capture("sudo", ["fallocate", "-l", String(missing * GiB), path]);
+              capture("sudo", ["chmod", "600", path]);
+              capture("sudo", ["mkswap", path]);
+              capture("sudo", ["swapon", path]);
+              report.swap.active = true; save();
+            }
+            const after = memory();
+            assert.ok(after.available + after.swapFree >= minimum * GiB, "compiler heaps lack RAM/swap headroom");
+            assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, "insufficient remaining disk");
+            (report.capacity ??= []).push({ phase: mode, before, after }); save();
+          }
+          function cleanupSwap() {
+            if (!report.swap) return;
+            const swap = report.swap;
+            assert.equal(swap.path, join(temp, "zero-cost-" + process.env.GITHUB_RUN_ID + "-" + task + ".swap"));
+            const live = () => readFileSync("/proc/swaps", "utf8").split("\n").slice(1).some(line => line.split(/\s+/)[0] === swap.path);
+            if (live()) capture("sudo", ["swapoff", swap.path]);
+            assert.equal(live(), false, "owned swap remains active");
+            if (existsSync(swap.path)) capture("sudo", ["rm", "--", swap.path]);
+            swap.active = false; swap.removed = true; save();
+          }
+          function filesUnder(root, prefix = "") {
+            const files = [];
+            for (const name of readdirSync(join(root, prefix)).sort()) {
+              const path = prefix ? prefix + "/" + name : name;
+              const info = lstatSync(join(root, path));
+              if (info.isDirectory()) files.push(...filesUnder(root, path));
+              else { assert.ok(info.isFile(), "artifact must be a regular file: " + path); files.push(path); }
+            }
+            return files;
+          }
+          const fileFacts = (root, paths) => paths.map(path => {
+            const info = lstatSync(join(root, path));
+            assert.ok(info.isFile(), "not a regular artifact: " + path);
+            return { path, size: info.size, mode: info.mode & 0o777, sha256: hash(join(root, path)) };
+          });
+          function checkFacts(root, expected) { assert.deepEqual(fileFacts(root, expected.map(file => file.path)), expected); }
+          function libnode(root) {
+            const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"));
+            assert.equal(manifest.schema, "scriptc.libnode-pack.v1");
+            assert.equal(manifest.platform, "linux"); assert.equal(manifest.arch, "x64");
+            assert.equal(manifest.moduleVersion, 137); assert.equal(manifest.bridgeAbi, 10);
+            assert.ok(["24.22.0", "24.22.1"].includes(manifest.nodeVersion));
+            for (const name of [manifest.libnode, manifest.bridge]) {
+              assert.ok(typeof name === "string" && basename(name) === name && name !== "." && name !== "..");
+              assert.ok(lstatSync(join(root, name)).isFile());
+              assert.equal(statSync(join(root, name)).size, manifest.files[name].size);
+              assert.equal(hash(join(root, name)), manifest.files[name].sha256);
+            }
+            return { manifest, manifestSha256: hash(join(root, "manifest.json")),
+              files: fileFacts(root, ["manifest.json", manifest.libnode, manifest.bridge,
+                ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])]) };
+          }
+          function tools() {
+            const node = process.version, pnpm = capture("pnpm", ["--version"]);
+            const llvm = capture("llvm-config", ["--version"]);
+            assert.equal(node, "v24.22.0"); assert.equal(pnpm, "11.1.3"); assert.equal(llvm, "22.1.8");
+            return { node, pnpm, llvm, clang: capture("clang", ["--version"]), nm: capture("nm", ["--version"]),
+              executables: Object.fromEntries(["node", "pnpm", "llvm-config", "clang", "g++", "nm", "strip"].map(name => [name, executable(name)])),
+              imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion, platform: process.platform, arch: process.arch };
+          }
+          function executable(name) {
+            const path = realpathSync(capture("which", [name]));
+            assert.ok(lstatSync(path).isFile());
+            return { path: scrub(path), size: statSync(path).size, sha256: hash(path) };
+          }
+          function readAssetManifest() {
+            const manifest = JSON.parse(readFileSync(join(assets, "inputs.json"), "utf8"));
+            assert.equal(manifest.baseline, BASE); assert.equal(manifest.candidate, CAND);
+            assert.equal(manifest.workflow, process.env.GITHUB_SHA);
+            assert.equal(manifest.run, process.env.GITHUB_RUN_ID); assert.equal(manifest.attempt, process.env.GITHUB_RUN_ATTEMPT);
+            assert.equal(manifest.runnerSha256, hash(fileURLToPath(import.meta.url)));
+            assert.equal(hash(join(assets, "native.tar.gz")), manifest.nativeArchiveSha256);
+            assert.equal(hash(join(assets, "libnode.tar.gz")), manifest.libnodeArchiveSha256);
+            return manifest;
+          }
+          async function inventories() {
+            const text = readFileSync(join(candidate, "scripts/zero-cost-gate.mjs"), "utf8");
+            assert.equal(sha(text), pins["scripts/zero-cost-gate.mjs"]);
+            const start = "const FIXTURE_PROGRAMS =", end = "/* ── builds ";
+            assert.equal(text.split(start).length, 2); assert.equal(text.split(end).length, 2);
+            const block = text.slice(text.indexOf(start), text.indexOf(end));
+            assert.ok(block.includes("function goodCodeSet()"));
+            const { readWorkloads } = await import(pathToFileURL(join(candidate, "benchmarks/runtime/workloads.mjs")).href);
+            // Run only the pinned collector declarations. Importing the gate
+            // itself would allocate its work directory and start compiling.
+            const collect = new Function("assert", "readWorkloads", "join", "relative", "existsSync",
+              "readdirSync", "statSync", "readFileSync", "resolve", "dirname", "programsRoot", "sets",
+              "values", "only", block + "\nreturn goodCodeSet();");
+            const select = (set, shard) => collect(assert, readWorkloads, join, relative, existsSync,
+              readdirSync, statSync, readFileSync, resolve, dirname, baseline, new Set(set.split(",")),
+              { corpus: "ts", shard }, null).map(program => ({
+                id: program.id, entry: relative(baseline, program.entry), kind: program.kind,
+                optimization: program.kind === "exe" ? program.optimization ?? "release" : null,
+                ...(program.workload ? { workload: program.workload } : {}),
+              }));
+            const full = select("bench,corpus,self"), shards = {};
+            for (let index = 1; index <= 8; index++) shards[String(index)] = select("bench,corpus", index + "/8");
+            shards.self = select("self");
+            const ids = rows => rows.map(row => row.id).sort();
+            assert.equal(new Set(ids(full)).size, full.length);
+            assert.deepEqual(ids(Object.values(shards).flat()), ids(full));
+            for (const rows of Object.values(shards)) assert.ok(rows.length > 0);
+            assert.deepEqual(ids(shards.self), ["fixture/llvm-emitter", "fixture/llvm-layouts", "self/cli"]);
+            return { schema: 1, baseline: BASE, programsRoot: baseline, pins, full, shards };
+          }
+          function validateGate(data, expected, roots) {
+            assert.equal(data.schema, 1);
+            for (const [label, head] of [["baseline", BASE], ["candidate", CAND]]) {
+              assert.equal(data.trees[label].root, roots[label]);
+              assert.equal(data.trees[label].revision, capture("git", ["rev-parse", "--short", head], roots[label]));
+            }
+            assert.equal(data.programsRoot, roots.baseline);
+            assert.equal(data.host.platform, "linux"); assert.equal(data.host.arch, "x64"); assert.equal(data.host.node, "v24.22.0");
+            assert.equal(data.allow, null); assert.equal(data.strict, false); assert.equal(data.baselineCache, null);
+            assert.ok(Array.isArray(data.failures) && Array.isArray(data.globalFailures));
+            assert.ok(data.globalFailures.every(value => data.failures.includes(value)));
+            assert.equal(data.verdict, data.failures.length ? "fail" : "pass");
+            assert.ok(Number.isFinite(data.elapsedMs) && data.elapsedMs > 0);
+            const actualIds = data.programs.map(row => row.id).sort(), wantedIds = expected.map(row => row.id).sort();
+            assert.deepEqual(actualIds, wantedIds, "incomplete program inventory");
+            assert.equal(new Set(actualIds).size, actualIds.length);
+            const counts = {};
+            for (const row of data.programs) {
+              assert.ok(["identical", "runtime-only", "nondeterministic", "both-fail", "differs", "build-error"].includes(row.verdict));
+              assert.equal(row.allowed, false);
+              counts[row.verdict] = (counts[row.verdict] ?? 0) + 1;
+              if (row.verdict === "both-fail") {
+                assert.ok(typeof row.baselineError === "string" && row.baselineError.length > 0);
+                assert.equal(row.baselineError, row.candidateError);
+              } else if (!["build-error"].includes(row.verdict)) {
+                const kinds = expected.find(program => program.id === row.id).kind === "exe" ? ["ir", "llvm", "exe"] : ["llvm"];
+                assert.deepEqual(Object.keys(row.artifacts).sort(), kinds.sort());
+                for (const side of ["baseline", "candidate"]) assert.ok(Number.isFinite(row.buildMs[side]) && row.buildMs[side] > 0);
+              }
+              assert.notEqual(row.cachedBaseline, true);
+            }
+            assert.deepEqual(data.counts, counts);
+            assert.equal(data.timing.runs, 5); assert.equal(data.timing.maxGrowth, 0.02);
+            const timed = expected.filter(row => !row.id.startsWith("corpus/"));
+            assert.deepEqual(data.timing.rows.map(row => row.id).sort(), timed.map(row => row.id).sort(), "incomplete timing inventory");
+            for (const row of data.timing.rows) {
+              const count = row.id.startsWith("bench/") ? 5 : row.id === "self/cli" ? 1 : 2;
+              for (const field of ["baselineMs", "candidateMs", "ratios"]) {
+                assert.equal(row[field].length, count, "missing timing samples: " + row.id);
+                assert.ok(row[field].every(value => Number.isFinite(value) && value > 0));
+              }
+            }
+            if (expected.some(row => row.id === "self/cli")) {
+              assert.equal(data.candidateSelf.ok, true, "candidate self-host source failed");
+              assert.ok(Number.isFinite(data.candidateSelf.buildMs) && data.candidateSelf.buildMs > 0);
+            } else assert.equal(data.candidateSelf, undefined);
+          }
+          save();
+          try {
+            if (mode === "prepare") {
+              assert.equal(task, "native");
+              report.sourceBefore = sources();
+              assert.ok(!existsSync(join(candidate, ".libnode-cache")), "unexpected existing native build cache");
+              // An additive exact-commit fetch supplies comparison objects
+              // only. The candidate checkout and index stay unchanged.
+              await checked("baseline-objects", "git", ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                "fetch", "--no-tags", "--depth=1", "https://github.com/vincentkoc/scriptc.git", BASE], candidate, 5);
+              const before = nativeInputs(candidate, BASE), after = nativeInputs(candidate, CAND);
+              assert.ok(before.length > 0); assert.deepEqual(after, before, "native source inputs changed");
+              report.nativeInputs = after; report.nativeInputSha256 = sha(after.join("\n"));
+              admit(true);
+            } else if (mode === "install-native") {
+              await checked("install", "pnpm", ["install", "--frozen-lockfile"], candidate, 20);
+            } else if (mode === "package") {
+              report.tools = tools();
+              assert.equal(capture("zig", ["version"]), "0.16.0");
+              report.tools.zig = "0.16.0";
+              report.tools.zigExecutable = executable("zig");
+              await checked("verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], candidate, 5);
+              const nativePaths = ["packages/llvm-linux-x64-gnu/bin", "packages/runtime-linux-x64-gnu/artifacts"];
+              const nativeFiles = fileFacts(candidate, [
+                ...nativePaths.flatMap(path => filesUnder(join(candidate, path)).map(file => path + "/" + file)),
+                "packages/runtime-linux-x64-gnu/runtime-pack.json",
+              ]);
+              const nodePack = libnode(process.env.SCRIPTC_LIBNODE);
+              await checked("pack-native", "tar", ["-czf", join(assets, "native.tar.gz"),
+                ...nativePaths, "packages/runtime-linux-x64-gnu/runtime-pack.json"], candidate, 10);
+              await checked("pack-libnode", "tar", ["-czf", join(assets, "libnode.tar.gz"),
+                ...nodePack.files.map(file => file.path)], process.env.SCRIPTC_LIBNODE, 10);
+              // The canonical action restores its cache below the checkout.
+              // Keep that task-created cache outside the clean source boundary.
+              const cache = join(candidate, ".libnode-cache"), movedCache = join(temp, "zero-cost-libnode-build-cache");
+              if (existsSync(cache)) {
+                assert.ok(lstatSync(cache).isDirectory()); assert.ok(!existsSync(movedCache));
+                renameSync(cache, movedCache); report.relocatedLibnodeCache = scrub(movedCache);
+              }
+              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              const manifest = {
+                baseline: BASE, candidate: CAND, workflow: report.workflow, run: report.run, attempt: report.attempt,
+                runnerSha256: hash(fileURLToPath(import.meta.url)), nativeInputs: report.nativeInputs,
+                nativeInputSha256: report.nativeInputSha256, nativeFiles, libnode: nodePack,
+                nativeArchiveSha256: hash(join(assets, "native.tar.gz")), libnodeArchiveSha256: hash(join(assets, "libnode.tar.gz")),
+                source: report.sourceAfter.candidate, tools: report.tools,
+              };
+              writeFileSync(join(assets, "inputs.json"), JSON.stringify(manifest, null, 2) + "\n");
+              report.complete = true; report.status = "complete";
+            } else if (mode === "initialize") {
+              assert.ok(/^(self|[1-8])$/.test(task));
+              report.sourceBefore = sources();
+              const manifest = readAssetManifest();
+              const baseInputs = nativeInputs(baseline, BASE), candInputs = nativeInputs(candidate, CAND);
+              assert.deepEqual(baseInputs, manifest.nativeInputs); assert.deepEqual(candInputs, baseInputs);
+              report.assetsSha256 = hash(join(assets, "inputs.json"));
+              report.nativeInputSha256 = manifest.nativeInputSha256;
+              admit(true);
+              const inventory = await inventories();
+              writeFileSync(join(out, "inventory.json"), JSON.stringify(inventory, null, 2) + "\n");
+              report.inventorySha256 = hash(join(out, "inventory.json"));
+            } else if (mode === "build") {
+              const manifest = readAssetManifest();
+              report.tools = tools();
+              for (const [name, value] of Object.entries(report.tools)) assert.deepEqual(value, manifest.tools[name], "native toolchain differs: " + name);
+              for (const [name, root] of [["baseline", baseline], ["candidate", candidate]]) {
+                await checked(name + "-install", "pnpm", ["install", "--frozen-lockfile"], root, 20);
+                const listing = capture("tar", ["-tzf", join(assets, "native.tar.gz")], root).split("\n");
+                assert.ok(listing.every(path => /^(packages\/llvm-linux-x64-gnu\/bin\/|packages\/runtime-linux-x64-gnu\/artifacts\/|packages\/runtime-linux-x64-gnu\/runtime-pack\.json$)/.test(path) && !path.split("/").includes("..")));
+                await checked(name + "-unpack", "tar", ["-xzf", join(assets, "native.tar.gz")], root, 10);
+                checkFacts(root, manifest.nativeFiles);
+                await checked(name + "-verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], root, 5);
+                await checked(name + "-build", "pnpm", ["build"], root, 25);
+              }
+              assert.ok(!existsSync(pack)); mkdirSync(pack);
+              const listed = capture("tar", ["-tzf", join(assets, "libnode.tar.gz")]).split("\n").sort();
+              assert.deepEqual(listed, manifest.libnode.files.map(file => file.path).sort());
+              await checked("unpack-libnode", "tar", ["-xzf", join(assets, "libnode.tar.gz")], pack, 10);
+              assert.deepEqual(libnode(pack), manifest.libnode);
+              report.libnode = manifest.libnode;
+              report.nativeIdentity = { helper: manifest.nativeFiles.find(file => file.path.endsWith("/scriptc-llvm-codegen")),
+                runtimeManifest: manifest.nativeFiles.find(file => file.path.endsWith("/runtime-pack.json")) };
+              report.sourcePreGate = sources(); assert.deepEqual(report.sourcePreGate, report.sourceBefore);
+              admit(false);
+            } else if (mode === "gate") {
+              const manifest = readAssetManifest();
+              const inventory = JSON.parse(readFileSync(join(out, "inventory.json"), "utf8"));
+              assert.equal(hash(join(out, "inventory.json")), report.inventorySha256);
+              const args = [join(candidate, "scripts/zero-cost-gate.mjs"), "--baseline=" + baseline,
+                "--candidate=" + candidate, "--programs=baseline", "--set=" + (task === "self" ? "self" : "bench,corpus"),
+                "--corpus=ts", "--jobs=1", "--timing-runs=5", "--self-timing-runs=0",
+                "--fixture-timing-runs=1", "--max-time-growth=2", "--max-size-growth=0",
+                "--json=" + join(out, "gate.json"), ...(task === "self" ? [] : ["--shard=" + task + "/8"])];
+              assert.ok(!existsSync(join(out, "gate.json")), "stale gate report");
+              report.gateArguments = args.map(scrub); save();
+              const code = await execute("gate", process.execPath, args, candidate, 120, { SCRIPTC_LIBNODE: pack });
+              assert.ok(code === 0 || code === 1, "gate did not finish");
+              const data = JSON.parse(readFileSync(join(out, "gate.json"), "utf8"));
+              validateGate(data, inventory.shards[task], { baseline, candidate });
+              assert.equal(code, data.verdict === "pass" ? 0 : 1);
+              checkFacts(candidate, manifest.nativeFiles); checkFacts(baseline, manifest.nativeFiles);
+              assert.deepEqual(libnode(pack), manifest.libnode);
+              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              report.complete = true; report.status = "complete"; report.gateVerdict = data.verdict;
+              report.counts = data.counts; report.globalFailures = data.globalFailures;
+              report.nonGlobalFailures = data.failures.filter(failure => !data.globalFailures.includes(failure));
+              report.gateSha256 = hash(join(out, "gate.json"));
+              // Canonical merge recomputes global timing over all shards.
+              // Program/build failures remain failures in both receipts.
+              if (report.nonGlobalFailures.length > 0) {
+                report.failureKind = "program-verdict";
+                throw Error("gate has program failures");
+              }
+            } else if (mode === "merge") {
+              report.sourceBefore = sources();
+              const inventory = await inventories(), expectedJobs = ["1", "2", "3", "4", "5", "6", "7", "8", "self"];
+              const files = [], summaries = [];
+              let common;
+              for (const job of expectedJobs) {
+                const dir = join(temp, "zero-cost-results", "zero-cost-result-" + job);
+                const summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8"));
+                assert.equal(summary.task, job); assert.equal(summary.complete, true);
+                assert.ok(summary.status === "complete" ||
+                  (summary.status === "failed" && summary.failureKind === "program-verdict"));
+                for (const [field, expected] of [["baseline", BASE], ["candidate", CAND], ["workflow", report.workflow],
+                  ["run", report.run], ["attempt", report.attempt]]) assert.equal(summary[field], expected);
+                assert.deepEqual(summary.sourceAfter, summary.sourceBefore);
+                assert.deepEqual(summary.sourceAfterCleanup, summary.sourceBefore);
+                assert.deepEqual(summary.sourceBefore, report.sourceBefore);
+                assert.equal(summary.swap?.active ?? false, false); assert.equal(summary.cleanupPassed, true);
+                assert.equal(hash(join(dir, "inventory.json")), summary.inventorySha256);
+                assert.deepEqual(JSON.parse(readFileSync(join(dir, "inventory.json"), "utf8")), inventory);
+                assert.equal(hash(join(dir, "gate.json")), summary.gateSha256);
+                const identity = { tools: summary.tools, native: summary.nativeIdentity, libnode: summary.libnode,
+                  assets: summary.assetsSha256, nativeInputs: summary.nativeInputSha256 };
+                if (common === undefined) common = identity; else assert.deepEqual(identity, common);
+                const data = JSON.parse(readFileSync(join(dir, "gate.json"), "utf8"));
+                validateGate(data, inventory.shards[job], { baseline, candidate });
+                assert.deepEqual(summary.nonGlobalFailures, data.failures.filter(failure => !data.globalFailures.includes(failure)));
+                if (summary.status === "failed") assert.ok(summary.nonGlobalFailures.length > 0);
+                files.push(join(dir, "gate.json")); summaries.push(summary);
+              }
+              const code = await execute("merge", process.execPath, [join(candidate, "scripts/zero-cost-merge.mjs"),
+                "--json=" + join(out, "merged.json"), ...files], candidate, 5);
+              assert.ok(code === 0 || code === 1);
+              const merged = JSON.parse(readFileSync(join(out, "merged.json"), "utf8"));
+              validateGate(merged, inventory.full, { baseline, candidate });
+              assert.equal(merged.shards, 9); assert.equal(code, merged.verdict === "pass" ? 0 : 1);
+              const { timingVerdict, timingGroups } = await import(pathToFileURL(join(candidate, "scripts/zero-cost-compare.mjs")).href);
+              report.timing = Object.fromEntries(Object.entries(timingGroups(merged.timing.rows))
+                .map(([name, rows]) => [name, timingVerdict(name, rows, 0.02)]));
+              report.counts = merged.counts; report.verdict = merged.verdict; report.identity = common;
+              report.inventorySha256 = sha(JSON.stringify(inventory));
+              report.programCount = inventory.full.length; report.shardCount = summaries.length;
+              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              report.complete = true; report.status = "complete";
+              assert.equal(code, 0, "canonical zero-cost gate failed");
+            } else if (mode === "finish") {
+              try { cleanupSwap(); report.cleanupPassed = true; }
+              finally {
+                report.sourceAfterCleanup = sources();
+                assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+              }
+              assert.equal(report.complete, true, "setup or qualification incomplete");
+              assert.equal(report.status, "complete");
+            } else throw Error("unknown mode: " + mode);
+          } catch (error) {
+            report.status = "failed";
+            (report.errors ??= []).push({ phase: mode, error: scrub(error.stack ?? error) });
+            process.exitCode = 1;
+          } finally {
+            if (interrupted) { report.status = "failed"; report.interrupted = interrupted; process.exitCode = 1; }
+            if (mode !== "finish" && report.status === "failed") {
+              try { report.sourceAfterFailure = sources(); }
+              catch (error) { report.sourceError = scrub(error.stack ?? error); }
+            }
+            report.updatedAt = new Date().toISOString(); save();
+            console.log(JSON.stringify({ task, mode, status: report.status, complete: report.complete }));
+            if (process.exitCode) console.error("[typed-local-js-zero-cost] FAILED (exit 1)");
+          }
+          RUNNER
+          node --check "$RUNNER_TEMP/zero-cost-assets/runner.mjs"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Verify native input equality and admit runner capacity
+        timeout-minutes: 10
+        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" prepare
+      - uses: ./.github/actions/llvm-linux
+      - name: Install frozen dependencies
+        timeout-minutes: 22
+        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" install-native
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - uses: ./.github/actions/libnode
+      - name: Verify and package shared native inputs
+        timeout-minutes: 25
+        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" package
+      - name: Finalize source and owned swap
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if test -f "$RUNNER_TEMP/zero-cost-assets/runner.mjs"; then
+            node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" finish
+          else
+            mkdir -p "$RUNNER_TEMP/zero-cost-native"
+            printf '%s\n' '{"complete":false,"status":"failed","error":"runner setup failed"}' > "$RUNNER_TEMP/zero-cost-native/summary.json"
+            echo '[typed-local-js-zero-cost] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: zero-cost-native-assets
+          path: ${{ runner.temp }}/zero-cost-assets
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-cost-native-evidence
+          path: ${{ runner.temp }}/zero-cost-native
+          if-no-files-found: error
+          retention-days: 1
+
+  compare:
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        part: ["1", "2", "3", "4", "5", "6", "7", "8", self]
+    env:
+      ZC_JOB: ${{ matrix.part }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          path: candidate
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: zero-cost-native-assets
+          path: ${{ runner.temp }}/zero-cost-assets
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: candidate/.node-version
+          cache: pnpm
+          cache-dependency-path: |
+            baseline/pnpm-lock.yaml
+            candidate/pnpm-lock.yaml
+      - name: Verify source and exact inventory; admit paired-build capacity
+        timeout-minutes: 10
+        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" initialize
+      - uses: ./candidate/.github/actions/llvm-linux
+      - name: Build each checkout with its own frozen dependencies
+        timeout-minutes: 70
+        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" build
+      - name: Compare the selected canonical programs
+        timeout-minutes: 123
+        run: |
+          ulimit -c 0
+          sudo sysctl -w kernel.core_pattern=core
+          node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" gate
+      - name: Finalize source and owned swap
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if test -f "$RUNNER_TEMP/zero-cost-assets/runner.mjs"; then
+            node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" finish
+          else
+            mkdir -p "$RUNNER_TEMP/zero-cost-$ZC_JOB"
+            printf '%s\n' '{"complete":false,"status":"failed","error":"setup failed before runner download"}' > "$RUNNER_TEMP/zero-cost-$ZC_JOB/summary.json"
+            echo '[typed-local-js-zero-cost] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-cost-result-${{ matrix.part }}
+          path: ${{ runner.temp }}/zero-cost-${{ matrix.part }}
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    needs: [native, compare]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ZC_JOB: merge
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: candidate/.node-version
+      - uses: actions/download-artifact@v4
+        with:
+          name: zero-cost-native-assets
+          path: ${{ runner.temp }}/zero-cost-assets
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zero-cost-result-*
+          path: ${{ runner.temp }}/zero-cost-results
+      - name: Verify all nine inventories and merge the canonical reports
+        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" merge
+      - name: Retain a setup failure receipt
+        if: always()
+        run: |
+          if ! test -f "$RUNNER_TEMP/zero-cost-merge/summary.json"; then
+            mkdir -p "$RUNNER_TEMP/zero-cost-merge"
+            printf '%s\n' '{"complete":false,"status":"failed","error":"aggregate setup failed or required artifact missing"}' > "$RUNNER_TEMP/zero-cost-merge/summary.json"
+            echo '[typed-local-js-zero-cost] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-cost-merged-evidence
+          path: ${{ runner.temp }}/zero-cost-merge
+          if-no-files-found: error
+          retention-days: 1
