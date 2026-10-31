@@ -1,0 +1,788 @@
+name: Diagnose numeric emitted code
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-numeric-codegen.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diagnose-numeric-codegen
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -eo pipefail {0}
+
+env:
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 71a9441c824262150f35acd2b8359f156ed3289c
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ed5cf0b5493a8969c25261ae21cfa6801e2dc82d
+          path: candidate
+          persist-credentials: false
+      - name: Authenticate the retained native producer
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'DOWNLOAD'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import sys
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          ORIGIN = {"workflow": "11e3cf017c25e06fe2e9059f1c433ab6c8a0dcde", "run": "41225112227", "attempt": "1"}
+          BASE = "71a9441c824262150f35acd2b8359f156ed3289c"
+          CAND = "ed5cf0b5493a8969c25261ae21cfa6801e2dc82d"
+          RUNNER_SHA = "8381cb2d7b40373b758d43db3bc78a08d68b7b212a529fb93b53d511fa45cc27"
+          INPUTS_SHA = "688a08d6c0ce2b531d50afbb7619322173e362bd3b36dc9dfc12ae41ea338494"
+          NATIVE_SHA = "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25"
+          ROOT = Path(os.environ["RUNNER_TEMP"])
+          OUT = ROOT / "numeric-codegen-proof"
+          CURRENT = {"workflow": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          ARTIFACTS = [
+              ("assets", 13050937720, "c2ea3c7736af495ef1b673c65058991f5ec1ea9fc85dadfcc81a629a3c3ed588", "numeric-codegen-assets", "numeric-runtime-native-assets"),
+              ("native", 13051446667, "4491ae00b8bd5d883c0030c326e50f36ed1ced7643a6d1fcab220f42f5e32695", "numeric-codegen-origin", "numeric-runtime-native-evidence"),
+          ]
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+
+          def write(path, value):
+              path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+
+          def facts(root):
+              result = []
+              for path in sorted(root.rglob("*")):
+                  assert not path.is_symlink(), "symlink in retained proof"
+                  if path.is_file():
+                      result.append({"path": path.relative_to(root).as_posix(), "size": path.stat().st_size, "sha256": digest(path)})
+                  else:
+                      assert path.is_dir(), "non-regular proof entry"
+              return result
+
+          def extract(archive, target):
+              assert not target.exists(), "artifact destination already exists"
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  assert 0 < len(entries) <= 20000, "artifact entry budget exceeded"
+                  assert sum(item.file_size for item in entries) <= 2 * 1024**3, "artifact expansion budget exceeded"
+                  seen = set()
+                  for item in entries:
+                      name = item.filename
+                      path = PurePosixPath(name)
+                      assert name and "\\" not in name and "\0" not in name
+                      assert not path.is_absolute() and ".." not in path.parts
+                      assert path.as_posix() == name.rstrip("/") and path.parts
+                      assert name.rstrip("/") not in seen, "duplicate artifact entry"
+                      seen.add(name.rstrip("/"))
+                      kind = stat.S_IFMT(item.external_attr >> 16)
+                      assert kind in (0, stat.S_IFREG, stat.S_IFDIR), "non-regular ZIP entry"
+                      assert not item.flag_bits & 1, "encrypted ZIP entry"
+                  target.mkdir(parents=True)
+                  for item in entries:
+                      path = target / item.filename
+                      if item.is_dir():
+                          path.mkdir(parents=True, exist_ok=True)
+                          continue
+                      assert stat.S_IFMT(item.external_attr >> 16) != stat.S_IFDIR
+                      path.parent.mkdir(parents=True, exist_ok=True)
+                      with bundle.open(item) as source, path.open("xb") as output:
+                          remaining = item.file_size
+                          while block := source.read(min(1024 * 1024, remaining + 1)):
+                              remaining -= len(block)
+                              assert remaining >= 0, "ZIP entry exceeds declared size"
+                              output.write(block)
+                          assert remaining == 0, "truncated ZIP entry"
+                      path.chmod(0o444)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+
+          def retrieve(spec, token, scratch):
+              label, artifact_id, expected, destination, name = spec
+              assert len(expected) == 64 and all(c in "0123456789abcdef" for c in expected)
+              opener = urllib.request.build_opener(NoRedirect)
+              endpoint = f"https://api.github.com/repos/vincentkoc/scriptc/actions/artifacts/{artifact_id}"
+              headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "scriptc-numeric-codegen"}
+              with opener.open(urllib.request.Request(endpoint, headers=headers), timeout=120) as response:
+                  raw = response.read(1024**2 + 1)
+              assert len(raw) <= 1024**2, "artifact metadata exceeds budget"
+              metadata = json.loads(raw)
+              assert metadata["id"] == artifact_id and metadata["name"] == name and metadata["expired"] is False
+              assert str(metadata["workflow_run"]["id"]) == ORIGIN["run"]
+              assert metadata["workflow_run"]["head_sha"] == ORIGIN["workflow"]
+              assert metadata["size_in_bytes"] <= 512 * 1024**2, "artifact archive exceeds budget"
+              assert metadata["digest"] == "sha256:" + expected
+              try:
+                  response = opener.open(urllib.request.Request(endpoint + "/zip", headers=headers), timeout=120)
+              except urllib.error.HTTPError as error:
+                  assert error.code == 302, "artifact redirect refused"
+                  location = error.headers.get("Location", "")
+                  error.close()
+                  parsed = urllib.parse.urlsplit(location)
+                  assert parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password
+                  # The signed storage request never receives the GitHub Authorization header.
+                  response = opener.open(urllib.request.Request(location), timeout=120)
+              archive = scratch / f"{artifact_id}.zip"
+              size = 0
+              with response, archive.open("xb") as output:
+                  while block := response.read(1024 * 1024):
+                      size += len(block)
+                      assert size <= 512 * 1024**2, "artifact archive exceeds budget"
+                      output.write(block)
+              actual = digest(archive)
+              assert actual == expected, f"artifact {artifact_id} archive digest mismatch"
+              target = ROOT / destination
+              extract(archive, target)
+              archive.unlink()
+              return {"label": label, "id": artifact_id, "name": name, "origin": ORIGIN,
+                      "zipSha256": actual, "zipBytes": size, "destination": destination, "files": facts(target)}
+
+
+          receipt = {"origin": ORIGIN, "execution": CURRENT, "artifacts": [], "verified": False}
+          OUT.mkdir()
+          failed = False
+          try:
+              token = os.environ.pop("GH_TOKEN")
+              with tempfile.TemporaryDirectory(prefix="numeric-codegen-downloads-", dir=ROOT) as directory:
+                  for spec in ARTIFACTS:
+                      receipt["artifacts"].append(retrieve(spec, token, Path(directory)))
+              assets = ROOT / "numeric-codegen-assets"
+              assert sorted(path.name for path in assets.iterdir()) == ["inputs.json", "native.tar.gz", "runner.mjs"]
+              assert digest(assets / "inputs.json") == INPUTS_SHA
+              assert digest(assets / "runner.mjs") == RUNNER_SHA
+              manifest = json.loads((assets / "inputs.json").read_bytes())
+              for key, expected in {"baseline": BASE, "candidate": CAND, **ORIGIN}.items():
+                  assert manifest[key] == expected
+              assert manifest["runnerSha256"] == RUNNER_SHA
+              assert manifest["nativeInputSha256"] == NATIVE_SHA
+              assert len(manifest["nativeInputs"]) == 1049
+              assert hashlib.sha256("\n".join(manifest["nativeInputs"]).encode()).hexdigest() == NATIVE_SHA
+              assert digest(assets / "native.tar.gz") == manifest["nativeArchiveSha256"]
+              native_file = ROOT / "numeric-codegen-origin/summary.json"
+              assert digest(native_file) == "424e4645df8213d4f31706ceb695cbc373e1a0f1569d582cb22bd56ec1e456c7"
+              native = json.loads(native_file.read_bytes())
+              for key, expected in {"task": "native", "baseline": BASE, "candidate": CAND, **ORIGIN}.items():
+                  assert native[key] == expected
+              assert native["complete"] is True and native["status"] == "complete"
+              assert native["cleanupPassed"] is True and native.get("swap", {}).get("active", False) is False
+              assert native["sourceBefore"] == native["sourceAfter"] == native["sourceAfterCleanup"]
+              assert all(step["groupDrained"] is True and step["code"] == 0 and not step.get("timedOut") for step in native["steps"])
+              assert native["sourceAfter"]["candidate"] == manifest["source"]
+              assert native["tools"] == manifest["tools"] and native["nativeInputs"] == manifest["nativeInputs"]
+              for source, destination in [(assets / "inputs.json", "native-origin-inputs.json"),
+                                          (assets / "runner.mjs", "native-origin-runner.mjs"),
+                                          (native_file, "native-origin-summary.json")]:
+                  shutil.copyfile(source, OUT / destination)
+              receipt["verified"] = True
+          except Exception as error:
+              receipt["error"] = {"type": type(error).__name__, "message": str(error) if isinstance(error, AssertionError) else "artifact retrieval or admission failed"}
+              print("[numeric-codegen-download] FAILED (exit 1)", file=sys.stderr)
+              failed = True
+          finally:
+              (OUT / "download.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+              if failed:
+                  sys.exit(1)
+          DOWNLOAD
+      - name: Write the diagnostic consumer
+        run: |
+          test ! -e "$RUNNER_TEMP/numeric-codegen-runner.mjs"
+          cat > "$RUNNER_TEMP/numeric-codegen-runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { spawn, spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import {
+            chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync,
+            readdirSync, readlinkSync, realpathSync, statfsSync, statSync, writeFileSync, writeSync,
+          } from "node:fs";
+          import { availableParallelism, totalmem } from "node:os";
+          import { basename, dirname, join } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+
+          const BASE = "71a9441c824262150f35acd2b8359f156ed3289c";
+          const CAND = "ed5cf0b5493a8969c25261ae21cfa6801e2dc82d";
+          const pins = {"scripts/bench-runtime.mjs":"be9734581c353d862af707b7104fbc489a6d294391f40c048dcf1bacdad3a68e","benchmarks/runtime/workloads.mjs":"de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c","benchmarks/runtime/workloads/numeric-kernels.json":"f46a7516c0e8acd961985c7c436a34c7dd0f3a8d12802825a3b37173fa57023e","benchmarks/runtime/workloads/numeric-kernels.ts":"c369d9f88cf3b13507f1beb0b28fc4f9ef955be8dea740981028d4b65a3ed4e0"};
+          const codegenPins = {"scripts/zero-cost-gate.mjs":"8c46165ba1a95338b010efcb425a6c03971fa883b0a2a7a57a077726c1f4a8f0","scripts/zero-cost-compare.mjs":"5fbc96898aeec0cac4d10a6d8899600925910c81b8cdd78bd560deb1da9dfc14","benchmarks/runtime/workloads.mjs":"de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c","benchmarks/runtime/workloads/numeric-kernels.json":"f46a7516c0e8acd961985c7c436a34c7dd0f3a8d12802825a3b37173fa57023e","benchmarks/runtime/workloads/numeric-kernels.ts":"c369d9f88cf3b13507f1beb0b28fc4f9ef955be8dea740981028d4b65a3ed4e0"};
+          const GiB = 1024 ** 3;
+          const task = "codegen";
+          const mode = process.argv[2];
+          assert.ok(["initialize", "build", "diagnose", "finish"].includes(mode));
+          const modeDeadline = Date.now() + ({ initialize: 8, build: 65, diagnose: 35, finish: 5 }[mode]) * 60_000;
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const temp = process.env.RUNNER_TEMP;
+          const assets = join(temp, "numeric-codegen-assets");
+          const out = join(temp, "numeric-codegen-proof");
+          const candidate = join(workspace, "candidate");
+          const baseline = join(workspace, "baseline");
+          mkdirSync(out, { recursive: true });
+          const summaryPath = join(out, "summary.json");
+          const report = existsSync(summaryPath) ? JSON.parse(readFileSync(summaryPath, "utf8")) : {
+            schema: 1, task, baseline: BASE, candidate: CAND, workflow: process.env.GITHUB_SHA,
+            origin: { workflow: "11e3cf017c25e06fe2e9059f1c433ab6c8a0dcde", run: "41225112227", attempt: "1" },
+            templateCommit: "11e3cf017c25e06fe2e9059f1c433ab6c8a0dcde", scope: "numeric emitted-code diagnostic",
+            diagnosticComplete: false, qualificationPassed: false, nativeRebuilt: false, runtimeBenchmarkRun: false,
+            run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", complete: false, startedAt: new Date().toISOString(), steps: [],
+          };
+          assert.equal(report.workflow, process.env.GITHUB_SHA);
+          assert.equal(report.run, process.env.GITHUB_RUN_ID);
+          assert.equal(report.attempt, process.env.GITHUB_RUN_ATTEMPT);
+          const sha = data => createHash("sha256").update(data).digest("hex");
+          const hash = file => sha(readFileSync(file));
+          const scrub = value => String(value).replaceAll(workspace, "<workspace>").replaceAll(temp, "<temp>");
+          const save = () => writeFileSync(summaryPath, JSON.stringify(report, null, 2) + "\n");
+          const runnerSha256 = hash(fileURLToPath(import.meta.url));
+          if (report.runnerSha256) assert.equal(report.runnerSha256, runnerSha256);
+          report.runnerSha256 = runnerSha256;
+          const download = JSON.parse(readFileSync(join(out, "download.json"), "utf8"));
+          assert.equal(download.verified, true);
+          assert.deepEqual(download.origin, report.origin);
+          assert.deepEqual(download.execution, { workflow: report.workflow, run: report.run, attempt: report.attempt });
+          report.downloadSha256 = hash(join(out, "download.json"));
+          copyFileSync(fileURLToPath(import.meta.url), join(out, "consumer-runner.mjs"));
+
+          const pause = ms => new Promise(done => setTimeout(done, ms));
+          const capture = (command, args, cwd = candidate) => {
+            const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 ** 2 });
+            assert.equal(result.error, undefined, command + ": " + String(result.error));
+            assert.equal(result.status, 0, command + ": " + (result.stderr ?? "").slice(-4000));
+            return result.stdout.trim();
+          };
+          let active;
+          let interrupted;
+          for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
+            interrupted = signal;
+            active?.stop();
+          });
+
+          // Each subprocess owns one detached group. Drain at leader exit,
+          // not pipe closure; descendants can otherwise keep the runner alive.
+          async function execute(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(interrupted, undefined, "runner interrupted");
+            const timeoutMs = Math.min(minutes * 60_000, modeDeadline - Date.now());
+            assert.ok(timeoutMs > 0, "qualification phase deadline expired");
+            const step = { label, command, args: args.map(scrub), cwd: scrub(cwd), startedAt: new Date().toISOString() };
+            report.steps.push(step); save();
+            const log = openSync(join(out, label + ".log"), "wx");
+            const started = Date.now();
+            const result = await new Promise(resolveResult => {
+              let timedOut = false, overflow = false, closed = false, settled = false, exited = false;
+              let force, pipeDeadline, hardDeadline;
+              let code = null, signal = null, error;
+              let bytes = 0;
+              const child = spawn(command, args, {
+                cwd, env: { ...process.env, ...env }, detached: true, stdio: ["ignore", "pipe", "pipe"],
+              });
+              const alive = () => {
+                if (!child.pid) return false;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, 0); return true; }
+                catch (failure) { if (failure.code === "ESRCH") return false; throw failure; }
+              };
+              const kill = sig => {
+                if (!child.pid) return;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, sig); }
+                catch (failure) { if (failure.code !== "ESRCH") throw failure; }
+              };
+              const finish = group => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer); clearTimeout(force); clearTimeout(pipeDeadline); clearTimeout(hardDeadline);
+                active = undefined;
+                child.stdout.destroy(); child.stderr.destroy();
+                child.unref();
+                closeSync(log);
+                resolveResult({ code, signal, error, timedOut, overflow, ...group, elapsedMs: Date.now() - started });
+              };
+              const stop = () => {
+                kill("SIGTERM");
+                if (!force) force = setTimeout(() => kill("SIGKILL"), 1000);
+                if (!hardDeadline) hardDeadline = setTimeout(() => finish({ groupDrained: false, cleanupDeadline: true }), 15_000);
+              };
+              active = { stop };
+              const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
+              const output = data => {
+                if (settled) return;
+                bytes += data.length;
+                if (bytes > 128 * 1024 ** 2) { overflow = true; stop(); return; }
+                writeSync(log, data);
+              };
+              child.stdout.on("data", output); child.stderr.on("data", output);
+              child.once("error", failure => {
+                error = String(failure);
+                if (!child.pid) finish({ groupDrained: true });
+              });
+              let drained;
+              child.once("exit", (exitCode, exitSignal) => {
+                exited = true; code = exitCode; signal = exitSignal;
+                drained = (async () => {
+                  await pause(100);
+                  const leftoverChildren = alive();
+                  if (leftoverChildren) {
+                    kill("SIGTERM");
+                    const gentle = Date.now() + 1000;
+                    while (alive() && Date.now() < gentle) await pause(100);
+                    if (alive()) kill("SIGKILL");
+                    const deadline = Date.now() + 9000;
+                    while (alive() && Date.now() < deadline) await pause(100);
+                  }
+                  return { leftoverChildren, groupDrained: !alive() };
+                })().catch(failure => ({ groupDrained: false, cleanupError: String(failure) }));
+                drained.then(group => {
+                  if (closed) finish(group);
+                  else pipeDeadline = setTimeout(() => finish({ ...group, groupDrained: false, unresolvedPipe: true }), 1000);
+                });
+              });
+              child.once("close", () => {
+                closed = true;
+                if (exited) drained.then(finish);
+                else if (error) finish({ groupDrained: !child.pid });
+              });
+            });
+            Object.assign(step, result, { finishedAt: new Date().toISOString(), log: label + ".log",
+              logSha256: hash(join(out, label + ".log")), logBytes: statSync(join(out, label + ".log")).size }); save();
+            assert.equal(interrupted, undefined, "runner interrupted");
+            assert.ok(result.groupDrained && !result.leftoverChildren && !result.timedOut &&
+              !result.overflow && !result.error && result.signal === null, label + ": incomplete subprocess " + JSON.stringify(result));
+            return result.code;
+          }
+          async function checked(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(await execute(label, command, args, cwd, minutes, env), 0, label + " failed");
+          }
+          function source(root, expected) {
+            assert.equal(capture("git", ["rev-parse", "HEAD"], root), expected);
+            assert.equal(capture("git", ["status", "--porcelain", "--untracked-files=all"], root), "", "dirty source");
+            const files = capture("git", ["ls-files", "-s", "-z"], root).split("\0").filter(Boolean);
+            const content = createHash("sha256");
+            for (const row of files) {
+              const tab = row.indexOf("\t"), name = row.slice(tab + 1), mode = row.slice(0, 6);
+              assert.ok(tab > 0 && !name.startsWith("/") && !name.split("/").includes(".."));
+              const path = join(root, name), info = lstatSync(path);
+              const bytes = info.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : readFileSync(path);
+              content.update(mode + "\0" + name + "\0" + sha(bytes) + "\0");
+            }
+            for (const [name, expectedHash] of Object.entries({ ...pins, ...codegenPins })) assert.equal(hash(join(root, name)), expectedHash, name);
+            return { head: expected, tree: capture("git", ["rev-parse", "HEAD^{tree}"], root), files: files.length, contentSha256: content.digest("hex") };
+          }
+          function sources() {
+            return { baseline: source(baseline, BASE), candidate: source(candidate, CAND) };
+          }
+          function nativeInputs(root, ref) {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", ref], root).split("\n");
+            return rows.filter(row => {
+              const name = row.slice(row.indexOf("\t") + 1);
+              return name.startsWith("native/llvm-codegen/") ||
+                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+                  "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
+            });
+          }
+          function memory() {
+            const fields = Object.fromEntries(readFileSync("/proc/meminfo", "utf8").trim().split("\n").map(line => {
+              const [name, amount] = line.split(/:\s*/); return [name, Number(amount.split(/\s/)[0]) * 1024];
+            }));
+            const disk = statfsSync(temp);
+            return { total: totalmem(), available: fields.MemAvailable, swapTotal: fields.SwapTotal,
+              swapFree: fields.SwapFree, diskFree: Number(disk.bavail) * Number(disk.bsize),
+              cores: availableParallelism(), swaps: readFileSync("/proc/swaps", "utf8") };
+          }
+          function admit(createSwap) {
+            const before = memory();
+            const minimum = 28;
+            const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));
+            const capacity = { phase: mode, createSwap, before, minimumGiB: minimum,
+              missingSwapGiB: missing, requiredDiskBytes: (missing + 16) * GiB, admitted: false };
+            (report.capacity ??= []).push(capacity); save();
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
+            assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, "insufficient physical runner capacity");
+            if (createSwap && missing > 0) {
+              assert.ok(missing <= 24, "swap requirement exceeds the task budget");
+              assert.ok(before.diskFree >= (missing + 16) * GiB, "insufficient disk for swap and builds");
+              const path = join(temp, "numeric-codegen-" + process.env.GITHUB_RUN_ID + ".swap");
+              assert.ok(!existsSync(path), "owned swap path already exists");
+              report.swap = { path, bytes: missing * GiB, originalSwaps: before.swaps, active: false }; save();
+              capture("sudo", ["fallocate", "-l", String(missing * GiB), path]);
+              capture("sudo", ["chmod", "600", path]);
+              capture("sudo", ["mkswap", path]);
+              capture("sudo", ["swapon", path]);
+              report.swap.active = true; save();
+            }
+            const after = memory(); capacity.after = after; save();
+            assert.ok(after.available + after.swapFree >= minimum * GiB, "compiler heaps lack RAM/swap headroom");
+            assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, "insufficient remaining disk");
+            capacity.admitted = true; save();
+          }
+          function cleanupSwap() {
+            if (!report.swap) return;
+            const swap = report.swap;
+            assert.equal(swap.path, join(temp, "numeric-codegen-" + process.env.GITHUB_RUN_ID + ".swap"));
+            const live = () => readFileSync("/proc/swaps", "utf8").split("\n").slice(1).some(line => line.split(/\s+/)[0] === swap.path);
+            if (live()) capture("sudo", ["swapoff", swap.path]);
+            assert.equal(live(), false, "owned swap remains active");
+            if (existsSync(swap.path)) capture("sudo", ["rm", "--", swap.path]);
+            swap.active = false; swap.removed = true; save();
+          }
+          function filesUnder(root, prefix = "") {
+            const files = [];
+            for (const name of readdirSync(join(root, prefix)).sort()) {
+              const path = prefix ? prefix + "/" + name : name;
+              const info = lstatSync(join(root, path));
+              if (info.isDirectory()) files.push(...filesUnder(root, path));
+              else { assert.ok(info.isFile(), "artifact must be a regular file: " + path); files.push(path); }
+            }
+            return files;
+          }
+          const fileFacts = (root, paths) => paths.map(path => {
+            const info = lstatSync(join(root, path));
+            assert.ok(info.isFile(), "not a regular artifact: " + path);
+            return { path, size: info.size, mode: info.mode & 0o777, sha256: hash(join(root, path)) };
+          });
+          function checkFacts(root, expected) { assert.deepEqual(fileFacts(root, expected.map(file => file.path)), expected); }
+          function tools() {
+            const node = process.version, pnpm = capture("pnpm", ["--version"]);
+            const llvm = capture("llvm-config", ["--version"]);
+            assert.equal(node, "v24.22.0"); assert.equal(pnpm, "11.1.3"); assert.equal(llvm, "22.1.8");
+            const zig = capture("zig", ["version"]); assert.equal(zig, "0.16.0");
+            return { node, pnpm, llvm, zig, clang: capture("clang", ["--version"]), nm: capture("nm", ["--version"]),
+              executables: Object.fromEntries(["node", "pnpm", "llvm-config", "clang", "g++", "nm", "strip", "zig"].map(name => [name, executable(name)])),
+              imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion, platform: process.platform, arch: process.arch };
+          }
+          function executable(name) {
+            const path = realpathSync(capture("which", [name]));
+            assert.ok(lstatSync(path).isFile());
+            return { path: scrub(path), size: statSync(path).size, sha256: hash(path) };
+          }
+          function readAssetManifest() {
+            const manifest = JSON.parse(readFileSync(join(assets, "inputs.json"), "utf8"));
+            assert.equal(manifest.baseline, BASE); assert.equal(manifest.candidate, CAND);
+            assert.equal(manifest.workflow, report.origin.workflow);
+            assert.equal(manifest.run, report.origin.run); assert.equal(manifest.attempt, report.origin.attempt);
+            assert.equal(hash(join(assets, "inputs.json")), "688a08d6c0ce2b531d50afbb7619322173e362bd3b36dc9dfc12ae41ea338494");
+            assert.equal(manifest.runnerSha256, "8381cb2d7b40373b758d43db3bc78a08d68b7b212a529fb93b53d511fa45cc27");
+            assert.equal(hash(join(assets, "runner.mjs")), manifest.runnerSha256);
+            assert.equal(hash(join(out, "download.json")), report.downloadSha256);
+            assert.equal(hash(fileURLToPath(import.meta.url)), report.runnerSha256);
+            assert.equal(hash(join(assets, "native.tar.gz")), manifest.nativeArchiveSha256);
+            assert.equal(manifest.nativeInputs.length, 1049);
+            assert.equal(sha(manifest.nativeInputs.join("\n")), "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25");
+            assert.equal(manifest.nativeInputSha256, "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25");
+            return manifest;
+          }
+          const builtFacts = root => fileFacts(root, readdirSync(join(root, "packages")).flatMap(name => {
+            const path = "packages/" + name + "/dist";
+            return existsSync(join(root, path)) ? filesUnder(join(root, path)).map(file => path + "/" + file) : [];
+          }));
+
+          function failureKind(data) {
+            if (data.verdict === "pass") return null;
+            const global = data.globalFailures.length > 0;
+            const program = data.failures.some(failure => !data.globalFailures.includes(failure));
+            assert.ok(global || program, "failed canonical verdict has no recorded failure");
+            return global && program ? "program-and-global-verdict" : global ? "global-verdict" : "program-verdict";
+          }
+          async function verifyCodegen(data, retained) {
+            assert.equal(data.schema, 1);
+            assert.deepEqual(data.host, { platform: "linux", arch: "x64", node: "v24.22.0" });
+            assert.deepEqual(data.trees, Object.fromEntries([["baseline", baseline, BASE], ["candidate", candidate, CAND]].map(([label, root, head]) =>
+              [label, { root, revision: capture("git", ["rev-parse", "--short", head], root) }])));
+            assert.equal(data.programsRoot, baseline); assert.equal(data.allow, null); assert.equal(data.strict, false);
+            assert.equal(data.runtime, null); assert.equal(data.baselineCache, null); assert.equal(data.candidateSelf, undefined);
+            assert.equal(data.programs.length, 1);
+            const row = data.programs[0];
+            assert.equal(row.id, "bench/numeric-kernels"); assert.equal(row.allowed, false);
+            assert.equal(row.baselineError, undefined); assert.equal(row.candidateError, undefined);
+            assert.equal(row.cachedBaseline, undefined); assert.equal(row.sizeFailure, undefined);
+            assert.deepEqual(Object.keys(row.artifacts).sort(), ["exe", "ir", "llvm"]);
+            for (const label of ["baseline", "candidate"]) {
+              assert.ok(Number.isFinite(row.buildMs[label]) && row.buildMs[label] > 0);
+              assert.ok(retained[label]?.ir && retained[label]?.llvm && retained[label]?.exe);
+            }
+            const compare = await import(pathToFileURL(join(candidate, "scripts/zero-cost-compare.mjs")));
+            const read = (label, kind) => readFileSync(join(out, retained[label][kind]));
+            const comparisons = (a, b) => {
+              const artifacts = Object.fromEntries(["ir", "llvm"].map(kind => [kind, compare.compareArtifact(kind, read(a, kind), read(b, kind))]));
+              const left = read(a, "exe"), right = read(b, "exe");
+              artifacts.exe = left.equals(right) ? { identical: true } : compare.compareExecutables(
+                left, right, readFileSync(join(out, retained[a].nm), "utf8"), readFileSync(join(out, retained[b].nm), "utf8"));
+              artifacts.exe.bytes = { baseline: left.length, candidate: right.length };
+              return artifacts;
+            };
+            const artifacts = comparisons("baseline", "candidate");
+            assert.deepEqual(row.artifacts, artifacts, "retained emitted artifacts disagree with canonical report");
+            const differs = Object.keys(artifacts).filter(kind => !artifacts[kind].identical);
+            let nondeterministic = [];
+            if (differs.length) {
+              assert.ok(retained.recheck?.ir && retained.recheck?.llvm && retained.recheck?.exe, "canonical baseline recheck is incomplete");
+              const self = comparisons("baseline", "recheck");
+              nondeterministic = differs.filter(kind => !self[kind].identical);
+            } else assert.equal(retained.recheck, undefined);
+            const verdict = compare.programVerdict({ baseline: { ok: true }, candidate: { ok: true }, artifacts,
+              allowed: false, required: true, runtimeOnly: false, nondeterministic, strict: false });
+            assert.equal(row.verdict, verdict.verdict);
+            if (row.verdict === "nondeterministic") assert.deepEqual(row.nondeterministic, nondeterministic);
+            else assert.equal(row.nondeterministic, undefined);
+            const before = compare.dynamicTierSymbols(compare.definedFunctionNames(readFileSync(join(out, retained.baseline.nm), "utf8")));
+            const symbols = compare.definedFunctionNames(readFileSync(join(out, retained.candidate.nm), "utf8"));
+            const after = compare.dynamicTierSymbols(symbols), added = after.filter(name => !before.includes(name));
+            const failures = [], node = compare.nodeIslandSymbols(symbols), icu = compare.icuSymbols(symbols);
+            if (node.length) failures.push("links Node island symbols: " + node.slice(0, 5).join(", "));
+            if (icu.length) failures.push("links ICU symbols: " + icu.slice(0, 5).join(", "));
+            if (after.length) failures.push("fully typed program links dynamic-tier symbols: " + after.slice(0, 5).join(", "));
+            if (added.length) failures.push("gained dynamic-tier symbols: " + added.slice(0, 5).join(", "));
+            assert.deepEqual(row.dynamicTier, { typed: true, count: after.length, added, failures });
+            assert.equal(data.timing.runs, 5); assert.equal(data.timing.maxGrowth, 0.02);
+            assert.equal(data.timing.rows.length, 1);
+            const timing = data.timing.rows[0]; assert.equal(timing.id, row.id);
+            for (const key of ["baselineMs", "candidateMs", "ratios"]) {
+              assert.equal(timing[key].length, 5); assert.ok(timing[key].every(value => Number.isFinite(value) && value > 0));
+            }
+            const merged = compare.mergeReports([data]).report;
+            for (const key of ["timing", "counts", "globalFailures", "failures", "verdict"]) assert.deepEqual(data[key], merged[key], key);
+            const nonGlobal = [...(verdict.fails ? [row.id + ": " + row.verdict] : []), ...failures.map(failure => row.id + ": " + failure)];
+            assert.deepEqual(data.failures.filter(failure => !data.globalFailures.includes(failure)), nonGlobal);
+            return { programVerdict: row.verdict, gateVerdict: data.verdict, failureKind: failureKind(data), failures: data.failures,
+              staticDifferenceIsNotRuntimeCausation: true, nativeFunctionalProof: false, runtimeBenchmarkRun: false };
+          }
+          async function retainCodegen(logPath) {
+            const log = readFileSync(logPath, "utf8");
+            const paths = [...log.matchAll(/^artifacts kept in (\/tmp\/scriptc-zero-cost-[A-Za-z0-9]+)$/gm)].map(match => match[1]);
+            assert.equal(paths.length, 1, "canonical owned scratch receipt missing or ambiguous");
+            const path = paths[0], name = basename(path);
+            assert.ok(!report.scratchBefore.includes(name), "canonical scratch predates this run");
+            assert.equal(realpathSync(path), path); assert.ok(lstatSync(path).isDirectory());
+            const created = readdirSync("/tmp").filter(name => name.startsWith("scriptc-zero-cost-") && !report.scratchBefore.includes(name)).sort();
+            assert.deepEqual(created, [name], "unresolved canonical scratch owner");
+            report.keptScratch = { path, name, copied: false, removed: false }; save();
+            const all = filesUnder(path);
+            assert.ok(all.length > 0 && all.length <= 100, "unexpected retained file count");
+            assert.ok(all.every(file => /^(baseline|candidate|recheck)\/bench_numeric-kernels\/[^/]+$/.test(file) ||
+              /^timing-(baseline|candidate)\.ll$/.test(file)), "unexpected canonical output path");
+            const destination = join(out, "emitted"); mkdirSync(destination);
+            const facts = fileFacts(path, all);
+            assert.ok(facts.reduce((sum, file) => sum + file.size, 0) <= 512 * 1024 ** 2, "retained artifact budget exceeded");
+            for (const file of facts) {
+              mkdirSync(dirname(join(destination, file.path)), { recursive: true });
+              copyFileSync(join(path, file.path), join(destination, file.path));
+              chmodSync(join(destination, file.path), file.mode);
+            }
+            checkFacts(destination, facts); checkFacts(path, facts);
+            report.keptScratch.files = facts; report.keptScratch.copied = true; save();
+            const retained = {};
+            for (const label of ["baseline", "candidate", "recheck"]) {
+              const prefix = label + "/bench_numeric-kernels/";
+              const rows = all.filter(file => file.startsWith(prefix));
+              if (rows.length === 0) { assert.equal(label, "recheck"); continue; }
+              const one = predicate => { const found = rows.filter(predicate); assert.equal(found.length, 1); return "emitted/" + found[0]; };
+              retained[label] = { exe: one(file => file === prefix + "program"), ir: one(file => file.endsWith(".ir.json")), llvm: one(file => file.endsWith(".ll")) };
+              const binary = join(out, retained[label].exe);
+              await checked(label + "-nm", "nm", ["-S", binary], candidate, 2);
+              await checked(label + "-disassembly", "llvm-objdump", ["-d", "-r", binary], candidate, 3);
+              retained[label].nm = label + "-nm.log"; retained[label].disassembly = label + "-disassembly.log";
+            }
+            for (const label of ["baseline", "candidate"]) assert.ok(all.includes("timing-" + label + ".ll"));
+            report.retained = retained; report.emittedFiles = fileFacts(destination, all); save();
+            return retained;
+          }
+
+          function verifyBuiltInputs(manifest) {
+            assert.deepEqual(tools(), report.tools);
+            assert.deepEqual({ ...executable("llvm-objdump"), version: capture("llvm-objdump", ["--version"]) }, report.codegenTool);
+            for (const [name, root] of [["baseline", baseline], ["candidate", candidate]]) {
+              checkFacts(root, manifest.nativeFiles); checkFacts(root, report.builds[name].files);
+              assert.equal(hash(join(root, "pnpm-lock.yaml")), report.builds[name].lockSha256);
+            }
+          }
+
+          save();
+          try {
+            if (mode === "initialize") {
+              report.sourceBefore = sources();
+              const manifest = readAssetManifest();
+              assert.deepEqual(nativeInputs(baseline, BASE), manifest.nativeInputs);
+              assert.deepEqual(nativeInputs(candidate, CAND), manifest.nativeInputs);
+              assert.deepEqual(report.sourceBefore.candidate, manifest.source); assert.deepEqual(manifest.pins, pins);
+              report.assetsSha256 = hash(join(assets, "inputs.json")); report.nativeInputSha256 = manifest.nativeInputSha256;
+              admit(true);
+            } else if (mode === "build") {
+              const manifest = readAssetManifest(); report.tools = tools();
+              report.codegenTool = { ...executable("llvm-objdump"), version: capture("llvm-objdump", ["--version"]) };
+              assert.match(report.codegenTool.version, /LLVM version 22\.1\.8/);
+              assert.deepEqual(report.tools, manifest.tools, "native toolchain differs");
+              report.builds = {};
+              for (const [name, root] of [["baseline", baseline], ["candidate", candidate]]) {
+                await checked(name + "-install", "pnpm", ["install", "--frozen-lockfile"], root, 20);
+                const listing = capture("tar", ["-tzf", join(assets, "native.tar.gz")], root).split("\n");
+                assert.ok(listing.every(path => /^(packages\/llvm-linux-x64-gnu\/bin\/|packages\/runtime-linux-x64-gnu\/artifacts\/|packages\/runtime-linux-x64-gnu\/runtime-pack\.json$)/.test(path) && !path.split("/").includes("..")));
+                assert.deepEqual(listing.filter(path => !path.endsWith("/")).sort(), manifest.nativeFiles.map(file => file.path).sort());
+                await checked(name + "-archive-types", "python3", ["-c",
+                  "import sys,tarfile; t=tarfile.open(sys.argv[1]); assert all(m.isfile() or m.isdir() for m in t.getmembers())",
+                  join(assets, "native.tar.gz")], root, 2);
+                await checked(name + "-unpack", "tar", ["-xzf", join(assets, "native.tar.gz")], root, 10);
+                checkFacts(root, manifest.nativeFiles);
+                await checked(name + "-verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], root, 5);
+                await checked(name + "-build", "pnpm", ["build"], root, 25);
+                checkFacts(root, manifest.nativeFiles);
+                const files = builtFacts(root); assert.ok(files.length > 0);
+                assert.ok(files.some(file => file.path === "packages/cli/dist/bootstrap.js"));
+                report.builds[name] = { files, digest: sha(JSON.stringify(files)), lockSha256: hash(join(root, "pnpm-lock.yaml")) }; save();
+              }
+              report.sourcePreGate = sources(); assert.deepEqual(report.sourcePreGate, report.sourceBefore);
+              admit(false);
+            } else if (mode === "diagnose") {
+              const manifest = readAssetManifest(); verifyBuiltInputs(manifest);
+              for (const name of ["SCRIPTC_SAN", "SCRIPTC_LIBNODE", "SCRIPTC_CPU_LEVEL", "SCRIPTC_CPU_DISPATCH",
+                "SCRIPTC_LINKER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_OPTIMIZATION", "SCRIPTC_NO_CACHE", "SCRIPTC_TIMING"])
+                assert.equal(process.env[name], undefined, "codegen override: " + name);
+              report.scratchBefore = readdirSync("/tmp").filter(name => name.startsWith("scriptc-zero-cost-")).sort(); save();
+              const output = join(out, "zero-cost.json");
+              const args = ["scripts/zero-cost-gate.mjs", "--baseline=" + baseline, "--candidate=" + candidate,
+                "--programs=baseline", "--set=bench", "--only=^bench/numeric-kernels$", "--jobs=1", "--keep", "--json=" + output];
+              report.invocation = { command: "node", args, cwd: candidate, sourcePins: codegenPins,
+                overrides: { allow: null, baselineCache: null, quick: false, strict: false },
+                canonicalDefaults: { timingRuns: 5, maxTimeGrowth: 0.02, maxSizeGrowth: 0 },
+                evidenceLimit: "retained timing LLVM is the last of five compile pairs; no workload runtime benchmark is executed" }; save();
+              const code = await execute("numeric-codegen", "node", args, candidate, 25);
+              assert.ok([0, 1].includes(code), "canonical gate did not reach an ordinary terminal verdict");
+              const retained = await retainCodegen(join(out, "numeric-codegen.log"));
+              assert.ok(statSync(output).size <= 16 * 1024 ** 2);
+              report.canonicalJson = { path: "zero-cost.json", size: statSync(output).size, sha256: hash(output) };
+              const data = JSON.parse(readFileSync(output, "utf8"));
+              report.verdict = await verifyCodegen(data, retained);
+              assert.equal(code, data.verdict === "pass" ? 0 : 1, "canonical exit/verdict mismatch");
+              verifyBuiltInputs(manifest);
+              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              report.nativeInputsVerifiedAfter = true; report.diagnosticComplete = true; report.complete = true;
+              report.qualificationPassed = data.verdict === "pass";
+              report.status = report.qualificationPassed ? "complete" : "failed";
+              if (!report.qualificationPassed) report.failureKind = report.verdict.failureKind;
+              save();
+              assert.equal(code, 0, "canonical numeric codegen gate failed; original verdict and emitted artifacts retained");
+            } else if (mode === "finish") {
+              try {
+                cleanupSwap();
+                assert.ok(report.steps.every(step => step.groupDrained === true), "owned process group unresolved");
+                if (report.keptScratch) {
+                  const kept = report.keptScratch;
+                  assert.equal(kept.path, join("/tmp", kept.name));
+                  assert.match(kept.name, /^scriptc-zero-cost-[A-Za-z0-9]+$/);
+                  assert.ok(!report.scratchBefore.includes(kept.name));
+                  assert.equal(kept.copied, true, "canonical evidence collection incomplete");
+                  checkFacts(join(out, "emitted"), kept.files); checkFacts(kept.path, kept.files);
+                  assert.equal(realpathSync(kept.path), kept.path);
+                  rmSync(kept.path, { recursive: true }); kept.removed = true;
+                }
+                if (report.scratchBefore) assert.deepEqual(readdirSync("/tmp").filter(name => name.startsWith("scriptc-zero-cost-")).sort(), report.scratchBefore,
+                  "unresolved canonical scratch; no speculative deletion");
+                const manifest = readAssetManifest();
+                assert.equal(hash(join(out, "native-origin-inputs.json")), hash(join(assets, "inputs.json")));
+                assert.equal(hash(join(out, "native-origin-runner.mjs")), manifest.runnerSha256);
+                for (const artifact of download.artifacts) {
+                  const path = join(temp, artifact.destination);
+                  assert.ok(["numeric-codegen-assets", "numeric-codegen-origin"].includes(artifact.destination));
+                  assert.equal(realpathSync(path), path);
+                  const actual = fileFacts(path, filesUnder(path)).map(({ path, size, sha256 }) => ({ path, size, sha256 }));
+                  assert.deepEqual(actual.sort((a,b)=>a.path.localeCompare(b.path)), artifact.files.sort((a,b)=>a.path.localeCompare(b.path)));
+                  rmSync(path, { recursive: true });
+                }
+                report.downloadScratchRemoved = true;
+              } finally {
+                report.sourceAfterCleanup = sources(); assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+                assert.equal(hash(join(out, "consumer-runner.mjs")), report.runnerSha256);
+                rmSync(fileURLToPath(import.meta.url)); report.payloadRemoved = true;
+              }
+              report.cleanupPassed = true;
+              assert.equal(report.complete, true, "setup or emitted-code diagnosis incomplete");
+              assert.equal(report.status, "complete", "canonical gate failed; diagnosis remains recorded");
+            } else throw Error("unknown mode: " + mode);
+          } catch (error) {
+            report.status = "failed"; report.qualificationPassed = false;
+            if (mode === "finish" && report.cleanupPassed !== true) report.diagnosticComplete = false;
+            (report.errors ??= []).push({ phase: mode, error: scrub(error.stack ?? error) });
+            process.exitCode = 1;
+          } finally {
+            if (interrupted) { report.status = "failed"; report.qualificationPassed = false; report.diagnosticComplete = false; report.interrupted = interrupted; process.exitCode = 1; }
+            if (mode !== "finish" && report.status === "failed") {
+              try { report.sourceAfterFailure = sources(); } catch (error) { report.sourceError = scrub(error.stack ?? error); }
+            }
+            report.updatedAt = new Date().toISOString(); save();
+            console.log(JSON.stringify({ task, mode, status: report.status, complete: report.complete }));
+            if (process.exitCode) console.error("[numeric-codegen] FAILED (exit 1)");
+          }
+          RUNNER
+          node --check "$RUNNER_TEMP/numeric-codegen-runner.mjs"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+          cache-dependency-path: |
+            baseline/pnpm-lock.yaml
+            candidate/pnpm-lock.yaml
+      - name: Verify sources and admit paired-build capacity
+        timeout-minutes: 10
+        run: node "$RUNNER_TEMP/numeric-codegen-runner.mjs" initialize
+      - uses: ./candidate/.github/actions/llvm-linux
+      - uses: ./candidate/.github/actions/zig
+      - name: Build exact sources using the retained native pack
+        timeout-minutes: 70
+        run: node "$RUNNER_TEMP/numeric-codegen-runner.mjs" build
+      - name: Compare and retain canonical emitted code
+        timeout-minutes: 38
+        run: |
+          ulimit -c 0
+          sudo sysctl -w kernel.core_pattern=core
+          node "$RUNNER_TEMP/numeric-codegen-runner.mjs" diagnose
+      - name: Finalize owned scratch and swap
+        if: always()
+        timeout-minutes: 7
+        run: |
+          if test -f "$RUNNER_TEMP/numeric-codegen-runner.mjs"; then
+            node "$RUNNER_TEMP/numeric-codegen-runner.mjs" finish
+          else
+            mkdir -p "$RUNNER_TEMP/numeric-codegen-proof"
+            printf '%s\n' '{"complete":false,"status":"failed","error":"setup failed before consumer creation"}' > "$RUNNER_TEMP/numeric-codegen-proof/summary.json"
+            echo '[numeric-codegen] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numeric-codegen-diagnostic
+          path: ${{ runner.temp }}/numeric-codegen-proof
+          if-no-files-found: error
+          retention-days: 1
