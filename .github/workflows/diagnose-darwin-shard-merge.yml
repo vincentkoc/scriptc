@@ -1,0 +1,669 @@
+name: Diagnose Darwin shard merge
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-darwin-shard-merge.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diagnose-darwin-shard-merge-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - name: Write bounded replay payload
+        id: payload
+        run: |
+          umask 077
+          mkdir "$RUNNER_TEMP/darwin-shard-merge-proof"
+          python3 -c 'import json,os,pathlib; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"darwin-shard-merge-proof"/"proof-owner.json"; p.write_text(json.dumps({"workflow":os.environ["GITHUB_SHA"],"run":os.environ["GITHUB_RUN_ID"],"attempt":os.environ["GITHUB_RUN_ATTEMPT"]})+"\n")'
+          cat > "$RUNNER_TEMP/darwin-shard-merge-proof/macho.py" <<'MACHO'
+          import hashlib
+          import json
+          import pathlib
+          import struct
+          import sys
+
+          WARNING_SYMBOLS = ["_sc_streq_4418951778850151","_sc_streq_2832937049513","_sc_streq_2439431829155374","_sc_streq_2411579562213172","_sc_streq_2734174280155539","_sc_streq_923839245533765","_sc_streq_2227497482646049","_sc_streq_2298207874780604"]
+          AUTHORED_SYMBOLS = ["_sc_f__x25_m411436747_QuadraticBezier"]
+          SYMBOLS = WARNING_SYMBOLS + AUTHORED_SYMBOLS
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def macho(data, label):
+              assert 32 <= len(data) <= 256 * 1024**2, "Mach-O file size outside diagnostic budget"
+              magic, cpu, subtype, kind, ncmds, cmdbytes, flags, reserved = struct.unpack_from("<8I", data)
+              assert magic == 0xfeedfacf and cpu == 0x100000c and kind == 1, "expected thin arm64 MH_OBJECT"
+              assert 0 < ncmds <= 1024 and 32 + cmdbytes <= len(data), "invalid Mach-O load command range"
+              sections, symtab = [], None
+              pos = 32
+              for _ in range(ncmds):
+                  assert pos + 8 <= 32 + cmdbytes
+                  command, size = struct.unpack_from("<II", data, pos)
+                  assert size >= 8 and size % 8 == 0 and pos + size <= 32 + cmdbytes, "invalid load command"
+                  if command == 0x19:
+                      assert size >= 72
+                      count = struct.unpack_from("<I", data, pos + 64)[0]
+                      assert 72 + count * 80 <= size and len(sections) + count <= 255
+                      for index in range(count):
+                          start = pos + 72 + index * 80
+                          name, segment, address, length, offset, align, reloff, nreloc, section_flags, r1, r2, r3 = struct.unpack_from("<16s16sQQ8I", data, start)
+                          name = name.split(b"\0", 1)[0].decode("utf8")
+                          segment = segment.split(b"\0", 1)[0].decode("utf8")
+                          zero = section_flags & 0xff in (1, 0xc, 0x12)
+                          assert zero or offset + length <= len(data), "section exceeds object"
+                          assert reloff + nreloc * 8 <= len(data), "relocations exceed object"
+                          sections.append({"index":len(sections)+1, "segment":segment, "name":name, "address":address,
+                              "size":length, "align":align, "flags":section_flags, "zeroFill":zero,
+                              "sha256":None if zero else sha(data[offset:offset+length]),
+                              "relocations":nreloc, "relocationSha256":sha(data[reloff:reloff+nreloc*8])})
+                  elif command == 2:
+                      assert size == 24 and symtab is None, "ambiguous symbol table"
+                      symtab = struct.unpack_from("<4I", data, pos + 8)
+                  pos += size
+              assert pos == 32 + cmdbytes and symtab is not None
+              symoff, count, stroff, strsize = symtab
+              assert count <= 2000000 and symoff + count * 16 <= len(data) and stroff + strsize <= len(data)
+              strings = data[stroff:stroff+strsize]
+              symbols, functions, oso, current_function = [], [], None, None
+              for index in range(count):
+                  string_index, typ, section, desc, value = struct.unpack_from("<IBBHQ", data, symoff + index * 16)
+                  assert string_index < strsize, "symbol string offset out of bounds"
+                  end = strings.find(b"\0", string_index)
+                  assert end >= 0, "unterminated symbol name"
+                  name = strings[string_index:end].decode("utf8")
+                  if not typ & 0xe0 and typ & 0xe == 0xe:
+                      assert 1 <= section <= len(sections), "invalid symbol section"
+                      owner = sections[section - 1]
+                      assert owner["address"] <= value <= owner["address"] + owner["size"], "symbol outside section"
+                  row = {"index":index, "name":name, "type":typ, "section":section, "desc":desc, "value":value}
+                  symbols.append(row)
+                  if typ == 0x64:
+                      oso = None
+                      current_function = None
+                  elif typ == 0x66:
+                      oso = {"path":name, "mtimeSeconds":value, "symbolIndex":index}
+                  elif typ == 0x24 and name:
+                      current_function = {**row, "oso":None if oso is None else dict(oso), "size":None, "closeSymbolIndex":None}
+                      functions.append(current_function)
+                  elif typ == 0x24 and not name:
+                      if current_function is not None:
+                          current_function["size"] = value
+                          current_function["closeSymbolIndex"] = index
+                          current_function = None
+              return {"label":label, "sha256":sha(data), "bytes":len(data), "header":{"cpu":cpu,"subtype":subtype,"kind":kind,"flags":flags},
+                  "sections":sections, "symbols":symbols, "functions":functions}
+
+          def normalized_symbols(parsed, paths):
+              rows = []
+              for symbol in parsed["symbols"]:
+                  row = [symbol[key] for key in ("name", "type", "section", "desc", "value")]
+                  if symbol["type"] == 0x66:
+                      assert symbol["name"] in paths, "unknown N_OSO path"
+                      row[0] = paths[symbol["name"]]
+                  rows.append(row)
+              return rows
+
+          def symbol_summary(parsed, paths, raw_inputs, raw_parsed):
+              rows = []
+              for name in SYMBOLS:
+                  owners = []
+                  for item, raw in zip(raw_inputs, raw_parsed, strict=True):
+                      found = [symbol for symbol in raw["symbols"] if symbol["name"] == name and not symbol["type"] & 0xe0 and symbol["type"] & 0xe == 0xe]
+                      for symbol in found:
+                          owners.append({"input":item["name"], "definition":symbol})
+                  assert len(owners) == 1 and owners[0]["definition"]["type"] == 0x1f, "sentinel raw private-external owner mismatch"
+                  definitions = [symbol for symbol in parsed["symbols"] if symbol["name"] == name and not symbol["type"] & 0xe0 and symbol["type"] & 0xe == 0xe]
+                  functions = [symbol for symbol in parsed["functions"] if symbol["name"] == name]
+                  mapped = []
+                  for function in functions:
+                      oso = function["oso"]
+                      alias = paths.get(oso["path"]) if oso else None
+                      input_row = next((item for item in raw_inputs if item["name"] == alias), None)
+                      size = function["size"]
+                      definition_matches = len(definitions) == 1 and definitions[0]["section"] == function["section"] and definitions[0]["value"] == function["value"]
+                      raw_def = owners[0]["definition"]
+                      raw = next(raw for item, raw in zip(raw_inputs, raw_parsed, strict=True) if item["name"] == owners[0]["input"])
+                      raw_section = raw["sections"][raw_def["section"] - 1]
+                      output_section = parsed["sections"][function["section"] - 1] if 1 <= function["section"] <= len(parsed["sections"]) else None
+                      range_valid = isinstance(size, int) and size > 0 and output_section is not None and raw_def["value"] + size <= raw_section["address"] + raw_section["size"] and function["value"] + size <= output_section["address"] + output_section["size"]
+                      mapped.append({**function, "definitionMatchesFunction":definition_matches, "rangesWithinSections":range_valid, "mappedInput":alias,
+                          "mtimeMatchesMappedInput":input_row is not None and oso["mtimeSeconds"] == int(input_row["mtimeNs"]) // 1000000000,
+                          "matchesRawDefinitionOwner":alias == owners[0]["input"]})
+                  rows.append({"selection":"first-eight-retained-warnings" if name in WARNING_SYMBOLS else "additional-authored-function", "symbol":name, "rawOwner":owners[0], "outputDefinitions":definitions, "functions":mapped})
+              return rows
+
+          def compact(parsed, paths, raw_inputs, raw_parsed):
+              contract = normalized_symbols(parsed, paths)
+              return {"label":parsed["label"],"bytes":parsed["bytes"],"sha256":parsed["sha256"],"header":parsed["header"],
+                  "sections":parsed["sections"],"symbolCount":len(parsed["symbols"]),
+                  "normalizedSymbolContractSha256":sha(json.dumps(contract,separators=(",",":")).encode()),
+                  "sentinels":symbol_summary(parsed, paths, raw_inputs, raw_parsed)}
+
+          def analyze(mode, admission_path, output, report_path):
+              assert mode in ("admit", "control", "differential"), "invalid analysis mode"
+              admission = json.loads(pathlib.Path(admission_path).read_text())
+              raw_inputs = admission["inputs"]
+              assert len(raw_inputs) == 17 and [r["name"] for r in raw_inputs] == [f"procedural-geometry.program-{i:03}.o" for i in range(17)]
+              paths = {key:item["name"] for item in raw_inputs for key in (item["originalPath"],item["stagedPath"])}
+              raw_parsed = [macho(pathlib.Path(item["stagedPath"]).read_bytes(),item["name"]) for item in raw_inputs]
+              original = macho(pathlib.Path(admission["originalMerged"]["stagedPath"]).read_bytes(),"retained-original")
+              parsed = macho(pathlib.Path(output).read_bytes(),mode)
+              original_summary = compact(original, paths, raw_inputs, raw_parsed)
+              observed = compact(parsed, paths, raw_inputs, raw_parsed)
+              if mode == "admit":
+                  assert observed["sha256"] == original_summary["sha256"]
+                  assert original_summary["normalizedSymbolContractSha256"] == "1cac8fd2c76333e18152faf3587d10cbc2d20e7258af7b5f1b56500a361003d1"
+                  assert all(len(row["outputDefinitions"]) == 1 and row["outputDefinitions"][0]["type"] == 0x1e and len(row["functions"]) == 1 and row["functions"][0]["mtimeMatchesMappedInput"] and row["functions"][0]["definitionMatchesFunction"] and row["functions"][0]["rangesWithinSections"] and not row["functions"][0]["matchesRawDefinitionOwner"] for row in original_summary["sentinels"])
+                  report = {"mode":mode,"inputsAdmitted":True,"retainedControl":original_summary,"linkReplayExecuted":False}
+              elif mode == "control":
+                  reproduced = observed["header"] == original_summary["header"] and observed["sections"] == original_summary["sections"] and observed["normalizedSymbolContractSha256"] == original_summary["normalizedSymbolContractSha256"]
+                  reproduced = reproduced and all(len(row["outputDefinitions"]) == 1 and row["outputDefinitions"][0]["type"] == 0x1e and len(row["functions"]) == 1 and row["functions"][0]["mtimeMatchesMappedInput"] and row["functions"][0]["definitionMatchesFunction"] and row["functions"][0]["rangesWithinSections"] and not row["functions"][0]["matchesRawDefinitionOwner"] for row in observed["sentinels"])
+                  report = {"mode":mode,"controlReproduced":reproduced,"original":original_summary,"observed":observed,
+                      "pathNormalization":"Only authenticated original/staged raw-object N_OSO paths map to their exact ordered input names."}
+              else:
+                  control = json.loads(pathlib.Path(admission["controlReport"]).read_text())
+                  assert control["controlReproduced"] is True
+                  control_summary = control["observed"]
+                  effective = all(len(row["outputDefinitions"]) == 1 and row["outputDefinitions"][0]["type"] == 0x1f for row in observed["sentinels"])
+                  covered = all(len(row["functions"]) == 1 and row["functions"][0]["mappedInput"] is not None and row["functions"][0]["mtimeMatchesMappedInput"] and row["functions"][0]["definitionMatchesFunction"] and row["functions"][0]["rangesWithinSections"] and row["functions"][0]["size"] == control_summary["sentinels"][index]["functions"][0]["size"] for index, row in enumerate(observed["sentinels"]))
+                  corrected = covered and all(row["functions"][0]["matchesRawDefinitionOwner"] for row in observed["sentinels"])
+                  wrong = covered and all(not row["functions"][0]["matchesRawDefinitionOwner"] for row in observed["sentinels"])
+                  text_keys = ("index","segment","name","address","size","align","flags","zeroFill","sha256")
+                  text_equal = [{key:section[key] for key in text_keys} for section in observed["sections"] if section["segment"] == "__TEXT"] == [{key:section[key] for key in text_keys} for section in control_summary["sections"] if section["segment"] == "__TEXT"]
+                  conclusion = "inconclusive"
+                  if effective and covered and text_equal:
+                      if corrected: conclusion = "demotion-contributes-for-nine-selected-sentinels"
+                      elif wrong: conclusion = "demotion-ablation-insufficient-for-nine-selected-sentinels"
+                  report = {"mode":mode,"observed":observed,"flagEffective":effective,"functionCoverageComplete":covered,
+                      "textBytesAndLayoutIdentical":text_equal,"sectionContractsIdentical":observed["sections"] == control_summary["sections"],
+                      "conclusion":conclusion,"runtimeAcceptance":False,
+                      "warningSelection":WARNING_SYMBOLS,"additionalAuthoredSelection":AUTHORED_SYMBOLS,
+                      "authoredDwarfContext":"A separate offline inspection found an authored DIE in raw001. This replay examines Mach-O ownership only; it does not rerun DWARF or dsymutil.",
+                      "limit":"Preserving private externals does not meet library internalization and is not a production fix or final dsymutil/runtime verdict."}
+              pathlib.Path(report_path).write_text(json.dumps(report,indent=2)+"\n")
+
+          if __name__ == "__main__":
+              analyze(*sys.argv[1:])
+          MACHO
+          cat > "$RUNNER_TEMP/darwin-shard-merge-proof/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { basename, dirname, join, relative, resolve } from "node:path";
+          import { setTimeout as delay } from "node:timers/promises";
+
+          const root = join(process.env.GITHUB_WORKSPACE, "source");
+          const out = join(process.env.RUNNER_TEMP, "darwin-shard-merge-proof");
+          const work = join(process.env.RUNNER_TEMP, "darwin-shard-merge-work");
+          const self = resolve(process.argv[1]);
+          const consumerIdentity = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT };
+          const sourceHead = "022f251fc38b4c169333f133398ee5150172f2bc";
+          const sourcePins = {"AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/three.test.ts":"6260fb23d1f98752b201192db3a14e8c01f6c8419c9508a6d311c9962327c86a","tests/fixtures/three/procedural-geometry.mjs":"e6fa26f371d954d0f3473a649646234dfa455534646b319d3293fe979ade9615","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/backend/debug-symbols.ts":"979ae280386fc98ab75643e925e7067357b31d495b69026e960e2376c280bbb3","packages/compiler/src/backend/native/executable.ts":"3af4b1034b7cb9750720d78c1e803743aeee1e1cf60b57396cf50d351ee33d39","packages/compiler/src/backend/native/driver.ts":"64d65bb08e9d9b97e9f9a48d55b02d8d4f0fd3bdc5eee4ae937b67abc57cd82e","packages/compiler/src/backend/native/session.ts":"b82407816ed96933fee39c9cd5dd7f47bb0be6a4a025bd1841e7c3ca2baf56ce","packages/compiler/src/backend/build-cache.ts":"f4a3dfa56c1063cb1b5fd9642bd30af79e6727e51e6250b2de27b2a2448c33e2","packages/compiler/src/backend/cache-root.ts":"7a9e30aa817aea4b45bf8866d5b53677872885ce5b9f43536ca94f9bb677e628","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/runtime-darwin-arm64/package.json":"955755aff1488955fb3181895559ed72ed9cc2f1103ef7a3fcbbee9dff94ecd0","packages/runtime-darwin-arm64/scripts/verify.mjs":"758b2fef508d2a2ff23ce43a709adb15166461aac66ece808578abea85d2f357","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/llvm-darwin-arm64/package.json":"aa242a8579d99df616078e805e7b7441c94e3867dd8f722ed32929fba4b4e383","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631","packages/compiler/src/backend/native/process.ts":"341c216690b7f5d401786f46e80e5bba3c7f8b5c22896d1d0c047e5f328c75ea","packages/compiler/src/backend/native/runtime-inputs.ts":"261d9462b2464d085d44f1c767e82adbbc3672c787b71c602de1046f3ccf45d8","packages/compiler/src/backend/native/tool-identity.ts":"2d239087986b664aff948f9a8fa18ac2ada65b0102cd65e3fe9472147deb4cb8","packages/compiler/src/backend/native/object-merge.ts":"cf92ea4c8e7bfc8961aa928564ca193d6b81ee735dd74ea33b4b7eb6ae2c0123","packages/compiler/src/backend/native/program-shards.ts":"b01f954a589c3ccbd0d0f2a71bc2fe7b66994db2bdf1378037c3ccec852bc792","packages/compiler/src/backend/native/runtime-objects.ts":"8722f813926a202b4cae5e1dff2829f30542d611fa09cddedaf36481c26ae630","packages/compiler/src/backend/native/vendor.ts":"371db343d518806187218379a64a8446f67773a509f7b65a9fd88425a264816c","tsconfig.base.json":"efc9a98b93b487ec0397287f90c59a89a039443a4eae3d023294a8724d2c22d4","packages/compiler/tsconfig.json":"8465ef2358e3a6fe7c91db8c3ba1b53fec5af62398b827209ded67ed653228d7"};
+          const expectedInputs = [{"name":"localize-keep.syms","bytes":6,"sha256":"6c08dd18573a198f1882b304248da747c00152dc8e8bd61f733ce42cfc39838f","mtimeNs":"1793480463567688041"},{"name":"procedural-geometry.program-000.o","bytes":5243272,"sha256":"2a1929e077b895078cf4df78844981a2052bd1e74f2ececd15dd1b6dfb83f62a","mtimeNs":"1793480442183267249"},{"name":"procedural-geometry.program-001.o","bytes":5081912,"sha256":"d9a129ebbdf4aa2d0ff7104b69c106374da8565ac2e1ae7f82d96cf958043dc2","mtimeNs":"1793480445014711833"},{"name":"procedural-geometry.program-002.o","bytes":4994168,"sha256":"80a15ac11b5371c2410ca6dbb867092864bf0d2524e8796cad544cde7a0044cb","mtimeNs":"1793480445094115708"},{"name":"procedural-geometry.program-003.o","bytes":5137192,"sha256":"477b576d6ffb67b0ca2d2a67069ee56fe308b5f62575ee8aa8719f762246a5ed","mtimeNs":"1793480445704978791"},{"name":"procedural-geometry.program-004.o","bytes":4821584,"sha256":"dc74620299e43b9e6a3db139959d87439a5dbaf75a56f4098e66faeae1d5c4b7","mtimeNs":"1793480447717164999"},{"name":"procedural-geometry.program-005.o","bytes":5730520,"sha256":"1f9b29626dcd3bf2a7104d08b414513cfac6fc0b9a0bc501caf35f024c374e39","mtimeNs":"1793480448540018791"},{"name":"procedural-geometry.program-006.o","bytes":5129576,"sha256":"c6254228d86a8c493ce31118b54f0616a0a919fe667b8c8c213d236aca9576cc","mtimeNs":"1793480448605927291"},{"name":"procedural-geometry.program-007.o","bytes":4394016,"sha256":"f0a17819e72398a190326ef2fe92722ee092d9d28204ae465903e30e2eef50f8","mtimeNs":"1793480450468375208"},{"name":"procedural-geometry.program-008.o","bytes":6507512,"sha256":"8d4ca212045775befaf0815aa6b9f0540d404620008dd4fb7043080309e27b16","mtimeNs":"1793480453078096791"},{"name":"procedural-geometry.program-009.o","bytes":8690904,"sha256":"6dde95356ae9918d40a77104352c56630468534828887424add47a6ed7716950","mtimeNs":"1793480457312294916"},{"name":"procedural-geometry.program-010.o","bytes":4440600,"sha256":"15501e69a122c3b457e6a8a8515b6e9284afd7fc9cf9161f45682612462e8cd1","mtimeNs":"1793480453550801708"},{"name":"procedural-geometry.program-011.o","bytes":6225288,"sha256":"0ff23bc31ca0601e72db2303f5709e684f7e13269cdf31f082344c32e31f486f","mtimeNs":"1793480456926189916"},{"name":"procedural-geometry.program-012.o","bytes":5394960,"sha256":"b6c0441721b36ac4851b348654958f76a5803d17e167f37430fc15d075b25f8f","mtimeNs":"1793480456917810541"},{"name":"procedural-geometry.program-013.o","bytes":6467904,"sha256":"68ea2dd95bc9ad48602a2f0d3af6aefd35a24c6a5e8d934df3ac4034619c4cf4","mtimeNs":"1793480461650510833"},{"name":"procedural-geometry.program-014.o","bytes":5417384,"sha256":"b798fd565c42823ba9c1ab0bd84195a339f64b61cc13d307698f44f7a50b2285","mtimeNs":"1793480460317062999"},{"name":"procedural-geometry.program-015.o","bytes":5849016,"sha256":"69edf26fa14f2a5aefe8db340937f9c7e60c5758719e395e4e28967ca7612cb8","mtimeNs":"1793480461499526708"},{"name":"procedural-geometry.program-016.o","bytes":5106624,"sha256":"04c249f68feaf5890e95d9de61499594d24e0e5a3d5b8da1c068c94123832ab8","mtimeNs":"1793480463556161791"},{"name":"procedural-geometry.program.localized.o","bytes":80659584,"sha256":"9f9b60b33417fd46f8c50edf09016453ccf78d677150b435cd83a567cc63b0bf","mtimeNs":"1793480464073096583"}];
+          const expectedTool = {"path":"/Applications/Xcode_16.4.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld","sha256":"648a8aac7f6f829a42305d24dddd7a3cfa48ee0bd9d4e7ec1ded5c51edea372b","versionArgs":["-v"],"versionCode":0,"stdout":"","stderr":"@(#)PROGRAM:ld PROJECT:ld-1167.5\nBUILD 01:45:05 Apr 30 2025\nconfigured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em\nwill use ld-classic for: armv6 armv7 armv7s i386 armv6m armv7k armv7m armv7em\nLTO support using: LLVM version 17.0.0 (static support for 29, runtime is 29)\nTAPI support using: Apple TAPI version 17.0.0 (tapi-1700.0.3.5)\n"};
+          const expectedImage = {"imageOS":"macos15","imageVersion":"20261028.0489.1","developerDirectory":"/Applications/Xcode_16.4.app/Contents/Developer","xcode":"Xcode 16.4\nBuild version 16F6","swVers":"ProductName:\t\tmacOS\nProductVersion:\t\t15.8.2\nBuildVersion:\t\t24H232","sdk":{"path":"/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","version":"15.5","build":"24F74","settingsSha256":"58a133735f0a55a624a1703067059f6e78925e51725ec6e1f966072e142c9c42"}};
+          const parser = join(out, "macho.py");
+          const CAP = 1024 * 1024;
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          function capture(command, args = [], cwd = root) {
+            const value = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.error, undefined, command + " launch failed");
+            assert.equal(value.status, 0, command + " failed");
+            return value.stdout.trim();
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).flatMap(entry => {
+              assert.ok(!entry.isSymbolicLink(), "proof symlink refused");
+              const name = prefix + entry.name, path = join(base, entry.name);
+              return entry.isDirectory() ? files(path, name + "/") : [{ ...record(path), path: name }];
+            }).sort((a, b) => a.path.localeCompare(b.path));
+          }
+          function verifyWorkOwner() {
+            const info = lstatSync(work);
+            assert.ok(info.isDirectory() && !info.isSymbolicLink());
+            assert.equal(info.mode & 0o777, 0o700);
+            const marker = join(work, "owner.json"), markerInfo = lstatSync(marker);
+            assert.ok(markerInfo.isFile() && !markerInfo.isSymbolicLink());
+            assert.deepEqual(json(marker), consumerIdentity, "scratch owner identity mismatch");
+            assert.deepEqual(json(join(out, "proof-owner.json")), consumerIdentity, "proof owner identity mismatch");
+            return consumerIdentity;
+          }
+          function source() {
+            assert.equal(capture("git", ["rev-parse", "HEAD"]), sourceHead);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const found = Object.fromEntries(Object.keys(sourcePins).map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(found, sourcePins);
+            return { head: sourceHead, clean: true, pins: found };
+          }
+          function inputs(admission) {
+            assert.deepEqual(admission.consumer, consumerIdentity);
+            assert.equal(admission.snapshotAuthenticated, true);
+            assert.equal(admission.manifestCount, 132); assert.equal(admission.snapshotCount, 96);
+            assert.equal(admission.priorDiagnosticComplete, false);
+            assert.deepEqual(admission.sourcePins, sourcePins);
+            assert.equal(admission.inputs.length, 17);
+            assert.deepEqual(admission.inputs.map(row => row.name), Array.from({ length: 17 }, (_, i) => "procedural-geometry.program-" + String(i).padStart(3, "0") + ".o"));
+            const rows = [...admission.inputs, admission.keepList, admission.originalMerged];
+            const found = rows.map(row => {
+              assert.equal(row.stagedPath, join(out, "inputs", row.name));
+              const info = lstatSync(row.stagedPath, { bigint: true });
+              assert.ok(info.isFile() && !info.isSymbolicLink());
+              const observed = { name: row.name, bytes: Number(info.size), sha256: hash(row.stagedPath), mtimeNs: String(info.mtimeNs) };
+              assert.deepEqual(observed, expectedInputs.find(item => item.name === row.name));
+              assert.equal(row.bytes, observed.bytes); assert.equal(row.sha256, observed.sha256); assert.equal(row.mtimeNs, observed.mtimeNs);
+              return observed;
+            });
+            assert.equal(new Set(found.map(row => row.name)).size, 19);
+            return found;
+          }
+          function tools() {
+            assert.equal(process.platform, "darwin"); assert.equal(process.arch, "arm64"); assert.equal(process.versions.node, "24.22.0");
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_OPTIONS", "DEVELOPER_DIR", "SDKROOT", "LD"]) assert.equal(process.env[key], undefined, key + " must be absent");
+            const actual = capture("/usr/bin/xcrun", ["--find", "ld"]);
+            assert.equal(actual, expectedTool.path); assert.equal(hash(actual), expectedTool.sha256);
+            const launcher = capture("/usr/bin/which", ["ld"]); assert.equal(launcher, "/usr/bin/ld", "PATH linker route changed");
+            const version = spawnSync("ld", ["-v"], { cwd: root, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(version.error, undefined); assert.equal(version.status, expectedTool.versionCode);
+            assert.equal(version.stdout, expectedTool.stdout); assert.equal(version.stderr.trim(), expectedTool.stderr.trim());
+            const sdkPath = capture("/usr/bin/xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+            const image = {
+              imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion,
+              developerDirectory: capture("/usr/bin/xcode-select", ["-p"]),
+              xcode: capture("/usr/bin/xcodebuild", ["-version"]),
+              swVers: capture("/usr/bin/sw_vers"),
+              sdk: { path: sdkPath, version: capture("/usr/bin/xcrun", ["--sdk", "macosx", "--show-sdk-version"]),
+                build: capture("/usr/bin/xcrun", ["--sdk", "macosx", "--show-sdk-build-version"]),
+                settingsSha256: hash(join(sdkPath, "SDKSettings.json")) }
+            };
+            assert.deepEqual(image, expectedImage, "host image or SDK changed");
+            const python = realpathSync(capture("/usr/bin/which", ["python3"]));
+            return { image, ld: { path: actual, sha256: hash(actual), launcher, launcherSha256: hash(launcher), stdout: version.stdout, stderr: version.stderr },
+              node: { path: process.execPath, sha256: hash(process.execPath), version: process.versions.node },
+              python: { path: python, sha256: hash(python), version: capture(python, ["--version"]) } };
+          }
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE"]) delete childEnv[key];
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeSync(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached Darwin group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function requireSuccess(value) {
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.forcedCleanup, false);
+          }
+
+          async function childMain() {
+            verifyWorkOwner();
+            writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", () => { process.stderr.write("diagnostic child launch failed\n"); process.exitCode = 127; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function linkArguments(admission, output, variant) {
+            assert.ok(variant === "control" || variant === "differential");
+            const control = ["-r", ...admission.inputs.map(item => item.stagedPath), "-o", output, "-exported_symbols_list", admission.keepList.stagedPath];
+            const args = variant === "control" ? control : [...control, "-keep_private_externs"];
+            assert.deepEqual(args.filter(arg => arg !== "-keep_private_externs"), control);
+            assert.equal(args.filter(arg => arg === "-keep_private_externs").length, variant === "control" ? 0 : 1);
+            return args;
+          }
+          function retainOutput(path, label) {
+            assert.equal(path, join(work, "program.localized.o"));
+            const info = lstatSync(path);
+            assert.ok(info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 256 * 1024 ** 2);
+            const target = join(out, label + ".o"); assert.equal(existsSync(target), false);
+            copyFileSync(path, target);
+            assert.equal(hash(path), hash(target));
+            return record(target);
+          }
+          async function main() {
+            const report = { schemaVersion: 1, source: sourceHead, consumer: consumerIdentity, diagnosticComplete: false,
+              runtimeAcceptance: false, finalPassed: false, links: [], observation: "incomplete",
+              commandLimit: 2, linkDeadlineSeconds: 120, streamStorageLimitBytes: CAP,
+              scope: "Object-only replay; no compiler, binary execution, strip, final link, or dsymutil invocation.",
+              originalRecipeObserved: false, sourceDerivedRecipe: "packages/compiler/src/backend/native/object-merge.ts at the pinned source.",
+              variant: "Add only -keep_private_externs; keep export list, ordered input bytes/mtimes, linker, and output path identical.",
+              interpretationLimit: "The eight warning-selected helpers and one separate authored function are bounded sentinels. Preserving private externals does not satisfy library internalization and cannot by itself be a production fix or a final dsymutil/runtime verdict." };
+            try {
+              verifyWorkOwner();
+              const archive = json(join(out, "archive-admission.json"));
+              assert.equal(archive.verified, true); assert.deepEqual(archive.consumer, consumerIdentity);
+              report.archive = archive; report.admission = record(join(out, "admission.json"));
+              const admission = json(join(out, "admission.json"));
+              report.origin = admission.origin;
+              report.sourceBefore = source(); report.inputsBefore = inputs(admission); report.toolsBefore = tools();
+              assert.equal(hash(parser), "43a2e491d76896e22e8432d748f8f878f8d1673054f104ac47a995a88a7513bd"); report.parser = record(parser); report.runner = record(self);
+              requireSuccess(await run("input-analysis", report.toolsBefore.python.path, [parser, "admit", join(out, "admission.json"), admission.originalMerged.stagedPath, join(out, "input-analysis.json")], 120));
+              assert.equal(json(join(out, "input-analysis.json")).inputsAdmitted, true);
+              const output = join(work, "program.localized.o");
+              assert.equal(existsSync(output), false);
+              for (const variant of ["control", "differential"]) {
+                assert.deepEqual(inputs(admission), report.inputsBefore); assert.deepEqual(tools(), report.toolsBefore);
+                const args = linkArguments(admission, output, variant);
+                const invocation = { label: variant, command: "ld", args, cwd: root, sourceDerivedOriginalRecipe: true, onlyDifferentialFlag: "-keep_private_externs" };
+                save(variant + ".invocation.json", invocation);
+                const result = await run(variant + "-link", "ld", args, 120);
+                const row = { ...invocation, process: result }; report.links.push(row); save("summary.json", report);
+                requireSuccess(result);
+                row.output = retainOutput(output, variant);
+                assert.deepEqual(inputs(admission), report.inputsBefore);
+                requireSuccess(await run(variant + "-analysis", report.toolsBefore.python.path, [parser, variant, join(out, "admission.json"), join(out, row.output.path), join(out, variant + "-analysis.json")], 120));
+                row.analysis = record(join(out, variant + "-analysis.json"));
+                const analysis = json(join(out, variant + "-analysis.json"));
+                if (variant === "control") {
+                  report.controlReproduced = analysis.controlReproduced === true;
+                  if (!report.controlReproduced) { report.observation = "control-not-reproduced"; break; }
+                  assert.equal(hash(output), row.output.sha256);
+                  rmSync(output);
+                } else {
+                  report.observation = analysis.conclusion;
+                  report.flagEffective = analysis.flagEffective;
+                  report.functionCoverageComplete = analysis.functionCoverageComplete;
+                }
+              }
+              report.diagnosticComplete = report.links.length === 2 && report.links.every(row => row.analysis && row.output) &&
+                report.controlReproduced === true && report.flagEffective === true && report.functionCoverageComplete === true;
+            } catch (error) { report.error = { name: error?.name, message: String(error?.message ?? error) }; }
+            finally {
+              try {
+                const admission = json(join(out, "admission.json"));
+                report.sourceAfter = source(); report.inputsAfter = inputs(admission); report.toolsAfter = tools();
+                assert.deepEqual(report.sourceAfter, report.sourceBefore); assert.deepEqual(report.inputsAfter, report.inputsBefore); assert.deepEqual(report.toolsAfter, report.toolsBefore);
+                report.inputsVerifiedAfter = true;
+              } catch (error) { report.readbackError = String(error); report.diagnosticComplete = false; }
+              report.diagnosticComplete &&= report.inputsVerifiedAfter === true;
+              save("summary.json", report);
+              process.stderr.write("[darwin-shard-merge] FAILED (exit 1)\n"); process.exitCode = 1;
+            }
+          }
+          function finalize() {
+            const report = existsSync(join(out, "summary.json")) ? json(join(out, "summary.json")) : { schemaVersion: 1, diagnosticComplete: false, runtimeAcceptance: false };
+            const cleanup = { completed: false, groupChecks: [] };
+            try {
+              cleanup.owner = verifyWorkOwner();
+              for (const name of readdirSync(out).filter(name => name.endsWith(".process.json"))) {
+                const result = json(join(out, name)); assert.equal(result.drained, true, "unresolved group; retain scratch");
+                assert.ok(existsSync(join(out, name.replace(".process.json", ".owner.json"))));
+              }
+              for (const name of readdirSync(out).filter(name => name.endsWith(".owner.json"))) {
+                const owner = json(join(out, name)), terminal = join(out, name.replace(".owner.json", ".process.json"));
+                assert.ok(existsSync(terminal), "missing terminal receipt; retain scratch");
+                const result = json(terminal);
+                assert.equal(result.pid, owner.pid); assert.equal(result.drained, true);
+                assert.equal(owner.pid, owner.group); assert.ok(Number.isInteger(owner.group) && owner.group > 1 && owner.group !== process.pid);
+                const members = groupMembers(owner.group); cleanup.groupChecks.push({ owner: name, members });
+                assert.equal(members.length, 0, "owned group not drained; retain scratch");
+              }
+              assert.equal(dirname(work), process.env.RUNNER_TEMP); verifyWorkOwner();
+              rmSync(work, { recursive: true }); cleanup.completed = !existsSync(work);
+              report.sourceAfterCleanup = source();
+              if (report.sourceBefore) assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+              if (report.inputsBefore) assert.deepEqual(inputs(json(join(out, "admission.json"))), report.inputsBefore);
+            } catch (error) { cleanup.error = String(error); report.diagnosticComplete = false; }
+            report.cleanup = cleanup; report.finalPassed = false; report.runtimeAcceptance = false;
+            report.finalVerdict = report.diagnosticComplete && cleanup.completed ? report.observation : "incomplete";
+            save("summary.json", report);
+            save("proof-manifest.json", files(out).filter(row => row.path !== "proof-manifest.json"));
+            process.stderr.write("[darwin-shard-merge] FAILED (exit 1)\n"); process.exitCode = 1;
+          }
+          if (process.argv[2] === "--child") await childMain();
+          else if (process.argv[2] === "--finalize") finalize();
+          else await main();
+          RUNNER
+      - name: Authenticate retained snapshot and stage only merge inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'DOWNLOAD'
+          import hashlib, json, os, shutil, stat, urllib.error, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          BASE = Path(os.environ["RUNNER_TEMP"])
+          OUT, WORK = BASE / "darwin-shard-merge-proof", BASE / "darwin-shard-merge-work"
+          OWNER = {"workflow":os.environ["GITHUB_SHA"],"run":os.environ["GITHUB_RUN_ID"],"attempt":os.environ["GITHUB_RUN_ATTEMPT"]}
+          ORIGIN = {"workflow":"b646109b9632968af4260d6a969e56e03b75446d","run":"41241364465","attempt":"1","job":124655776950,"source":"022f251fc38b4c169333f133398ee5150172f2bc"}
+          EXPECTED = [{"name":"localize-keep.syms","bytes":6,"sha256":"6c08dd18573a198f1882b304248da747c00152dc8e8bd61f733ce42cfc39838f","mtimeNs":"1793480463567688041"},{"name":"procedural-geometry.program-000.o","bytes":5243272,"sha256":"2a1929e077b895078cf4df78844981a2052bd1e74f2ececd15dd1b6dfb83f62a","mtimeNs":"1793480442183267249"},{"name":"procedural-geometry.program-001.o","bytes":5081912,"sha256":"d9a129ebbdf4aa2d0ff7104b69c106374da8565ac2e1ae7f82d96cf958043dc2","mtimeNs":"1793480445014711833"},{"name":"procedural-geometry.program-002.o","bytes":4994168,"sha256":"80a15ac11b5371c2410ca6dbb867092864bf0d2524e8796cad544cde7a0044cb","mtimeNs":"1793480445094115708"},{"name":"procedural-geometry.program-003.o","bytes":5137192,"sha256":"477b576d6ffb67b0ca2d2a67069ee56fe308b5f62575ee8aa8719f762246a5ed","mtimeNs":"1793480445704978791"},{"name":"procedural-geometry.program-004.o","bytes":4821584,"sha256":"dc74620299e43b9e6a3db139959d87439a5dbaf75a56f4098e66faeae1d5c4b7","mtimeNs":"1793480447717164999"},{"name":"procedural-geometry.program-005.o","bytes":5730520,"sha256":"1f9b29626dcd3bf2a7104d08b414513cfac6fc0b9a0bc501caf35f024c374e39","mtimeNs":"1793480448540018791"},{"name":"procedural-geometry.program-006.o","bytes":5129576,"sha256":"c6254228d86a8c493ce31118b54f0616a0a919fe667b8c8c213d236aca9576cc","mtimeNs":"1793480448605927291"},{"name":"procedural-geometry.program-007.o","bytes":4394016,"sha256":"f0a17819e72398a190326ef2fe92722ee092d9d28204ae465903e30e2eef50f8","mtimeNs":"1793480450468375208"},{"name":"procedural-geometry.program-008.o","bytes":6507512,"sha256":"8d4ca212045775befaf0815aa6b9f0540d404620008dd4fb7043080309e27b16","mtimeNs":"1793480453078096791"},{"name":"procedural-geometry.program-009.o","bytes":8690904,"sha256":"6dde95356ae9918d40a77104352c56630468534828887424add47a6ed7716950","mtimeNs":"1793480457312294916"},{"name":"procedural-geometry.program-010.o","bytes":4440600,"sha256":"15501e69a122c3b457e6a8a8515b6e9284afd7fc9cf9161f45682612462e8cd1","mtimeNs":"1793480453550801708"},{"name":"procedural-geometry.program-011.o","bytes":6225288,"sha256":"0ff23bc31ca0601e72db2303f5709e684f7e13269cdf31f082344c32e31f486f","mtimeNs":"1793480456926189916"},{"name":"procedural-geometry.program-012.o","bytes":5394960,"sha256":"b6c0441721b36ac4851b348654958f76a5803d17e167f37430fc15d075b25f8f","mtimeNs":"1793480456917810541"},{"name":"procedural-geometry.program-013.o","bytes":6467904,"sha256":"68ea2dd95bc9ad48602a2f0d3af6aefd35a24c6a5e8d934df3ac4034619c4cf4","mtimeNs":"1793480461650510833"},{"name":"procedural-geometry.program-014.o","bytes":5417384,"sha256":"b798fd565c42823ba9c1ab0bd84195a339f64b61cc13d307698f44f7a50b2285","mtimeNs":"1793480460317062999"},{"name":"procedural-geometry.program-015.o","bytes":5849016,"sha256":"69edf26fa14f2a5aefe8db340937f9c7e60c5758719e395e4e28967ca7612cb8","mtimeNs":"1793480461499526708"},{"name":"procedural-geometry.program-016.o","bytes":5106624,"sha256":"04c249f68feaf5890e95d9de61499594d24e0e5a3d5b8da1c068c94123832ab8","mtimeNs":"1793480463556161791"},{"name":"procedural-geometry.program.localized.o","bytes":80659584,"sha256":"9f9b60b33417fd46f8c50edf09016453ccf78d677150b435cd83a567cc63b0bf","mtimeNs":"1793480464073096583"}]
+          ZIP_SHA = "09c0f5fcd3a64259d74854a5cd39f27fac1d8e8fd41c7f8b7fdf7e37f8f3d589"
+          SUMMARY_SHA = "9333cc327c9777787d36dab9fd33cf004e38906362bf0fe8911fee8f63bb1a91"
+          assert OUT.is_dir() and not OUT.is_symlink()
+          assert json.loads((OUT/"proof-owner.json").read_text()) == OWNER, "proof owner mismatch"
+          WORK.mkdir(mode=0o700)
+          with (WORK/"owner.json").open("x") as f: f.write(json.dumps(OWNER)+"\n")
+          receipt = {"origin":ORIGIN,"consumer":OWNER,"verified":False,"priorDiagnosticComplete":False}
+          stage = "metadata"
+          def digest(stream):
+              h=hashlib.sha256()
+              for block in iter(lambda:stream.read(1024*1024),b""):h.update(block)
+              return h.hexdigest()
+          def safe(name):
+              path=PurePosixPath(name)
+              assert name and "\\" not in name and "\0" not in name and not path.is_absolute() and ".." not in path.parts
+              assert path.as_posix()==name and path.parts
+              return path
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,request,fp,code,message,headers,newurl):return None
+          try:
+              token=os.environ.pop("GH_TOKEN")
+              headers={"Authorization":"Bearer "+token,"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28","User-Agent":"scriptc-darwin-shard-merge"}
+              opener=urllib.request.build_opener(NoRedirect)
+              def api(path):
+                  with opener.open(urllib.request.Request("https://api.github.com/repos/vincentkoc/scriptc/"+path,headers=headers),timeout=60) as response: raw=response.read(1024**2+1)
+                  assert len(raw)<=1024**2,"API response budget exceeded"
+                  return json.loads(raw)
+              metadata=api("actions/artifacts/13057377531")
+              assert metadata["id"]==13057377531 and metadata["name"]=="darwin-three-debug-map" and metadata["expired"] is False,"artifact identity or expiry mismatch"
+              assert metadata["size_in_bytes"]==140020336 and metadata["digest"]=="sha256:"+ZIP_SHA,"archive metadata mismatch"
+              assert str(metadata["workflow_run"]["id"])==ORIGIN["run"] and metadata["workflow_run"]["head_sha"]==ORIGIN["workflow"],"producer mismatch"
+              stage="job"
+              job=api("actions/jobs/"+str(ORIGIN["job"]))
+              assert job["run_id"]==int(ORIGIN["run"]) and job["head_sha"]==ORIGIN["workflow"] and job["status"]=="completed" and job["conclusion"]=="failure","producer job mismatch"
+              run=api("actions/runs/"+ORIGIN["run"])
+              assert str(run["run_attempt"])==ORIGIN["attempt"],"producer attempt mismatch"
+              stage="download"
+              try:
+                  opener.open(urllib.request.Request("https://api.github.com/repos/vincentkoc/scriptc/actions/artifacts/13057377531/zip",headers=headers),timeout=60)
+                  raise AssertionError("artifact endpoint did not redirect")
+              except urllib.error.HTTPError as response:
+                  assert response.code in (301,302,303,307,308),"artifact redirect refused"
+                  location=response.headers["Location"]
+              assert location.startswith("https://"),"artifact redirect is not HTTPS"
+              archive=WORK/"origin.zip"
+              total=0
+              with urllib.request.urlopen(location,timeout=120) as response, archive.open("xb") as f:
+                  while True:
+                      block=response.read(1024*1024)
+                      if not block:break
+                      total+=len(block);assert total<=140020336,"archive download exceeds pinned size";f.write(block)
+              assert total==140020336 and digest(archive.open("rb"))==ZIP_SHA,"archive content mismatch"
+              stage="zip"
+              with zipfile.ZipFile(archive) as z:
+                  info=z.infolist()
+                  assert len(info)==133 and len({i.filename for i in info})==133,"archive inventory mismatch"
+                  assert sum(i.file_size for i in info)==859366345,"archive expanded-size mismatch"
+                  for item in info:
+                      safe(item.filename)
+                      mode=item.external_attr>>16
+                      assert not item.is_dir() and not stat.S_ISLNK(mode),"unsupported archive member"
+                  def raw(name):return z.read(name)
+                  def read(name):return json.loads(raw(name))
+                  assert hashlib.sha256(raw("summary.json")).hexdigest()==SUMMARY_SHA
+                  assert hashlib.sha256(raw("proof-manifest.json")).hexdigest()=="58cfc88f4050029c31c3ff29187160c894a4a1f31d1cc7da4fad1b2fdaa5b8c8"
+                  manifest=read("proof-manifest.json");assert len(manifest)==132
+                  assert {i.filename for i in info}=={r["path"] for r in manifest}|{"proof-manifest.json"},"manifest coverage mismatch"
+                  for row in manifest:
+                      assert z.getinfo(row["path"]).file_size==row["bytes"]
+                      with z.open(row["path"]) as f:assert digest(f)==row["sha256"],"manifest member mismatch"
+                  snapshot=read("debug-map/snapshot.json")
+                  assert snapshot["complete"] is True and len(snapshot["files"])==96,"snapshot incomplete"
+                  assert hashlib.sha256(raw("debug-map/snapshot.json")).hexdigest()=="ba9c6396221b72dc6c796cb3f263375c16e745630e73d8050da2c6f1f9b4a015"
+                  for row in snapshot["files"]:
+                      name="debug-map/snapshot/"+row["copy"];safe(name)
+                      assert z.getinfo(name).file_size==row["bytes"] and row["sha256"]==row["copySha256"] and row["mtimeNs"]==row["copyMtimeNs"]
+                      with z.open(name) as f:assert digest(f)==row["sha256"],"snapshot member mismatch"
+                  summary=read("summary.json");observer=read("debug-map/observer.json")
+                  assert summary["source"]==ORIGIN["source"] and summary["consumer"]=={k:ORIGIN[k] for k in ("workflow","run","attempt")}
+                  assert summary["inputsVerifiedAfter"] is True and summary["cleanup"]["completed"] is True
+                  assert summary["instrumentation"]["restored"] is True and observer["originalErrorIdentityPreserved"] is True
+                  assert summary["diagnosticComplete"] is False,"historical incomplete observation changed"
+                  order=observer["liveInputs"]["rawObjects"]
+                  assert len(order)==17 and [Path(p).name for p in order]==[f"procedural-geometry.program-{i:03}.o" for i in range(17)],"raw object order mismatch"
+                  ctx=observer["context"];keep=str(Path(ctx["buildDir"])/"localize-keep.syms")
+                  selected=order+[keep,ctx["shardedProgramObject"]]
+                  assert observer["mergeRecipe"]["observedSubprocess"] is False
+                  assert observer["mergeRecipe"]["argv"]==["ld","-r",*order,"-o",ctx["shardedProgramObject"],"-exported_symbols_list",keep],"source-derived merge recipe mismatch"
+                  rows={r["path"]:r for r in snapshot["files"]}
+                  assert len(rows)==96
+                  expected={r["name"]:r for r in EXPECTED}
+                  stage="stage-inputs"
+                  inputs=OUT/"inputs";inputs.mkdir(mode=0o700)
+                  staged=[]
+                  for path in selected:
+                      row=rows[path];name=Path(path).name
+                      assert {k:row[k] for k in ("bytes","sha256","mtimeNs")}=={k:expected[name][k] for k in ("bytes","sha256","mtimeNs")},"selected input pin mismatch"
+                      target=inputs/name
+                      with z.open("debug-map/snapshot/"+row["copy"]) as source,target.open("xb") as dest:shutil.copyfileobj(source,dest,1024*1024)
+                      os.chmod(target,0o600)
+                      os.utime(target,ns=(int(row["atimeNs"]),int(row["mtimeNs"])))
+                      assert target.stat().st_size==row["bytes"] and str(target.stat().st_mtime_ns)==row["mtimeNs"] and digest(target.open("rb"))==row["sha256"],"staged input mismatch"
+                      staged.append({"name":name,"originalPath":path,"stagedPath":str(target),**{k:row[k] for k in ("bytes","sha256","mtimeNs")}})
+                  admission={"origin":ORIGIN,"consumer":OWNER,"artifact":metadata["id"],"zipSha256":ZIP_SHA,"summarySha256":SUMMARY_SHA,
+                      "manifestCount":132,"snapshotCount":96,"priorDiagnosticComplete":False,"snapshotAuthenticated":True,
+                      "inputs":staged[:17],"keepList":staged[17],"originalMerged":staged[18],
+                      "sourcePins":summary["sourceBefore"]["pins"],"priorTools":summary["toolsBefore"],
+                      "controlReport":str(OUT/"control-analysis.json"),
+                      "pathDeviation":"Identical input basenames and mtimes under this run's owned proof directory; both link replays share one owned output path.",
+                      "originalMergeRecipe":"Source-derived from pinned object-merge.ts; not an observed original subprocess."}
+                  (OUT/"admission.json").write_text(json.dumps(admission,indent=2)+"\n")
+                  for name in ["summary.json","proof-manifest.json","debug-map/snapshot.json","debug-map/observer.json","debug-map/inspection-tools.json"]:
+                      target=OUT/("origin-"+name.replace("/","-"));target.write_bytes(raw(name))
+              receipt.update({"verified":True,"archiveBytes":total,"manifestVerified":132,"snapshotVerified":96,"stagedInputs":19})
+          except Exception as error:
+              receipt.update({"failureStage":stage,"failureType":type(error).__name__})
+              if isinstance(error,urllib.error.HTTPError):receipt["httpStatus"]=error.code
+              print(json.dumps(receipt),flush=True)
+              raise SystemExit(1)
+          finally:
+              (OUT/"archive-admission.json").write_text(json.dumps(receipt,indent=2)+"\n")
+          DOWNLOAD
+      - name: Replay control and private-extern preservation variant
+        run: node "$RUNNER_TEMP/darwin-shard-merge-proof/runner.mjs"
+      - name: Verify owned child drain and remove replay scratch
+        if: always() && steps.payload.outcome == 'success'
+        run: node "$RUNNER_TEMP/darwin-shard-merge-proof/runner.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.payload.outcome == 'success'
+        with:
+          name: darwin-shard-merge
+          path: ${{ runner.temp }}/darwin-shard-merge-proof
+          if-no-files-found: error
+          retention-days: 1
