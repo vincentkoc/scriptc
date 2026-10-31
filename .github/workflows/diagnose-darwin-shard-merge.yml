@@ -1,4 +1,4 @@
-name: Diagnose Darwin shard merge
+name: Diagnose Darwin shard merge CU identity
 
 on:
   push:
@@ -41,6 +41,8 @@ jobs:
           import hashlib
           import json
           import pathlib
+          import os
+          import stat
           import struct
           import sys
 
@@ -51,12 +53,48 @@ jobs:
           def sha(data):
               return hashlib.sha256(data).hexdigest()
 
-          def macho(data, label):
+
+          def semantic_relocations(data, section, location, symbols, sections):
+              reloff, count = location
+              digest = hashlib.sha256()
+              kinds = {}
+              def words(index):
+                  return struct.unpack_from("<II", data, reloff + index * 8)
+              for index in range(count):
+                  address, packed = words(index)
+                  assert not address & 0x80000000, "scattered relocation refused"
+                  number = packed & 0xffffff
+                  pcrel, length, external, typ = (packed >> 24) & 1, (packed >> 25) & 3, (packed >> 27) & 1, packed >> 28
+                  assert typ <= 10 and address + (1 << length) <= section["size"], "unsupported relocation encoding or range"
+                  if typ == 10:
+                      assert external == 0 and pcrel == 0 and length == 2 and index + 1 < count, "invalid ARM64 ADDEND"
+                      following_address, following = words(index + 1)
+                      assert following_address == address and following >> 28 in (3, 4), "unpaired ARM64 ADDEND"
+                      target = ["addend", number, number - (1 << 24) if number & 0x800000 else number]
+                  elif external:
+                      assert number < len(symbols) and not symbols[number]["type"] & 0xe0, "external relocation target is not a non-debug symbol"
+                      target = ["symbol", *[symbols[number][key] for key in ("name", "type", "section", "desc", "value")]]
+                  elif number == 0:
+                      target = ["absolute", 0]
+                  else:
+                      assert 1 <= number <= len(sections), "invalid local relocation section"
+                      target = ["section", *[sections[number - 1][key] for key in ("index", "segment", "name", "address", "size", "flags")]]
+                  if typ == 1:
+                      assert pcrel == 0 and index + 1 < count, "unpaired ARM64 SUBTRACTOR"
+                      following_address, following = words(index + 1)
+                      assert following_address == address and following >> 28 == 0 and (following >> 25) & 3 == length, "invalid SUBTRACTOR pair"
+                  # Sequence and pair adjacency remain part of this contract; only external symbol indices are normalized.
+                  row = [index, address, typ, length, pcrel, external, target]
+                  digest.update(json.dumps(row, separators=(",", ":")).encode() + b"\n")
+                  kinds[str(typ)] = kinds.get(str(typ), 0) + 1
+              return {"sha256":digest.hexdigest(),"count":count,"types":kinds}
+
+          def macho(data, label, semantic=True):
               assert 32 <= len(data) <= 256 * 1024**2, "Mach-O file size outside diagnostic budget"
               magic, cpu, subtype, kind, ncmds, cmdbytes, flags, reserved = struct.unpack_from("<8I", data)
               assert magic == 0xfeedfacf and cpu == 0x100000c and kind == 1, "expected thin arm64 MH_OBJECT"
               assert 0 < ncmds <= 1024 and 32 + cmdbytes <= len(data), "invalid Mach-O load command range"
-              sections, symtab = [], None
+              sections, symtab, relocation_locations = [], None, []
               pos = 32
               for _ in range(ncmds):
                   assert pos + 8 <= 32 + cmdbytes
@@ -74,6 +112,7 @@ jobs:
                           zero = section_flags & 0xff in (1, 0xc, 0x12)
                           assert zero or offset + length <= len(data), "section exceeds object"
                           assert reloff + nreloc * 8 <= len(data), "relocations exceed object"
+                          relocation_locations.append((reloff, nreloc))
                           sections.append({"index":len(sections)+1, "segment":segment, "name":name, "address":address,
                               "size":length, "align":align, "flags":section_flags, "zeroFill":zero,
                               "sha256":None if zero else sha(data[offset:offset+length]),
@@ -112,6 +151,10 @@ jobs:
                           current_function["size"] = value
                           current_function["closeSymbolIndex"] = index
                           current_function = None
+              if semantic:
+                  for section, location in zip(sections, relocation_locations, strict=True):
+                      if not section["flags"] & 0x02000000:
+                          section["semanticRelocations"] = semantic_relocations(data, section, location, symbols, sections)
               return {"label":label, "sha256":sha(data), "bytes":len(data), "header":{"cpu":cpu,"subtype":subtype,"kind":kind,"flags":flags},
                   "sections":sections, "symbols":symbols, "functions":functions}
 
@@ -154,11 +197,42 @@ jobs:
                   rows.append({"selection":"first-eight-retained-warnings" if name in WARNING_SYMBOLS else "additional-authored-function", "symbol":name, "rawOwner":owners[0], "outputDefinitions":definitions, "functions":mapped})
               return rows
 
+
+          def object_groups(parsed, paths, raw_inputs, raw_parsed):
+              definitions = {}
+              for item, raw in zip(raw_inputs, raw_parsed, strict=True):
+                  for symbol in raw["symbols"]:
+                      if not symbol["type"] & 0xe0 and symbol["type"] & 0xe == 0xe:
+                          definitions.setdefault(symbol["name"], set()).add(item["name"])
+              groups = []
+              for symbol in parsed["symbols"]:
+                  if symbol["type"] != 0x66:
+                      continue
+                  mapped = paths.get(symbol["name"])
+                  item = next((item for item in raw_inputs if item["name"] == mapped), None)
+                  assert item is not None, "unknown group object"
+                  rows = [function for function in parsed["functions"] if function["oso"] and function["oso"]["symbolIndex"] == symbol["index"]]
+                  owners, unresolved = {}, 0
+                  for function in rows:
+                      owner = definitions.get(function["name"], set())
+                      if len(owner) != 1:
+                          unresolved += 1
+                      else:
+                          name = next(iter(owner)); owners[name] = owners.get(name, 0) + 1
+                  groups.append({"symbolIndex":symbol["index"],"mappedInput":mapped,"mtimeSeconds":symbol["value"],
+                      "mtimeMatches":symbol["value"] == int(item["mtimeNs"]) // 1000000000,
+                      "functions":len(rows),"closedRanges":sum(isinstance(row["size"],int) and row["size"] > 0 for row in rows),
+                      "actualRawOwnerCounts":owners,"unresolvedOrAmbiguousOwners":unresolved})
+              return groups
+
           def compact(parsed, paths, raw_inputs, raw_parsed):
               contract = normalized_symbols(parsed, paths)
               return {"label":parsed["label"],"bytes":parsed["bytes"],"sha256":parsed["sha256"],"header":parsed["header"],
                   "sections":parsed["sections"],"symbolCount":len(parsed["symbols"]),
                   "normalizedSymbolContractSha256":sha(json.dumps(contract,separators=(",",":")).encode()),
+                  "nonDebugSymbolCount":sum(not row["type"] & 0xe0 for row in parsed["symbols"]),
+                  "nonDebugSymbolContractSha256":sha(json.dumps(sorted([[row[key] for key in ("name","type","section","desc","value")] for row in parsed["symbols"] if not row["type"] & 0xe0]),separators=(",",":")).encode()),
+                  "objectGroups":object_groups(parsed,paths,raw_inputs,raw_parsed),
                   "sentinels":symbol_summary(parsed, paths, raw_inputs, raw_parsed)}
 
           def analyze(mode, admission_path, output, report_path):
@@ -167,9 +241,9 @@ jobs:
               raw_inputs = admission["inputs"]
               assert len(raw_inputs) == 17 and [r["name"] for r in raw_inputs] == [f"procedural-geometry.program-{i:03}.o" for i in range(17)]
               paths = {key:item["name"] for item in raw_inputs for key in (item["originalPath"],item["stagedPath"])}
-              raw_parsed = [macho(pathlib.Path(item["stagedPath"]).read_bytes(),item["name"]) for item in raw_inputs]
+              raw_parsed = [macho(pathlib.Path(item["stagedPath"]).read_bytes(),item["name"],semantic=False) for item in raw_inputs]
               original = macho(pathlib.Path(admission["originalMerged"]["stagedPath"]).read_bytes(),"retained-original")
-              parsed = macho(pathlib.Path(output).read_bytes(),mode)
+              parsed = original if mode == "admit" and pathlib.Path(output) == pathlib.Path(admission["originalMerged"]["stagedPath"]) else macho(pathlib.Path(output).read_bytes(),mode)
               original_summary = compact(original, paths, raw_inputs, raw_parsed)
               observed = compact(parsed, paths, raw_inputs, raw_parsed)
               if mode == "admit":
@@ -186,26 +260,110 @@ jobs:
                   control = json.loads(pathlib.Path(admission["controlReport"]).read_text())
                   assert control["controlReproduced"] is True
                   control_summary = control["observed"]
-                  effective = all(len(row["outputDefinitions"]) == 1 and row["outputDefinitions"][0]["type"] == 0x1f for row in observed["sentinels"])
+                  definitions_preserved = all(len(row["outputDefinitions"]) == 1 and row["outputDefinitions"][0]["type"] == 0x1e for row in observed["sentinels"])
                   covered = all(len(row["functions"]) == 1 and row["functions"][0]["mappedInput"] is not None and row["functions"][0]["mtimeMatchesMappedInput"] and row["functions"][0]["definitionMatchesFunction"] and row["functions"][0]["rangesWithinSections"] and row["functions"][0]["size"] == control_summary["sentinels"][index]["functions"][0]["size"] for index, row in enumerate(observed["sentinels"]))
                   corrected = covered and all(row["functions"][0]["matchesRawDefinitionOwner"] for row in observed["sentinels"])
                   wrong = covered and all(not row["functions"][0]["matchesRawDefinitionOwner"] for row in observed["sentinels"])
                   text_keys = ("index","segment","name","address","size","align","flags","zeroFill","sha256")
                   text_equal = [{key:section[key] for key in text_keys} for section in observed["sections"] if section["segment"] == "__TEXT"] == [{key:section[key] for key in text_keys} for section in control_summary["sections"] if section["segment"] == "__TEXT"]
+                  symbols_equal = observed["nonDebugSymbolCount"] == control_summary["nonDebugSymbolCount"] and observed["nonDebugSymbolContractSha256"] == control_summary["nonDebugSymbolContractSha256"]
+                  relocations_equal = [(row["index"],row["semanticRelocations"]) for row in observed["sections"] if not row["flags"] & 0x02000000] == [(row["index"],row["semanticRelocations"]) for row in control_summary["sections"] if not row["flags"] & 0x02000000]
+                  groups = observed["objectGroups"]
+                  boundary_one = [row for row in groups if row["mappedInput"] == raw_inputs[1]["name"]]
+                  boundary_two = [row for row in groups if row["mappedInput"] == raw_inputs[2]["name"]]
+                  separated = len(boundary_one) == 1 and len(boundary_two) == 1 and boundary_one[0]["mtimeMatches"] and boundary_two[0]["mtimeMatches"] and groups.index(boundary_two[0]) == groups.index(boundary_one[0]) + 1
+                  nondebug_bytes_equal = [{key:section[key] for key in text_keys} for section in observed["sections"] if not section["flags"] & 0x02000000] == [{key:section[key] for key in text_keys} for section in control_summary["sections"] if not section["flags"] & 0x02000000]
+                  selected_group = covered and len(boundary_one) == 1 and all(row["functions"][0]["oso"]["symbolIndex"] == boundary_one[0]["symbolIndex"] for row in observed["sentinels"])
                   conclusion = "inconclusive"
-                  if effective and covered and text_equal:
-                      if corrected: conclusion = "demotion-contributes-for-nine-selected-sentinels"
-                      elif wrong: conclusion = "demotion-ablation-insufficient-for-nine-selected-sentinels"
-                  report = {"mode":mode,"observed":observed,"flagEffective":effective,"functionCoverageComplete":covered,
-                      "textBytesAndLayoutIdentical":text_equal,"sectionContractsIdentical":observed["sections"] == control_summary["sections"],
+                  if definitions_preserved and covered and text_equal and nondebug_bytes_equal and symbols_equal and relocations_equal:
+                      if corrected and separated and selected_group: conclusion = "metadata-sensitive-ownership-for-nine-selected-sentinels"
+                      elif wrong and separated: conclusion = "CU-name-perturbation-did-not-repair-nine-selected-sentinels"
+                  report = {"mode":mode,"observed":observed,"definitionsPreserved":definitions_preserved,"functionCoverageComplete":covered,
+                      "textBytesAndLayoutIdentical":text_equal,"nonDebugSectionBytesAndLayoutIdentical":nondebug_bytes_equal,"nonDebugSymbolsIdentical":symbols_equal,"semanticRelocationsIdentical":relocations_equal,
+                      "selectedSentinelsInRaw001Group":selected_group,"newRaw001Boundary":boundary_one,"followingRaw002Boundary":boundary_two,"requiredBoundariesSeparated":separated,
+                      "remainingGroups":[row for row in groups if row["mappedInput"] not in (raw_inputs[1]["name"],raw_inputs[2]["name"])],
                       "conclusion":conclusion,"runtimeAcceptance":False,
                       "warningSelection":WARNING_SYMBOLS,"additionalAuthoredSelection":AUTHORED_SYMBOLS,
-                      "authoredDwarfContext":"A separate offline inspection found an authored DIE in raw001. This replay examines Mach-O ownership only; it does not rerun DWARF or dsymutil.",
-                      "limit":"Preserving private externals does not meet library internalization and is not a production fix or final dsymutil/runtime verdict."}
+                      "limit":"This is a bounded metadata-sensitive ownership experiment, not a whole-program, ld-classic correspondence, production-fix, final dSYM, or runtime verdict."}
               pathlib.Path(report_path).write_text(json.dumps(report,indent=2)+"\n")
 
+
+          MUTATION = {"offset":0x312a86,"beforeByte":0x74,"afterByte":0x78,"bytes":5081912,
+              "beforeSha256":"d9a129ebbdf4aa2d0ff7104b69c106374da8565ac2e1ae7f82d96cf958043dc2",
+              "afterSha256":"a90d2b8a3ec2091de695253ea2d6ffc6339bdf4febdc6d4cf9ec0e51e5d48a26"}
+          def first_cu(data, candidate):
+              assert len(data) == MUTATION["bytes"] and sha(data) == MUTATION["afterSha256" if candidate else "beforeSha256"]
+              info, strings, abbrev = 3197172, 3222142, 3196664
+              assert struct.unpack_from("<IHI",data,info) == (0x4c6d,4,0) and data[info+10:info+12] == b"\x08\x01"
+              assert data[abbrev:abbrev+19] == bytes.fromhex("011101250e1305030e10171b0e110155170000")
+              assert struct.unpack_from("<I",data,info+0x12)[0] == 8 and struct.unpack_from("<I",data,info+0x1a)[0] == 22
+              expected = b"xhree.core.js\0" if candidate else b"three.core.js\0"
+              assert data[strings+8:strings+22] == expected and strings+8 == MUTATION["offset"]
+              end = data.index(b"\0", strings+22)
+              directory = data[strings+22:end].decode()
+              return {"CUOffset":0,"DIEOffset":0xb,"nameForm":"DW_FORM_strp","nameAttributeInfoOffset":0x12,
+                  "nameStringOffset":8,"nameFileOffset":strings+8,"name":expected[:-1].decode(),
+                  "compDirAttributeInfoOffset":0x1a,"compDirStringOffset":22,"compDir":directory}
+
+          def mutate(mode, admission_path, output, report_path):
+              assert mode in ("mutate", "restore")
+              admission = json.loads(pathlib.Path(admission_path).read_text())
+              expected_owner = {"workflow":os.environ["GITHUB_SHA"],"run":os.environ["GITHUB_RUN_ID"],"attempt":os.environ["GITHUB_RUN_ATTEMPT"]}
+              out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "darwin-shard-merge-proof"
+              work = pathlib.Path(os.environ["RUNNER_TEMP"]) / "darwin-shard-merge-work"
+              assert json.loads((work/"owner.json").read_text()) == expected_owner == admission["consumer"]
+              assert json.loads((out/"proof-owner.json").read_text()) == expected_owner
+              row = admission["inputs"][1]; target = pathlib.Path(output)
+              assert row["name"] == "procedural-geometry.program-001.o"
+              assert target == pathlib.Path(row["stagedPath"]) == out/"inputs"/row["name"]
+              assert pathlib.Path(report_path) == out/("mutation.json" if mode == "mutate" else "restoration.json")
+              receipt = {"mode":mode,"status":"preparing","consumer":expected_owner,"mutation":MUTATION,
+                  "offlineAliasAdmission":{"workflow":"9c79a2136ade96663f4dc9950582c42a0693457e","run":"41243514351",
+                      "zipSha256":"f7d48306614047e8a64a2305612704ef7c33241efb2825646f24acf891e7aff9",
+                      "raw001CUs":7,"DIEs":1523,"affectedDIEReferences":1,"acceleratorRecords":493,"acceleratorAliases":0,
+                      "scope":"Exact-hash-bound offline full-DIE/accelerator admission; this run verifies the first CU and one-byte delta."}}
+              fd = None
+              try:
+                  fd = os.open(target, os.O_RDWR | os.O_NOFOLLOW)
+                  before = os.fstat(fd); assert stat.S_ISREG(before.st_mode) and before.st_size == MUTATION["bytes"]
+                  with os.fdopen(os.dup(fd),"rb") as stream: data=stream.read(MUTATION["bytes"]+1)
+                  current = sha(data); assert current in (MUTATION["beforeSha256"],MUTATION["afterSha256"]), "unknown intermediate object bytes"
+                  receipt["before"] = {"sha256":current,"bytes":len(data),"mtimeNs":str(before.st_mtime_ns),"firstCU":first_cu(data,current==MUTATION["afterSha256"])}
+                  if mode == "mutate":
+                      assert current == MUTATION["beforeSha256"] and str(before.st_mtime_ns) == row["mtimeNs"], "original input identity changed"
+                  desired = bytearray(data); desired[MUTATION["offset"]] = MUTATION["afterByte" if mode=="mutate" else "beforeByte"]; desired=bytes(desired)
+                  expected = MUTATION["afterSha256" if mode=="mutate" else "beforeSha256"]
+                  assert sha(desired) == expected
+                  differences = [i for i,(a,b) in enumerate(zip(data,desired,strict=True)) if a!=b]
+                  assert differences == ([MUTATION["offset"]] if current!=expected else [])
+                  receipt.update({"changedOffsets":differences,"allOtherBytesIdentical":True,"status":"writing"})
+                  pathlib.Path(report_path).write_text(json.dumps(receipt,indent=2)+"\n")
+                  if mode == "mutate":
+                      retained = out/"counterfactual-raw001.o"
+                      with retained.open("xb") as stream: stream.write(desired)
+                      os.utime(retained,ns=(before.st_atime_ns,int(row["mtimeNs"])))
+                      assert retained.read_bytes() == desired and retained.stat().st_mtime_ns == int(row["mtimeNs"])
+                      receipt["retainedCandidate"] = {"path":retained.name,"bytes":len(desired),"sha256":expected,"mtimeNs":row["mtimeNs"]}
+                  if differences:
+                      assert os.pwrite(fd,desired[MUTATION["offset"]:MUTATION["offset"]+1],MUTATION["offset"]) == 1
+                      os.fsync(fd)
+                  os.utime(fd,ns=(before.st_atime_ns,int(row["mtimeNs"])))
+                  after = os.fstat(fd); os.lseek(fd,0,os.SEEK_SET)
+                  with os.fdopen(os.dup(fd),"rb") as stream: actual=stream.read(MUTATION["bytes"]+1)
+                  assert after.st_ino==before.st_ino and after.st_dev==before.st_dev and after.st_size==before.st_size
+                  assert actual == desired and after.st_mtime_ns == int(row["mtimeNs"])
+                  receipt["after"]={"sha256":sha(actual),"bytes":len(actual),"mtimeNs":str(after.st_mtime_ns),"firstCU":first_cu(actual,mode=="mutate")}
+                  receipt["status"]="mutated" if mode=="mutate" else "restored"
+              except BaseException as error:
+                  receipt.update({"status":"failed","errorType":type(error).__name__,"error":str(error)})
+                  raise
+              finally:
+                  if fd is not None:os.close(fd)
+                  pathlib.Path(report_path).write_text(json.dumps(receipt,indent=2)+"\n")
+
           if __name__ == "__main__":
-              analyze(*sys.argv[1:])
+              if sys.argv[1] in ("mutate","restore"): mutate(*sys.argv[1:])
+              else: analyze(*sys.argv[1:])
           MACHO
           cat > "$RUNNER_TEMP/darwin-shard-merge-proof/runner.mjs" <<'RUNNER'
           import assert from "node:assert/strict";
@@ -262,7 +420,8 @@ jobs:
             assert.deepEqual(found, sourcePins);
             return { head: sourceHead, clean: true, pins: found };
           }
-          function inputs(admission) {
+          function inputs(admission, state = "original") {
+            assert.ok(state === "original" || state === "counterfactual");
             assert.deepEqual(admission.consumer, consumerIdentity);
             assert.equal(admission.snapshotAuthenticated, true);
             assert.equal(admission.manifestCount, 132); assert.equal(admission.snapshotCount, 96);
@@ -276,8 +435,10 @@ jobs:
               const info = lstatSync(row.stagedPath, { bigint: true });
               assert.ok(info.isFile() && !info.isSymbolicLink());
               const observed = { name: row.name, bytes: Number(info.size), sha256: hash(row.stagedPath), mtimeNs: String(info.mtimeNs) };
-              assert.deepEqual(observed, expectedInputs.find(item => item.name === row.name));
-              assert.equal(row.bytes, observed.bytes); assert.equal(row.sha256, observed.sha256); assert.equal(row.mtimeNs, observed.mtimeNs);
+              const original = expectedInputs.find(item => item.name === row.name);
+              const expected = state === "counterfactual" && row.name === "procedural-geometry.program-001.o" ? { ...original, sha256: "a90d2b8a3ec2091de695253ea2d6ffc6339bdf4febdc6d4cf9ec0e51e5d48a26" } : original;
+              assert.deepEqual(observed, expected);
+              assert.equal(row.bytes, original.bytes); assert.equal(row.sha256, original.sha256); assert.equal(row.mtimeNs, original.mtimeNs);
               return observed;
             });
             assert.equal(new Set(found.map(row => row.name)).size, 19);
@@ -410,13 +571,25 @@ jobs:
             child.once("error", () => { process.stderr.write("diagnostic child launch failed\n"); process.exitCode = 127; });
             child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
           }
-          function linkArguments(admission, output, variant) {
-            assert.ok(variant === "control" || variant === "differential");
-            const control = ["-r", ...admission.inputs.map(item => item.stagedPath), "-o", output, "-exported_symbols_list", admission.keepList.stagedPath];
-            const args = variant === "control" ? control : [...control, "-keep_private_externs"];
-            assert.deepEqual(args.filter(arg => arg !== "-keep_private_externs"), control);
-            assert.equal(args.filter(arg => arg === "-keep_private_externs").length, variant === "control" ? 0 : 1);
-            return args;
+          function linkArguments(admission, output) {
+            return ["-r", ...admission.inputs.map(item => item.stagedPath), "-o", output, "-exported_symbols_list", admission.keepList.stagedPath];
+          }
+          function assertGroupsDrained() {
+            const checks = [];
+            for (const name of readdirSync(out).filter(name => name.endsWith(".process.json"))) {
+              const result = json(join(out, name)); assert.equal(result.drained, true, "unresolved group; retain staged inputs and scratch");
+              assert.ok(existsSync(join(out, name.replace(".process.json", ".owner.json"))));
+            }
+            for (const name of readdirSync(out).filter(name => name.endsWith(".owner.json"))) {
+              const owner = json(join(out, name)), terminal = join(out, name.replace(".owner.json", ".process.json"));
+              assert.ok(existsSync(terminal), "missing terminal receipt; retain staged inputs and scratch");
+              const result = json(terminal);
+              assert.equal(result.pid, owner.pid); assert.equal(result.drained, true);
+              assert.equal(owner.pid, owner.group); assert.ok(Number.isInteger(owner.group) && owner.group > 1 && owner.group !== process.pid);
+              const members = groupMembers(owner.group); checks.push({ owner: name, members });
+              assert.equal(members.length, 0, "owned group not drained; retain staged inputs and scratch");
+            }
+            return checks;
           }
           function retainOutput(path, label) {
             assert.equal(path, join(work, "program.localized.o"));
@@ -433,8 +606,8 @@ jobs:
               commandLimit: 2, linkDeadlineSeconds: 120, streamStorageLimitBytes: CAP,
               scope: "Object-only replay; no compiler, binary execution, strip, final link, or dsymutil invocation.",
               originalRecipeObserved: false, sourceDerivedRecipe: "packages/compiler/src/backend/native/object-merge.ts at the pinned source.",
-              variant: "Add only -keep_private_externs; keep export list, ordered input bytes/mtimes, linker, and output path identical.",
-              interpretationLimit: "The eight warning-selected helpers and one separate authored function are bounded sentinels. Preserving private externals does not satisfy library internalization and cannot by itself be a production fix or a final dsymutil/runtime verdict." };
+              variant: "Change only raw001 DW_AT_name first byte at 0x312a86 from 0x74 to 0x78; identical argv, paths, ordering, tool, options, and original nanosecond mtimes.",
+              interpretationLimit: "The eight warning-selected helpers and one separate authored function are bounded sentinels. A changed result establishes metadata-sensitive ownership only, not whole-program correctness, ld-classic correspondence, a production fix, final dSYM, or runtime acceptance." };
             try {
               verifyWorkOwner();
               const archive = json(join(out, "archive-admission.json"));
@@ -443,21 +616,30 @@ jobs:
               const admission = json(join(out, "admission.json"));
               report.origin = admission.origin;
               report.sourceBefore = source(); report.inputsBefore = inputs(admission); report.toolsBefore = tools();
-              assert.equal(hash(parser), "43a2e491d76896e22e8432d748f8f878f8d1673054f104ac47a995a88a7513bd"); report.parser = record(parser); report.runner = record(self);
+              assert.equal(hash(parser), "1cb8fe7796909767e311e7aa455fc09327d5a72806217a83d00730b2e0412e86"); report.parser = record(parser); report.runner = record(self);
               requireSuccess(await run("input-analysis", report.toolsBefore.python.path, [parser, "admit", join(out, "admission.json"), admission.originalMerged.stagedPath, join(out, "input-analysis.json")], 120));
               assert.equal(json(join(out, "input-analysis.json")).inputsAdmitted, true);
               const output = join(work, "program.localized.o");
               assert.equal(existsSync(output), false);
               for (const variant of ["control", "differential"]) {
-                assert.deepEqual(inputs(admission), report.inputsBefore); assert.deepEqual(tools(), report.toolsBefore);
-                const args = linkArguments(admission, output, variant);
-                const invocation = { label: variant, command: "ld", args, cwd: root, sourceDerivedOriginalRecipe: true, onlyDifferentialFlag: "-keep_private_externs" };
+                if (variant === "differential") {
+                  assertGroupsDrained(); report.mutationAttempted = true; save("summary.json", report);
+                  requireSuccess(await run("mutate-raw001", report.toolsBefore.python.path, [parser, "mutate", join(out, "admission.json"), admission.inputs[1].stagedPath, join(out, "mutation.json")], 120));
+                  report.mutation = json(join(out, "mutation.json")); assert.equal(report.mutation.status, "mutated");
+                }
+                const inputState = variant === "control" ? "original" : "counterfactual";
+                const inputsBeforeLink = inputs(admission, inputState);
+                assert.deepEqual(tools(), report.toolsBefore);
+                const args = linkArguments(admission, output);
+                if (variant === "differential") assert.deepEqual(args, report.links[0].args, "link argv changed");
+                const invocation = { label: variant, command: "ld", args, cwd: root, sourceDerivedOriginalRecipe: true, inputsBeforeLink, inputState,
+                  onlyDifferentialChange: "raw001 byte 0x312a86: 0x74 to 0x78; original mtime preserved" };
                 save(variant + ".invocation.json", invocation);
                 const result = await run(variant + "-link", "ld", args, 120);
                 const row = { ...invocation, process: result }; report.links.push(row); save("summary.json", report);
                 requireSuccess(result);
                 row.output = retainOutput(output, variant);
-                assert.deepEqual(inputs(admission), report.inputsBefore);
+                row.inputsAfterLink = inputs(admission, inputState); assert.deepEqual(row.inputsAfterLink, inputsBeforeLink);
                 requireSuccess(await run(variant + "-analysis", report.toolsBefore.python.path, [parser, variant, join(out, "admission.json"), join(out, row.output.path), join(out, variant + "-analysis.json")], 120));
                 row.analysis = record(join(out, variant + "-analysis.json"));
                 const analysis = json(join(out, variant + "-analysis.json"));
@@ -468,16 +650,27 @@ jobs:
                   rmSync(output);
                 } else {
                   report.observation = analysis.conclusion;
-                  report.flagEffective = analysis.flagEffective;
+                  report.definitionsPreserved = analysis.definitionsPreserved;
+                  report.nonDebugSymbolsIdentical = analysis.nonDebugSymbolsIdentical;
+                  report.semanticRelocationsIdentical = analysis.semanticRelocationsIdentical;
+                  report.nonDebugSectionBytesAndLayoutIdentical = analysis.nonDebugSectionBytesAndLayoutIdentical;
+                  report.requiredBoundariesSeparated = analysis.requiredBoundariesSeparated;
                   report.functionCoverageComplete = analysis.functionCoverageComplete;
                 }
               }
               report.diagnosticComplete = report.links.length === 2 && report.links.every(row => row.analysis && row.output) &&
-                report.controlReproduced === true && report.flagEffective === true && report.functionCoverageComplete === true;
+                report.controlReproduced === true && report.definitionsPreserved === true && report.functionCoverageComplete === true &&
+                report.nonDebugSymbolsIdentical === true && report.semanticRelocationsIdentical === true && report.nonDebugSectionBytesAndLayoutIdentical === true;
             } catch (error) { report.error = { name: error?.name, message: String(error?.message ?? error) }; }
             finally {
               try {
                 const admission = json(join(out, "admission.json"));
+                if (report.mutationAttempted) {
+                  assertGroupsDrained();
+                  requireSuccess(await run("restore-raw001", report.toolsBefore.python.path, [parser, "restore", join(out, "admission.json"), admission.inputs[1].stagedPath, join(out, "restoration.json")], 120));
+                  report.restoration = json(join(out, "restoration.json"));
+                  assert.equal(report.restoration.status, "restored"); report.mutationRestored = true;
+                }
                 report.sourceAfter = source(); report.inputsAfter = inputs(admission); report.toolsAfter = tools();
                 assert.deepEqual(report.sourceAfter, report.sourceBefore); assert.deepEqual(report.inputsAfter, report.inputsBefore); assert.deepEqual(report.toolsAfter, report.toolsBefore);
                 report.inputsVerifiedAfter = true;
@@ -492,19 +685,9 @@ jobs:
             const cleanup = { completed: false, groupChecks: [] };
             try {
               cleanup.owner = verifyWorkOwner();
-              for (const name of readdirSync(out).filter(name => name.endsWith(".process.json"))) {
-                const result = json(join(out, name)); assert.equal(result.drained, true, "unresolved group; retain scratch");
-                assert.ok(existsSync(join(out, name.replace(".process.json", ".owner.json"))));
-              }
-              for (const name of readdirSync(out).filter(name => name.endsWith(".owner.json"))) {
-                const owner = json(join(out, name)), terminal = join(out, name.replace(".owner.json", ".process.json"));
-                assert.ok(existsSync(terminal), "missing terminal receipt; retain scratch");
-                const result = json(terminal);
-                assert.equal(result.pid, owner.pid); assert.equal(result.drained, true);
-                assert.equal(owner.pid, owner.group); assert.ok(Number.isInteger(owner.group) && owner.group > 1 && owner.group !== process.pid);
-                const members = groupMembers(owner.group); cleanup.groupChecks.push({ owner: name, members });
-                assert.equal(members.length, 0, "owned group not drained; retain scratch");
-              }
+              cleanup.groupChecks = assertGroupsDrained();
+              if (report.mutationAttempted) assert.equal(report.mutationRestored, true, "mutation not restored; retain scratch");
+              if (report.inputsBefore) assert.deepEqual(inputs(json(join(out, "admission.json"))), report.inputsBefore);
               assert.equal(dirname(work), process.env.RUNNER_TEMP); verifyWorkOwner();
               rmSync(work, { recursive: true }); cleanup.completed = !existsSync(work);
               report.sourceAfterCleanup = source();
@@ -655,7 +838,7 @@ jobs:
           finally:
               (OUT/"archive-admission.json").write_text(json.dumps(receipt,indent=2)+"\n")
           DOWNLOAD
-      - name: Replay control and private-extern preservation variant
+      - name: Replay control and one-byte CU-name counterfactual
         run: node "$RUNNER_TEMP/darwin-shard-merge-proof/runner.mjs"
       - name: Verify owned child drain and remove replay scratch
         if: always() && steps.payload.outcome == 'success'
