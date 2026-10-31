@@ -1,0 +1,223 @@
+name: Qualify native TLS SPKI policy
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-native-tls-spki.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-native-tls-spki-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: efedbfcca3c374eeb119764dc2738e3ff41ecfb1
+
+jobs:
+  policy:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    env:
+      SCRIPTC_TEST_WORKERS: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Run native policy tests
+        shell: python
+        run: |
+          import ctypes
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          # Own orphaned compiler/test children until they have been reaped.
+          assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+          root = Path.cwd()
+          out = Path(os.environ["RUNNER_TEMP"]) / "native-tls-spki-proof"
+          out.mkdir(mode=0o700)
+          report = {
+              "source": os.environ["SOURCE_SHA"], "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "scope": "native TLS policy C tests on Linux", "qualificationComplete": False,
+              "complete": False, "steps": [],
+          }
+          def digest(data):
+              return hashlib.sha256(data).hexdigest()
+          def save():
+              (out / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+          def capture(args):
+              return subprocess.check_output(args, text=True, timeout=30).strip()
+          def source_inputs():
+              paths = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
+              rows = {}
+              for raw in paths:
+                  if not raw:
+                      continue
+                  name = os.fsdecode(raw)
+                  path = root / name
+                  rows[name] = {"mode": path.lstat().st_mode, "sha256": digest(
+                      os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes())}
+              return rows
+          def group_alive(group):
+              while True:
+                  try:
+                      pid, _ = os.waitpid(-group, os.WNOHANG)
+                      if pid == 0:
+                          break
+                  except ChildProcessError:
+                      break
+              try:
+                  os.killpg(group, 0)
+                  return True
+              except ProcessLookupError:
+                  return False
+          def signal_group(group, sig):
+              assert group > 1
+              try:
+                  os.killpg(group, sig)
+              except ProcessLookupError:
+                  pass
+          cancellation = 0
+          def interrupted(signum, frame):
+              global cancellation
+              cancellation = signum
+          signal.signal(signal.SIGTERM, interrupted)
+          signal.signal(signal.SIGINT, interrupted)
+          def execute(name, args, env=None, limit=600):
+              if cancellation:
+                  raise RuntimeError("cancelled before " + name)
+              row = {"name": name, "args": args, "timeoutSeconds": limit}
+              report["steps"].append(row)
+              save()
+              started = time.monotonic()
+              streams = [out / (name + suffix) for suffix in (".stdout.log", ".stderr.log")]
+              with streams[0].open("xb") as stdout, streams[1].open("xb") as stderr:
+                  # The handler records cancellation across spawn and drainage;
+                  # it never raises between acquiring the child and cleanup.
+                  child = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                           start_new_session=True, env={**os.environ, **(env or {})})
+                  assert child.pid > 1
+                  row["group"] = child.pid
+                  row["timedOut"] = False
+                  try:
+                      save()
+                      deadline = time.monotonic() + limit
+                      while child.poll() is None and not cancellation and time.monotonic() < deadline:
+                          try:
+                              child.wait(timeout=0.25)
+                          except subprocess.TimeoutExpired:
+                              pass
+                      row["timedOut"] = child.poll() is None and not cancellation
+                  finally:
+                      # Cancellation also seals the streams only after this group drains.
+                      if child.poll() is None:
+                          signal_group(child.pid, signal.SIGTERM)
+                          try:
+                              child.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              signal_group(child.pid, signal.SIGKILL)
+                              child.wait(timeout=5)
+                      row["exitCode"] = child.returncode
+                      deadline = time.monotonic() + 5
+                      while group_alive(child.pid) and time.monotonic() < deadline:
+                          time.sleep(0.05)
+                      row["forcedCleanup"] = group_alive(child.pid)
+                      if row["forcedCleanup"]:
+                          signal_group(child.pid, signal.SIGKILL)
+                          deadline = time.monotonic() + 5
+                          while group_alive(child.pid) and time.monotonic() < deadline:
+                              time.sleep(0.05)
+                      row["drained"] = not group_alive(child.pid)
+                      row["streamsSealed"] = row["drained"]
+                      row["cancelledSignal"] = cancellation
+                      save()
+              row["seconds"] = round(time.monotonic() - started, 3)
+              row["streams"] = [{"path": p.name, "bytes": p.stat().st_size,
+                                  "sha256": digest(p.read_bytes())} for p in streams]
+              save()
+              print(json.dumps(row), flush=True)
+              if row["exitCode"] != 0 or row["timedOut"] or row["forcedCleanup"] or not row["drained"] or cancellation:
+                  for path in streams:
+                      print(path.read_bytes()[-12000:].decode(errors="replace"), flush=True)
+                  raise RuntimeError(name + " failed; full streams retained")
+          try:
+              assert capture(["git", "rev-parse", "HEAD"]) == report["source"]
+              assert capture(["git", "status", "--porcelain=v1", "--untracked-files=all"]) == ""
+              before = source_inputs()
+              (out / "source-inputs.json").write_text(json.dumps(before, sort_keys=True, indent=2) + "\n")
+              report["tools"] = {name: capture([name, "--version"]) for name in ("node", "pnpm", "clang")}
+              execute("format", ["pnpm", "exec", "oxfmt", "--check", "packages/runtime/test/tls-spki.test.ts"])
+              execute("lint", ["pnpm", "exec", "oxlint", "--deny-warnings", "packages/runtime/test/tls-spki.test.ts"])
+              cases = [
+                  "valid", "blocked-leaf-required", "blocked-leaf-optional", "blocked-intermediate",
+                  "blocked-selected-root", "blocked-unused-anchor", "unrelated-blocked-peer-valid",
+                  "unrelated-blocked-peer-invalid-required", "unrelated-blocked-peer-invalid-optional",
+                  "server-secondary-eku", "server-secondary-eku-required", "hostname-only", "valid-client",
+                  "blocked-client-required", "blocked-client-optional", "hash-error", "client-secondary-eku", "verify-none",
+              ]
+              # Pinned Vitest 3.2.7 quotes $name and truncates strings to 38 chars.
+              displayed = [name if len(name) <= 38 else name[:37] + "\u2026" for name in cases]
+              expected = {"TLS SPKI policy controls"} | {
+                  f"TLS SPKI '{name}' version {version}" for name in displayed for version in (12, 13)}
+              for flavor in ("plain", "san"):
+                  result_path = out / (flavor + ".vitest.json")
+                  execute(flavor, ["pnpm", "test", "packages/runtime/test/tls-spki.test.ts", "--reporter=verbose",
+                                   "--reporter=json", "--outputFile=" + str(result_path)],
+                          {"SCRIPTC_SAN": "1" if flavor == "san" else "0", "UBSAN_OPTIONS": "halt_on_error=1"})
+                  result = json.loads(result_path.read_text())
+                  assertions = [item for suite in result["testResults"] for item in suite["assertionResults"]]
+                  assert len(assertions) == len(expected) == result["numPassedTests"] == result["numTotalTests"]
+                  assert {item["title"] for item in assertions} == expected
+                  assert all(item["status"] == "passed" for item in assertions)
+                  report[flavor] = {"passed": len(assertions), "skipped": result["numPendingTests"]}
+                  assert report[flavor]["skipped"] == 0
+              report["sourceUnchanged"] = source_inputs() == before
+              assert report["sourceUnchanged"]
+              assert capture(["git", "rev-parse", "HEAD"]) == report["source"]
+              assert capture(["git", "status", "--porcelain=v1", "--untracked-files=all"]) == ""
+              assert not cancellation, "cancelled before proof completion"
+              report["complete"] = True
+          except BaseException as error:
+              report["failure"] = str(error)
+              print(str(error), file=sys.stderr, flush=True)
+          finally:
+              save()
+              files = [{"path": p.name, "bytes": p.stat().st_size, "sha256": digest(p.read_bytes())}
+                       for p in sorted(out.iterdir()) if p.is_file()]
+              (out / "manifest.json").write_text(json.dumps(files, indent=2) + "\n")
+          if not report["complete"] or cancellation:
+              print("[native-tls-spki] FAILED (exit 1)", file=sys.stderr, flush=True)
+              raise SystemExit(1)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-tls-spki-proof
+          path: ${{ runner.temp }}/native-tls-spki-proof
+          if-no-files-found: error
+          retention-days: 7
