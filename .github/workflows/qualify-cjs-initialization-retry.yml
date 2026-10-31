@@ -1,0 +1,743 @@
+name: Qualify CommonJS initialization retry
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-cjs-initialization-retry.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-cjs-initialization-retry
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            source: 71a9441c824262150f35acd2b8359f156ed3289c
+          - label: candidate
+            source: 8220094cfd2b1274fbe29db4f948e6287d536a96
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      DIAGNOSTIC_SOURCE: ${{ matrix.source }}
+      DIAGNOSTIC_LABEL: ${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = "$DIAGNOSTIC_SOURCE"
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Compare CommonJS retry and qualify candidate
+        run: |
+          cat > "$RUNNER_TEMP/cjs-retry-diagnostic.mjs" <<'PROOF'
+          import assert from "node:assert/strict";
+          import { spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { readlinkSync, symlinkSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+          import { join, relative } from "node:path";
+
+          const root = process.cwd(), head = process.env.DIAGNOSTIC_SOURCE;
+          delete process.env.FORCE_COLOR; delete process.env.NO_COLOR;
+          for (const key of ["SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_OPTIMIZATION", "SCRIPTC_CPU_DISPATCH", "SCRIPTC_TEST_SHARD", "SCRIPTC_LIBNODE"]) delete process.env[key];
+          const out = join(process.env.RUNNER_TEMP, "cjs-retry-proof");
+          const work = join(process.env.RUNNER_TEMP, "cjs-retry-work");
+          mkdirSync(out); mkdirSync(work);
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          writeFileSync(join(work, ".diagnostic-owner.json"), JSON.stringify(owner), { flag: "wx" });
+          const report = {
+            label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
+            runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", diagnosticComplete: false, qualificationComplete: false, regressionObserved: false,
+            templateCommit: "5b3681054778fc53ded8f1a9838bcfcc86761037",
+            completeSuite: false, scope: "cjs-initialization-retry",
+            expectedExecutionAttempts: 4, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [], gates: [],
+          };
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const scrub = value => String(value).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
+          const save = () => writeFileSync(join(out, "summary.json"), scrub(JSON.stringify(report, null, 2)) + "\n");
+          let sequence = 0;
+          const execute = (name, command, args, seconds = 60, env = {}) => {
+            const stem = String(++sequence).padStart(2, "0") + "-" + name;
+            const stdout = join(out, stem + ".stdout.log"), stderr = join(out, stem + ".stderr.log");
+            const fds = [openSync(stdout, "wx"), openSync(stderr, "wx")], started = Date.now();
+            let result;
+            try {
+              // GNU timeout owns the command group, including compiler descendants.
+              result = spawnSync("timeout", ["--signal=TERM", "--kill-after=5s", seconds + "s", command, ...args], {
+                cwd: root, env: { ...process.env, ...env }, stdio: ["ignore", ...fds],
+              });
+            } finally { fds.forEach(closeSync); }
+            const observed = {
+              name, command, args, seconds: (Date.now() - started) / 1000, limitSeconds: seconds,
+              code: result.status, signal: result.signal, error: result.error?.message,
+              stdout: relative(out, stdout), stderr: relative(out, stderr),
+              stdoutSha256: hash(stdout), stderrSha256: hash(stderr),
+              stdoutBytes: lstatSync(stdout).size, stderrBytes: lstatSync(stderr).size,
+            };
+            observed.status = observed.error ? "tool-error" : observed.signal ? "signal" :
+              observed.code === 124 ? "timeout" : observed.code === 137 ? "killed" :
+              observed.code === 0 ? "completed" : "nonzero-exit";
+            report.steps.push(observed); save(); return observed;
+          };
+          const text = step => {
+            assert.ok(step.stdoutBytes <= 16 * 1024 ** 2, "bounded text reader exceeded; raw log retained");
+            return readFileSync(join(out, step.stdout), "utf8");
+          };
+          const requireSuccess = step => { assert.equal(step.status, "completed", step.name); return step; };
+          const capture = (name, command, args) => text(requireSuccess(execute(name, command, args))).trim();
+          const validateCompile = (step, entry, artifact, markedIslands) => {
+            try {
+              requireSuccess(step);
+              const diagnostics = JSON.parse(text(step));
+              assert.equal(diagnostics.schema, "scriptc-diagnostics"); assert.equal(diagnostics.schemaVersion, 1);
+              assert.equal(diagnostics.command, "build"); assert.equal(diagnostics.entry, entry);
+              assert.equal(diagnostics.artifact, artifact); assert.equal(diagnostics.phase, "complete");
+              assert.equal(diagnostics.success, true); assert.ok(Array.isArray(diagnostics.diagnostics));
+              assert.equal(diagnostics.diagnostics.filter(item => item.severity === "error").length, 0);
+              const islands = diagnostics.diagnostics.filter(item => item.code === "SC8001");
+              assert.deepEqual(islands.map(item => item.file).sort(), [...markedIslands].sort());
+              step.diagnosticsStatus = "passed"; return true;
+            } catch (error) {
+              step.diagnosticsStatus = "failed"; step.diagnosticsError = scrub(error.stack ?? error); return false;
+            } finally { save(); }
+          };
+          // Exact harness exception: keep every other sanitizer message and all raw bytes.
+          const ASAN_SWAP = /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext.*\n/gm;
+          const parityOutcome = (step, sanitize = false) => {
+            assert.ok(step.stderrBytes <= 16 * 1024 ** 2, "bounded normalization reader exceeded; raw log retained");
+            const raw = readFileSync(join(out, step.stderr), "utf8");
+            let removedLines = 0;
+            const normalized = sanitize ? raw.replace(ASAN_SWAP, () => { removedLines += 1; return ""; }) : raw;
+            const stderr = step.stderr + ".normalized.log"; writeFileSync(join(out, stderr), normalized);
+            return {
+              status: step.status, code: step.code, signal: step.signal, error: step.error,
+              stdout: step.stdout, stdoutSha256: step.stdoutSha256, stderr, stderrSha256: digest(normalized),
+              normalization: { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
+                ruleSource: "tests/harness/module-initialization.test.ts:64", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags },
+            };
+          };
+          const completeCase = item => item.oracle?.expectedMatched === true && item.oracle.status === "completed" &&
+            item.ir?.status === "passed" && item.ir.compile?.status === "completed" &&
+            item.ir.compile.diagnosticsStatus === "passed" && Boolean(item.ir.artifact) &&
+            ["plain", "san"].every(flavor => {
+              const native = item.flavors[flavor], execution = native?.execution;
+              return native?.compile?.status === "completed" && native.compile.diagnosticsStatus === "passed" &&
+                Boolean(native.llvm && native.binarySha256) && native.inputsVerifiedAfter === true &&
+                execution?.attempted === true && !execution.error &&
+                !["SIGKILL", "SIGTERM", "SIGHUP", "SIGINT"].includes(execution.signal) &&
+                ![129, 130, 137, 143].includes(execution.code) &&
+                ["completed", "nonzero-exit", "signal"].includes(execution.status) && Boolean(execution.parityOutcome);
+            });
+          const regressionObserved = item => completeCase(item) && ["plain", "san"].every(flavor => {
+            const native = item.flavors[flavor], execution = native.execution, actual = execution.parityOutcome;
+            return native.parity === "mismatch" && execution.status === "completed" && execution.code === 0 && execution.signal === null &&
+              actual.stdoutSha256 === item.baselineStdoutSha256 && actual.stdoutSha256 !== item.expectedStdoutSha256 &&
+              actual.stderrSha256 === digest("");
+          });
+          const verifyGateData = (spec, data, collection) => {
+            assert.ok(Array.isArray(data.testResults));
+            const fileOf = value => {
+              const matches = spec.files.filter(file => value === file || value.endsWith("/" + file));
+              assert.equal(matches.length, 1, "unexpected test file: " + value); return matches[0];
+            };
+            const rows = data.testResults.flatMap(suite => suite.assertionResults.map(row => {
+              assert.ok(Array.isArray(row.ancestorTitles) && typeof row.title === "string");
+              // Vitest list uses " > "; the JSON reporter's fullName uses spaces.
+              return { file: fileOf(suite.name), name: row.fullName, status: row.status,
+                collectedName: [...row.ancestorTitles, row.title].join(" > ") };
+            }));
+            assert.deepEqual([...new Set(data.testResults.map(suite => fileOf(suite.name)))].sort(), [...spec.files].sort());
+            const executed = rows.filter(row => !["pending", "skipped", "todo"].includes(row.status));
+            let selected;
+            if (spec.collect) {
+              assert.ok(Array.isArray(collection) && collection.length > 0, "empty collection");
+              const inventory = collection.map(row => ({ file: fileOf(row.file), name: row.name }));
+              const key = row => row.file + "\u0000" + ("collectedName" in row ? row.collectedName : row.name);
+              assert.equal(new Set(inventory.map(key)).size, inventory.length, "duplicate collected test");
+              assert.deepEqual([...new Set(inventory.map(row => row.file))].sort(), [...spec.files].sort());
+              assert.deepEqual(rows.map(key).sort(), inventory.map(key).sort(), "collected/run inventory mismatch");
+              assert.equal(executed.length, inventory.length, "unit skipped or missing");
+              assert.equal(data.numTotalTests, inventory.length);
+              selected = executed;
+            } else {
+              selected = spec.tests.flatMap(name => rows.filter(row => row.name === name || row.name.endsWith(" " + name)));
+              for (const name of spec.tests) {
+                const found = selected.filter(row => row.name === name || row.name.endsWith(" " + name));
+                assert.equal(found.length, 1, "missing or duplicate test: " + name);
+              }
+              assert.equal(executed.length, spec.tests.length, "unexpected executed tests");
+              if (!spec.args.includes("-t")) {
+                assert.equal(rows.length, spec.tests.length, "unexpected test inventory");
+                assert.equal(data.numTotalTests, spec.tests.length);
+              }
+            }
+            assert.ok(selected.every(row => row.status === "passed"), "test did not pass");
+            assert.equal(data.success, true); assert.equal(data.numFailedTests, 0); assert.equal(data.numFailedTestSuites, 0);
+            assert.equal(data.numPassedTests, selected.length);
+            if (spec.llvmModes) for (const row of selected)
+              assert.ok(/^llvm differential corpus \([^)]*, release\+dev(?:,|\))/.test(row.name), "both LLVM modes must run");
+            return { tests: selected, executedCount: executed.length,
+              fileCounts: Object.fromEntries(spec.files.map(file => [file, selected.filter(row => row.file === file).length])) };
+          };
+          const sourceFiles = [
+            "packages/compiler/src/frontend/lowering/lower-modules.ts",
+            "packages/compiler/src/frontend/lowering/lowerer.ts",
+            "packages/compiler/src/frontend/program.ts",
+            "packages/compiler/src/frontend/program-node.ts",
+            "packages/compiler/src/frontend/pipeline.ts",
+            "packages/compiler/src/ir/ir.ts",
+            "packages/compiler/src/index.ts",
+            "packages/compiler/src/backend/llvm/emitter.ts",
+            "packages/compiler/src/backend/llvm/unwind-abi.ts",
+            "packages/compiler/src/backend/runtime-abi.ts",
+            "packages/compiler/src/backend/native-codegen-core.ts",
+            "packages/compiler/src/cli/command.ts",
+            "native/llvm-codegen/src/main.cpp",
+            "native/llvm-codegen/src/target.h",
+            "packages/runtime/src/scr_lib.c",
+            "packages/runtime/src/scr_exception.c",
+            "packages/runtime-pack-common/scripts/verify.mjs",
+            "packages/runtime-linux-x64-gnu/package.json",
+            "packages/llvm-linux-x64-gnu/package.json",
+            ".github/actions/native-packages/action.yml",
+            ".github/actions/llvm-linux/action.yml",
+            ".github/actions/zig/action.yml",
+            "pnpm-lock.yaml",
+            "package.json",
+            "vitest.config.ts",
+            "tests/harness/differential.test.ts",
+            "tests/harness/llvm-differential.test.ts",
+            "packages/compiler/src/frontend/lowering/lower-modules.test.ts",
+            "packages/compiler/src/frontend/program.test.ts",
+            "packages/compiler/src/backend/llvm/emitter.test.ts",
+            "packages/compiler/src/backend/llvm/unwind-abi.test.ts",
+            "CHANGELOG.md"
+          ];
+          if (report.label === "candidate") sourceFiles.push("tests/harness/module-initialization.test.ts");
+          const source = () => {
+            assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("source-status", "git", ["status", "--porcelain"]), "");
+            requireSuccess(execute("source-diff", "git", ["diff", "--exit-code", "HEAD"]));
+            return Object.fromEntries(sourceFiles.map(file => [file, hash(file)]));
+          };
+          const moduleFiles = base => readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(entry => {
+            const path = join(base, entry.name), info = lstatSync(path);
+            assert.ok(!info.isSymbolicLink());
+            if (info.isDirectory()) return moduleFiles(path).map(file => ({ ...file, path: entry.name + "/" + file.path }));
+            assert.ok(info.isFile()); return [{ path: entry.name, bytes: info.size, sha256: hash(path) }];
+          });
+          const specs = [
+            {
+              "id": "cjs-retry-cjs",
+              "entry": "main.cjs",
+              "origin": "tests/harness/module-initialization.test.ts",
+              "fixtureSource": "8220094cfd2b1274fbe29db4f948e6287d536a96",
+              "transform": "expand committed fixture with extension=cjs graph=false esm=false; no source rewrite",
+              "fixtureDefinitionSha256": "7786a6ddb1dd95538eece6906b15584f8689d15c028f4aa5f8696bc0457a9375",
+              "files": {
+                "main.cjs": "for (let i = 0; i < 2; i++) {\n  try { require(\"./failed.cjs\"); }\n  catch (error) {\n    console.log(error instanceof Error ? error.message : String(error));\n  }\n}\nconst first = require(\"./ok.cjs\");\nconst second = require(\"./ok.cjs\");\nconsole.log(\"same\", first === second, first.value, second.value);\n",
+                "failed.cjs": "console.log(\"failed\");\nthrow new Error(\"retry\");\n",
+                "ok.cjs": "console.log(\"ok\");\nmodule.exports = { value: 7 };\n"
+              },
+              "expected": "failed\nretry\nfailed\nretry\nok\nsame true 7 7\n",
+              "baselineExpected": "failed\nretry\nok\nsame true 7 7\n"
+            },
+            {
+              "id": "cjs-retry-cts",
+              "entry": "main.cts",
+              "origin": "tests/harness/module-initialization.test.ts",
+              "fixtureSource": "8220094cfd2b1274fbe29db4f948e6287d536a96",
+              "transform": "expand committed fixture with extension=cts graph=false esm=false; no source rewrite",
+              "fixtureDefinitionSha256": "7786a6ddb1dd95538eece6906b15584f8689d15c028f4aa5f8696bc0457a9375",
+              "files": {
+                "main.cts": "for (let i = 0; i < 2; i++) {\n  try { require(\"./failed.cts\"); }\n  catch (error) {\n    console.log(error instanceof Error ? error.message : String(error));\n  }\n}\nconst first = require(\"./ok.cts\");\nconst second = require(\"./ok.cts\");\nconsole.log(\"same\", first === second, first.value, second.value);\n",
+                "failed.cts": "console.log(\"failed\");\nthrow new Error(\"retry\");\n",
+                "ok.cts": "console.log(\"ok\");\nmodule.exports = { value: 7 };\n"
+              },
+              "expected": "failed\nretry\nfailed\nretry\nok\nsame true 7 7\n",
+              "baselineExpected": "failed\nretry\nok\nsame true 7 7\n"
+            }
+          ];
+          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"files":["packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"collect":true,"seconds":900},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":false,"seconds":1200},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"regression-san","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":true,"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
+          for (const spec of specs) {
+            const dir = join(fixtures, spec.id); mkdirSync(dir);
+            for (const [file, contents] of Object.entries(spec.files))
+              writeFileSync(join(dir, file), contents);
+            writeFileSync(join(dir, "expected.stdout.log"), spec.expected);
+            writeFileSync(join(dir, "baseline-expected.stdout.log"), spec.baselineExpected);
+          }
+          const fixtureManifest = moduleFiles(fixtures);
+          report.fixtureManifest = fixtureManifest; report.fixtureDigest = digest(JSON.stringify(fixtureManifest));
+          const verifyFixtures = () => assert.deepEqual(moduleFiles(fixtures), fixtureManifest);
+          const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
+          save();
+          try {
+            assert.equal(report.fixtureDigest, "a8ce3be1eb03f5e64d261a922f4c477c2d964a05ccfa6634bcbad650156d587f", "authored fixture bytes changed");
+            report.sourceInputs = source(); report.sourceVerifiedBefore = true;
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
+            report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
+            assert.deepEqual(report.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
+            requireSuccess(execute("verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]));
+            const runtimeManifestPath = "packages/runtime-linux-x64-gnu/runtime-pack.json";
+            report.runtimeManifestSha256 = hash(runtimeManifestPath);
+            copyFileSync(runtimeManifestPath, join(out, "runtime-pack.json"));
+            report.runtimeManifest = recordFile(join(out, "runtime-pack.json"));
+            report.build = execute("workspace-build", "pnpm", ["build"], 600); requireSuccess(report.build);
+            report.helper = JSON.parse(capture("helper", "packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+            assert.equal(report.helper.ok, true);
+            report.helperBinarySha256 = hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen");
+            assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
+            assert.equal(report.helper.scriptc_package_version, JSON.parse(readFileSync("packages/llvm-linux-x64-gnu/package.json", "utf8")).version);
+            report.image = { os: process.env.ImageOS, version: process.env.ImageVersion };
+            report.vitestVersion = JSON.parse(readFileSync("node_modules/vitest/package.json", "utf8")).version;
+            assert.equal(report.vitestVersion, "3.2.7");
+            const verifyNativeInputs = () => {
+              assert.equal(hash(runtimeManifestPath), report.runtimeManifestSha256);
+              assert.equal(hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen"), report.helperBinarySha256);
+            };
+            for (const spec of specs) {
+              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, entry: spec.entry, expectedStdoutSha256: digest(spec.expected), baselineStdoutSha256: digest(spec.baselineExpected), flavors: {} };
+              report.cases.push(observed);
+              const dir = join(fixtures, spec.id), entry = join(dir, spec.entry), markedIslands = [];
+              const artifacts = join(out, spec.id); mkdirSync(artifacts);
+              verifyFixtures();
+              try {
+                observed.oracle = execute(spec.id + "-node", process.execPath, [entry], 30, { SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.oracle.attempted = observed.oracle.status !== "tool-error";
+                observed.oracle.parityOutcome = parityOutcome(observed.oracle);
+                observed.oracle.expectedMatched = observed.oracle.status === "completed" &&
+                  observed.oracle.stdoutSha256 === digest(spec.expected) && observed.oracle.stderrBytes === 0;
+              } catch (error) { observed.oracleError = scrub(error.stack ?? error); }
+              const common = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics"];
+              const irPath = join(artifacts, "program.ir.json"), irCache = join(work, spec.id + "-ir-cache"); mkdirSync(irCache, { mode: 0o700 });
+              observed.ir = { status: "running", attempted: false };
+              try {
+                observed.ir.compile = execute(spec.id + "-ir", process.execPath, [...common, "--emit=ir", "-o", irPath], 180,
+                  { SCRIPTC_CACHE_DIR: irCache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.ir.attempted = observed.ir.compile.status !== "tool-error";
+                if (existsSync(irPath)) observed.ir.artifact = recordFile(irPath);
+                assert.ok(validateCompile(observed.ir.compile, entry, irPath, markedIslands), "IR compilation or diagnostics failed");
+                assert.ok(observed.ir.artifact, "successful IR build did not produce its artifact");
+                const ir = JSON.parse(readFileSync(irPath, "utf8"));
+                assert.ok(Array.isArray(ir.functions) && ir.functions.length > 0 && typeof ir.entry === "string");
+                observed.ir.status = "passed";
+              } catch (error) { observed.ir.status = "failed"; observed.ir.error = scrub(error.stack ?? error); }
+              finally { save(); }
+              for (const flavor of ["plain", "san"]) {
+                const result = observed.flavors[flavor] = { status: "running", execution: { status: "not-executed", attempted: false }, parity: "not-compared" };
+                const build = join(work, spec.id + "-" + flavor); mkdirSync(build);
+                const binary = join(build, "program"), cache = join(build, "cache"); mkdirSync(cache, { mode: 0o700 });
+                const env = { SCRIPTC_CACHE_DIR: cache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "", ASAN_OPTIONS: "detect_leaks=0" };
+                try {
+                  const args = [...common, "-o", binary, "--keep-llvm", ...(flavor === "san" ? ["--sanitize"] : [])];
+                  result.compile = execute(spec.id + "-" + flavor + "-compile", process.execPath, args, 300, env);
+                  // The compiler retains LLVM by entry stem, not executable name.
+                  if (existsSync(join(build, "main.ll"))) {
+                    const llvm = join(artifacts, flavor + ".ll"); copyFileSync(join(build, "main.ll"), llvm); result.llvm = recordFile(llvm);
+                  }
+                  assert.ok(validateCompile(result.compile, entry, binary, markedIslands), "native compilation or diagnostics failed");
+                  result.execution = { status: "blocked-before-execution", attempted: false };
+                  assert.equal(observed.ir.status, "passed", "native execution requires admitted IR");
+                  verifyNativeInputs(); verifyFixtures();
+                  result.binarySha256 = hash(binary);
+                  result.execution = execute(spec.id + "-" + flavor + "-run", binary, [], 30, { ...env, SCRIPTC_LIBNODE: "" });
+                  result.execution.attempted = result.execution.status !== "tool-error";
+                  result.execution.parityOutcome = parityOutcome(result.execution, flavor === "san");
+                  const expectedOutcome = observed.oracle?.parityOutcome, actualOutcome = result.execution.parityOutcome;
+                  result.parity = observed.oracle?.expectedMatched && expectedOutcome && result.execution.status === "completed" &&
+                    actualOutcome.code === expectedOutcome.code && actualOutcome.signal === expectedOutcome.signal &&
+                    actualOutcome.stdoutSha256 === expectedOutcome.stdoutSha256 && actualOutcome.stderrSha256 === expectedOutcome.stderrSha256 ? "matched" : "mismatch";
+                  assert.equal(hash(binary), result.binarySha256);
+                  verifyNativeInputs(); verifyFixtures();
+                  result.inputsVerifiedAfter = true;
+                  assert.ok(result.llvm, "successful native build did not retain LLVM");
+                  assert.equal(result.parity, "matched"); result.status = "passed";
+                } catch (error) { result.status = "failed"; result.error = scrub(error.stack ?? error); }
+                finally { save(); }
+              }
+              observed.complete = completeCase(observed); save();
+            }
+            if (report.label === "candidate") {
+              const harnessLink = join(root, "node_modules/.cache/scriptc-tests");
+              assert.equal(lstatSync(harnessLink, { throwIfNoEntry: false }), undefined, "harness output already has an owner");
+              const harnessOutput = join(work, "harness-output"); mkdirSync(harnessOutput);
+              mkdirSync(join(root, "node_modules/.cache"), { recursive: true });
+              symlinkSync(harnessOutput, harnessLink, "dir");
+              const gateArtifacts = join(out, "gates"); mkdirSync(gateArtifacts);
+              for (const spec of gateSpecs) {
+                const gate = { id: spec.id, status: "running", expectedTests: spec.tests ?? [], llvmModes: spec.llvmModes ?? null };
+                report.gates.push(gate);
+                const scratch = join(work, "gate-" + spec.id); mkdirSync(scratch, { mode: 0o700 });
+                const cache = join(scratch, "cache"), temp = join(scratch, "tmp"); mkdirSync(cache, { mode: 0o700 }); mkdirSync(temp);
+                const jsonPath = join(gateArtifacts, spec.id + ".vitest.json");
+                const collectionPath = join(gateArtifacts, spec.id + ".collection.json");
+                const env = { SCRIPTC_TEST_WORKERS: "2", SCRIPTC_SAN: spec.sanitize ? "1" : "",
+                  SCRIPTC_CACHE_DIR: cache, XDG_CACHE_HOME: join(scratch, "xdg"), TMPDIR: temp, ASAN_OPTIONS: "detect_leaks=0" };
+                try {
+                  assert.equal(process.env.SCRIPTC_LLVM_TEST_MODE, undefined);
+                  assert.equal(process.env.SCRIPTC_TEST_OPTIMIZATION, undefined);
+                  gate.environment = { llvmTestMode: null, testOptimization: null, cpuDispatch: null, shard: null, sanitize: env.SCRIPTC_SAN };
+                  if (spec.collect) {
+                    // Vitest 3.2.7 list records file/name pairs; the run must execute that exact inventory.
+                    gate.collectionStep = execute("collect-" + spec.id, "pnpm", ["exec", "vitest", "list", ...spec.files, "--json=" + collectionPath], 300, env);
+                    requireSuccess(gate.collectionStep);
+                    gate.collection = recordFile(collectionPath); assert.ok(gate.collection.bytes <= 16 * 1024 ** 2);
+                  }
+                  gate.step = execute("gate-" + spec.id, "pnpm",
+                    [...spec.args, ...(spec.files ? ["--reporter=default", "--reporter=json", "--outputFile=" + jsonPath] : [])], spec.seconds, env);
+                  gate.attempted = gate.step.status !== "tool-error";
+                  if (spec.files) {
+                    gate.artifact = recordFile(jsonPath); assert.ok(gate.artifact.bytes <= 16 * 1024 ** 2);
+                    const data = JSON.parse(readFileSync(jsonPath, "utf8"));
+                    const collection = spec.collect ? JSON.parse(readFileSync(collectionPath, "utf8")) : undefined;
+                    Object.assign(gate, verifyGateData(spec, data, collection));
+                  }
+                  requireSuccess(gate.step); gate.status = "passed";
+                } catch (error) { gate.status = "failed"; gate.error = scrub(error.stack ?? error); }
+                finally { save(); }
+              }
+              assert.equal(readlinkSync(harnessLink), harnessOutput);
+            }
+            report.executionAttempts = report.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
+            report.diagnosticComplete = report.cases.length === specs.length && report.cases.every(item => item.complete);
+            report.diagnosticComplete &&= report.executionAttempts === report.expectedExecutionAttempts;
+            report.regressionObserved = report.label === "baseline" && report.diagnosticComplete && report.cases.every(regressionObserved);
+            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item =>
+              ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed" && item.flavors[flavor].parity === "matched")) &&
+              (report.label === "baseline" || report.gates.length === gateSpecs.length && report.gates.every(gate => gate.status === "passed"));
+            report.status = report.qualificationComplete ? "passed" : report.regressionObserved ? "regression-observed" : "failed";
+          } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
+          finally {
+            try {
+              requireSuccess(execute("verify-runtime-after", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]));
+              assert.equal(hash("packages/runtime-linux-x64-gnu/runtime-pack.json"), report.runtimeManifestSha256);
+              assert.equal(hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen"), report.helperBinarySha256);
+              report.nativeInputsVerifiedAfter = true;
+              assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true;
+            }
+            catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.regressionObserved = false; report.sourceError = scrub(error.stack ?? error); }
+            report.finishedAt = new Date().toISOString(); save();
+            writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
+            console.log(JSON.stringify({ label: report.label, status: report.status, diagnosticComplete: report.diagnosticComplete, qualificationComplete: report.qualificationComplete }));
+            if (!(report.label === "baseline" ? report.diagnosticComplete && report.regressionObserved : report.qualificationComplete)) { console.error("[cjs-retry-diagnostic] FAILED (exit 1)"); process.exitCode = 1; }
+          }
+          PROOF
+          ulimit -c 0
+          node "$RUNNER_TEMP/cjs-retry-diagnostic.mjs"
+      - name: Remove this diagnostic's build scratch
+        if: always()
+        run: |
+          node --input-type=module <<'CLEANUP'
+          import assert from "node:assert/strict";
+          import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const temp = process.env.RUNNER_TEMP, work = join(temp, "cjs-retry-work"), out = join(temp, "cjs-retry-proof");
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          const receipt = { ...owner, work: "absent", payload: "absent", harnessLink: "absent" };
+          try {
+            if (existsSync(work)) {
+              assert.deepEqual(JSON.parse(readFileSync(join(work, ".diagnostic-owner.json"), "utf8")), owner);
+              const harnessLink = join(process.cwd(), "node_modules/.cache/scriptc-tests");
+              const info = lstatSync(harnessLink, { throwIfNoEntry: false });
+              if (info !== undefined) {
+                assert.equal(owner.label, "candidate"); assert.ok(info.isSymbolicLink());
+                assert.equal(readlinkSync(harnessLink), join(work, "harness-output"));
+                rmSync(harnessLink); receipt.harnessLink = "removed";
+              }
+              rmSync(work, { recursive: true }); receipt.work = "removed";
+            }
+            const payload = join(temp, "cjs-retry-diagnostic.mjs");
+            if (existsSync(payload)) { rmSync(payload); receipt.payload = "removed"; }
+          } catch (error) { receipt.error = String(error); process.exitCode = 1; }
+          finally {
+            mkdirSync(out, { recursive: true });
+            writeFileSync(join(out, "cleanup.json"), JSON.stringify(receipt, null, 2) + "\n");
+            if (process.exitCode) console.error("[cjs-retry-cleanup] FAILED (exit 1)");
+          }
+          CLEANUP
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cjs-initialization-retry-${{ matrix.label }}
+          path: ${{ runner.temp }}/cjs-retry-proof
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: diagnose
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cjs-initialization-retry-*
+          path: ${{ runner.temp }}/cjs-initialization-retry-results
+      - name: Verify paired retry and candidate gates
+        run: |
+          node --input-type=module <<'COMPARE'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const heads = { baseline: "71a9441c824262150f35acd2b8359f156ed3289c", candidate: "8220094cfd2b1274fbe29db4f948e6287d536a96" };
+          const specs = [{"id":"cjs-retry-cjs","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"8220094cfd2b1274fbe29db4f948e6287d536a96","transform":"expand committed fixture with extension=cjs graph=false esm=false; no source rewrite","fixtureDefinitionSha256":"7786a6ddb1dd95538eece6906b15584f8689d15c028f4aa5f8696bc0457a9375","expected":"failed\nretry\nfailed\nretry\nok\nsame true 7 7\n","baselineExpected":"failed\nretry\nok\nsame true 7 7\n"},{"id":"cjs-retry-cts","entry":"main.cts","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"8220094cfd2b1274fbe29db4f948e6287d536a96","transform":"expand committed fixture with extension=cts graph=false esm=false; no source rewrite","fixtureDefinitionSha256":"7786a6ddb1dd95538eece6906b15584f8689d15c028f4aa5f8696bc0457a9375","expected":"failed\nretry\nfailed\nretry\nok\nsame true 7 7\n","baselineExpected":"failed\nretry\nok\nsame true 7 7\n"}];
+          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"files":["packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"collect":true,"seconds":900},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":false,"seconds":1200},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"regression-san","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":true,"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            scope: "cjs-initialization-retry", diagnosticComplete: false, qualificationComplete: false, sources: {} };
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const ASAN_SWAP = /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext.*\n/gm;
+          const completeCase = item => item.oracle?.expectedMatched === true && item.oracle.status === "completed" &&
+            item.ir?.status === "passed" && item.ir.compile?.status === "completed" &&
+            item.ir.compile.diagnosticsStatus === "passed" && Boolean(item.ir.artifact) &&
+            ["plain", "san"].every(flavor => {
+              const native = item.flavors[flavor], execution = native?.execution;
+              return native?.compile?.status === "completed" && native.compile.diagnosticsStatus === "passed" &&
+                Boolean(native.llvm && native.binarySha256) && native.inputsVerifiedAfter === true &&
+                execution?.attempted === true && !execution.error &&
+                !["SIGKILL", "SIGTERM", "SIGHUP", "SIGINT"].includes(execution.signal) &&
+                ![129, 130, 137, 143].includes(execution.code) &&
+                ["completed", "nonzero-exit", "signal"].includes(execution.status) && Boolean(execution.parityOutcome);
+            });
+          const regressionObserved = item => completeCase(item) && ["plain", "san"].every(flavor => {
+            const native = item.flavors[flavor], execution = native.execution, actual = execution.parityOutcome;
+            return native.parity === "mismatch" && execution.status === "completed" && execution.code === 0 && execution.signal === null &&
+              actual.stdoutSha256 === item.baselineStdoutSha256 && actual.stdoutSha256 !== item.expectedStdoutSha256 &&
+              actual.stderrSha256 === digest("");
+          });
+          const verifyGateData = (spec, data, collection) => {
+            assert.ok(Array.isArray(data.testResults));
+            const fileOf = value => {
+              const matches = spec.files.filter(file => value === file || value.endsWith("/" + file));
+              assert.equal(matches.length, 1, "unexpected test file: " + value); return matches[0];
+            };
+            const rows = data.testResults.flatMap(suite => suite.assertionResults.map(row => {
+              assert.ok(Array.isArray(row.ancestorTitles) && typeof row.title === "string");
+              // Vitest list uses " > "; the JSON reporter's fullName uses spaces.
+              return { file: fileOf(suite.name), name: row.fullName, status: row.status,
+                collectedName: [...row.ancestorTitles, row.title].join(" > ") };
+            }));
+            assert.deepEqual([...new Set(data.testResults.map(suite => fileOf(suite.name)))].sort(), [...spec.files].sort());
+            const executed = rows.filter(row => !["pending", "skipped", "todo"].includes(row.status));
+            let selected;
+            if (spec.collect) {
+              assert.ok(Array.isArray(collection) && collection.length > 0, "empty collection");
+              const inventory = collection.map(row => ({ file: fileOf(row.file), name: row.name }));
+              const key = row => row.file + "\u0000" + ("collectedName" in row ? row.collectedName : row.name);
+              assert.equal(new Set(inventory.map(key)).size, inventory.length, "duplicate collected test");
+              assert.deepEqual([...new Set(inventory.map(row => row.file))].sort(), [...spec.files].sort());
+              assert.deepEqual(rows.map(key).sort(), inventory.map(key).sort(), "collected/run inventory mismatch");
+              assert.equal(executed.length, inventory.length, "unit skipped or missing");
+              assert.equal(data.numTotalTests, inventory.length);
+              selected = executed;
+            } else {
+              selected = spec.tests.flatMap(name => rows.filter(row => row.name === name || row.name.endsWith(" " + name)));
+              for (const name of spec.tests) {
+                const found = selected.filter(row => row.name === name || row.name.endsWith(" " + name));
+                assert.equal(found.length, 1, "missing or duplicate test: " + name);
+              }
+              assert.equal(executed.length, spec.tests.length, "unexpected executed tests");
+              if (!spec.args.includes("-t")) {
+                assert.equal(rows.length, spec.tests.length, "unexpected test inventory");
+                assert.equal(data.numTotalTests, spec.tests.length);
+              }
+            }
+            assert.ok(selected.every(row => row.status === "passed"), "test did not pass");
+            assert.equal(data.success, true); assert.equal(data.numFailedTests, 0); assert.equal(data.numFailedTestSuites, 0);
+            assert.equal(data.numPassedTests, selected.length);
+            if (spec.llvmModes) for (const row of selected)
+              assert.ok(/^llvm differential corpus \([^)]*, release\+dev(?:,|\))/.test(row.name), "both LLVM modes must run");
+            return { tests: selected, executedCount: executed.length,
+              fileCounts: Object.fromEntries(spec.files.map(file => [file, selected.filter(row => row.file === file).length])) };
+          };
+          try {
+            for (const [label, head] of Object.entries(heads)) {
+              const dir = join(process.env.RUNNER_TEMP, "cjs-initialization-retry-results", "cjs-initialization-retry-" + label);
+              const verifyFile = file => {
+                const bytes = readFileSync(join(dir, file.path));
+                assert.equal(digest(bytes), file.sha256); assert.equal(bytes.length, file.bytes);
+              };
+              const verifyOutcome = (execution, sanitize) => {
+                const outcome = execution?.parityOutcome;
+                if (!outcome) return;
+                let removedLines = 0;
+                const raw = readFileSync(join(dir, execution.stderr), "utf8");
+                const normalized = sanitize ? raw.replace(ASAN_SWAP, () => { removedLines += 1; return ""; }) : raw;
+                assert.equal(readFileSync(join(dir, outcome.stderr), "utf8"), normalized);
+                assert.equal(outcome.stderrSha256, digest(normalized)); assert.equal(outcome.stdoutSha256, execution.stdoutSha256);
+                assert.equal(outcome.stdout, execution.stdout); assert.equal(outcome.status, execution.status);
+                assert.equal(outcome.code, execution.code); assert.equal(outcome.signal, execution.signal);
+                assert.deepEqual(outcome.normalization, { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
+                  ruleSource: "tests/harness/module-initialization.test.ts:64", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags });
+              };
+              const verifyDiagnostics = (compile, spec, suffix) => {
+                if (compile?.diagnosticsStatus !== "passed") return;
+                assert.equal(compile.status, "completed");
+                const value = JSON.parse(readFileSync(join(dir, compile.stdout), "utf8"));
+                const entrySuffix = "/cjs-retry-proof/fixtures/" + spec.id + "/" + spec.entry;
+                assert.ok(value.entry.endsWith(entrySuffix));
+                const temp = value.entry.slice(0, -entrySuffix.length);
+                assert.equal(value.schema, "scriptc-diagnostics"); assert.equal(value.schemaVersion, 1);
+                assert.equal(value.command, "build"); assert.equal(value.phase, "complete"); assert.equal(value.success, true);
+                assert.equal(value.artifact, temp + suffix); assert.ok(Array.isArray(value.diagnostics));
+                assert.equal(value.diagnostics.filter(item => item.severity === "error").length, 0);
+                assert.deepEqual(value.diagnostics.filter(item => item.code === "SC8001"), []);
+              };
+              const bytes = readFileSync(join(dir, "summary.json")), summary = JSON.parse(bytes);
+              result.sources[label] = { summarySha256: digest(bytes), summary };
+              assert.equal(digest(bytes), readFileSync(join(dir, "summary.sha256"), "utf8").trim());
+              assert.equal(summary.head, head); assert.equal(summary.label, label); assert.equal(summary.scope, result.scope);
+              assert.equal(summary.templateCommit, "5b3681054778fc53ded8f1a9838bcfcc86761037");
+              assert.equal(summary.workflow, result.workflow); assert.equal(summary.runId, result.runId); assert.equal(summary.attempt, result.attempt);
+              assert.equal(summary.fixtureDigest, "a8ce3be1eb03f5e64d261a922f4c477c2d964a05ccfa6634bcbad650156d587f");
+              assert.equal(digest(JSON.stringify(summary.fixtureManifest)), summary.fixtureDigest);
+              assert.deepEqual(summary.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
+              assert.equal(summary.vitestVersion, "3.2.7");
+              assert.equal(summary.build.status, "completed"); assert.equal(summary.helper.protocol_version, "1");
+              assert.equal(summary.helper.llvm_version, "22.1.8"); assert.match(summary.helperBinarySha256, /^[a-f0-9]{64}$/);
+              verifyFile(summary.runtimeManifest); assert.equal(summary.runtimeManifest.sha256, summary.runtimeManifestSha256);
+              const runtimeManifest = JSON.parse(readFileSync(join(dir, summary.runtimeManifest.path), "utf8"));
+              assert.equal(runtimeManifest.schema, "scriptc.runtime-pack.v1"); assert.equal(runtimeManifest.format, 1);
+              assert.equal(runtimeManifest.package, "@scriptc/runtime-linux-x64-gnu");
+              const cleanup = JSON.parse(readFileSync(join(dir, "cleanup.json"), "utf8"));
+              assert.equal(cleanup.runId, result.runId); assert.equal(cleanup.attempt, result.attempt);
+              assert.equal(cleanup.workflow, result.workflow); assert.equal(cleanup.label, label);
+              assert.equal(cleanup.error, undefined); assert.equal(cleanup.work, "removed"); assert.equal(cleanup.payload, "removed");
+              assert.equal(cleanup.harnessLink, label === "candidate" ? "removed" : "absent");
+              result.sources[label].cleanup = cleanup;
+              assert.deepEqual(summary.cases.map(item => item.id), specs.map(spec => spec.id));
+              for (const file of summary.fixtureManifest) verifyFile({ ...file, path: "fixtures/" + file.path });
+              for (const step of summary.steps) for (const stream of ["stdout", "stderr"])
+                verifyFile({ path: step[stream], sha256: step[stream + "Sha256"], bytes: step[stream + "Bytes"] });
+              for (const spec of specs) {
+                const item = summary.cases.find(item => item.id === spec.id), id = spec.id;
+                for (const key of ["origin", "fixtureSource", "fixtureDefinitionSha256", "transform", "entry"]) assert.equal(item[key], spec[key]);
+                assert.equal(item.expectedStdoutSha256, digest(spec.expected));
+                assert.equal(item.baselineStdoutSha256, digest(spec.baselineExpected));
+                assert.equal(readFileSync(join(dir, "fixtures", id, "expected.stdout.log"), "utf8"), spec.expected);
+                assert.equal(readFileSync(join(dir, "fixtures", id, "baseline-expected.stdout.log"), "utf8"), spec.baselineExpected);
+                if (item.oracle) {
+                  verifyOutcome(item.oracle, false);
+                  const step = summary.steps.find(step => step.name === id + "-node");
+                  assert.ok(step); assert.deepEqual(step.args, ["<temp>/cjs-retry-proof/fixtures/" + id + "/" + spec.entry]);
+                  assert.equal(step.stdoutSha256, item.oracle.stdoutSha256); assert.equal(step.stderrSha256, item.oracle.stderrSha256);
+                  assert.equal(item.oracle.expectedMatched, item.oracle.status === "completed" &&
+                    item.oracle.stdoutSha256 === digest(spec.expected) && item.oracle.stderrBytes === 0);
+                }
+                if (item.ir.artifact) {
+                  verifyFile(item.ir.artifact);
+                  if (item.ir.status === "passed") {
+                    const ir = JSON.parse(readFileSync(join(dir, item.ir.artifact.path), "utf8"));
+                    assert.ok(Array.isArray(ir.functions) && ir.functions.length > 0 && typeof ir.entry === "string");
+                  }
+                }
+                verifyDiagnostics(item.ir.compile, spec, "/cjs-retry-proof/" + id + "/program.ir.json");
+                for (const flavor of ["plain", "san"]) {
+                  const native = item.flavors[flavor], execution = native.execution;
+                  if (native.llvm) verifyFile(native.llvm);
+                  verifyDiagnostics(native.compile, spec, "/cjs-retry-work/" + id + "-" + flavor + "/program");
+                  verifyOutcome(execution, flavor === "san");
+                  if (execution.attempted) {
+                    assert.equal(item.ir.status, "passed"); assert.equal(native.compile.diagnosticsStatus, "passed");
+                    assert.match(native.binarySha256, /^[a-f0-9]{64}$/);
+                    const step = summary.steps.find(step => step.name === id + "-" + flavor + "-run");
+                    assert.ok(step); assert.equal(step.command, "<temp>/cjs-retry-work/" + id + "-" + flavor + "/program"); assert.deepEqual(step.args, []);
+                    assert.notEqual(step.status, "tool-error");
+                    assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
+                    const actual = execution.parityOutcome, oracle = item.oracle?.parityOutcome;
+                    const matched = Boolean(item.oracle?.expectedMatched && actual && oracle && execution.status === "completed" &&
+                      actual.code === oracle.code && actual.signal === oracle.signal &&
+                      actual.stdoutSha256 === oracle.stdoutSha256 && actual.stderrSha256 === oracle.stderrSha256);
+                    assert.equal(native.parity, matched ? "matched" : "mismatch");
+                  }
+                }
+                assert.equal(item.complete, completeCase(item));
+              }
+              const attempts = summary.cases.flatMap(item => Object.values(item.flavors)).filter(native => native.execution.attempted === true).length;
+              assert.equal(summary.expectedExecutionAttempts, 4); assert.equal(summary.executionAttempts, attempts);
+              const complete = summary.cases.every(completeCase) && attempts === 4 && summary.sourceVerifiedBefore === true &&
+                summary.sourceVerifiedAfter === true && summary.fixturesVerifiedAfter === true && summary.nativeInputsVerifiedAfter === true;
+              assert.equal(summary.diagnosticComplete, complete);
+              assert.deepEqual(summary.gates.map(gate => gate.id), label === "candidate" ? gateSpecs.map(gate => gate.id) : []);
+              for (const gate of summary.gates) {
+                const spec = gateSpecs.find(spec => spec.id === gate.id);
+                assert.deepEqual(gate.expectedTests, spec.tests ?? []); assert.deepEqual(gate.llvmModes, spec.llvmModes ?? null);
+                if (gate.collection) verifyFile(gate.collection);
+                if (gate.artifact) verifyFile(gate.artifact);
+                if (gate.step) {
+                  assert.equal(gate.step.name, "gate-" + spec.id); assert.equal(gate.step.command, "pnpm");
+                  assert.deepEqual(gate.step.args, [...spec.args, ...(spec.files ? ["--reporter=default", "--reporter=json",
+                    "--outputFile=<temp>/cjs-retry-proof/gates/" + spec.id + ".vitest.json"] : [])]);
+                }
+                if (gate.status === "passed") {
+                  assert.equal(gate.step.status, "completed"); assert.equal(gate.attempted, true);
+                  assert.deepEqual(gate.environment, { llvmTestMode: null, testOptimization: null, cpuDispatch: null, shard: null, sanitize: spec.sanitize ? "1" : "" });
+                  if (spec.collect) {
+                    assert.equal(gate.collectionStep.status, "completed");
+                    assert.deepEqual(gate.collectionStep.args, ["exec", "vitest", "list", ...spec.files,
+                      "--json=<temp>/cjs-retry-proof/gates/" + spec.id + ".collection.json"]);
+                  }
+                  if (spec.files) {
+                    const data = JSON.parse(readFileSync(join(dir, gate.artifact.path), "utf8"));
+                    const collection = spec.collect ? JSON.parse(readFileSync(join(dir, gate.collection.path), "utf8")) : undefined;
+                    const observed = verifyGateData(spec, data, collection);
+                    assert.deepEqual({ tests: gate.tests, executedCount: gate.executedCount, fileCounts: gate.fileCounts }, observed);
+                  }
+                }
+              }
+              const qualified = complete && summary.cases.every(item => ["plain", "san"].every(flavor =>
+                item.flavors[flavor].status === "passed" && item.flavors[flavor].parity === "matched")) &&
+                (label === "baseline" || summary.gates.every(gate => gate.status === "passed"));
+              assert.equal(summary.qualificationComplete, qualified);
+              assert.equal(summary.regressionObserved, label === "baseline" && complete && summary.cases.every(regressionObserved));
+              assert.equal(summary.status, qualified ? "passed" : summary.regressionObserved ? "regression-observed" : "failed");
+            }
+            const baseline = result.sources.baseline.summary, candidate = result.sources.candidate.summary;
+            assert.equal(baseline.fixtureDigest, candidate.fixtureDigest);
+            result.nativeIdentity = { runtimeManifestEqual: baseline.runtimeManifestSha256 === candidate.runtimeManifestSha256,
+              helperBinaryEqual: baseline.helperBinarySha256 === candidate.helperBinarySha256, sharedPack: false };
+            result.diagnosticComplete = baseline.diagnosticComplete && candidate.diagnosticComplete;
+            result.qualificationComplete = result.diagnosticComplete && baseline.regressionObserved && candidate.qualificationComplete;
+          } catch (error) { result.error = String(error); result.diagnosticComplete = false; result.qualificationComplete = false; }
+          writeFileSync(join(process.env.RUNNER_TEMP, "cjs-initialization-retry-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
+          console.log(JSON.stringify({ diagnosticComplete: result.diagnosticComplete, qualificationComplete: result.qualificationComplete }));
+          if (!result.qualificationComplete) { console.error("[cjs-retry-comparison] FAILED (exit 1)"); process.exitCode = 1; }
+          COMPARE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cjs-initialization-retry-aggregate
+          path: ${{ runner.temp }}/cjs-initialization-retry-aggregate.json
+          if-no-files-found: error
+          retention-days: 3
