@@ -5,6 +5,9 @@ All notable changes to scriptc will be documented in this file.
 ## Unreleased
 
 - Reassigned function declarations in shared modules are callable before an island enters them, and later module evaluation preserves their replacements.
+
+- A failed CommonJS module is evaluated again on the next require, including programs that do not read module-graph metadata.
+
 - Shared Node-island exports declared in one statement become visible to island callbacks after each declaration, so later initializers can read earlier bindings.
 
 <!-- release:start -->
