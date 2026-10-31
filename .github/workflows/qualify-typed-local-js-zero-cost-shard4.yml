@@ -1,0 +1,433 @@
+name: Recover typed local JavaScript zero-cost shard 4
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-typed-local-js-zero-cost-shard4.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qualify-typed-local-js-zero-cost-shard4
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -eo pipefail {0}
+
+env:
+  BASE_SHA: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+  CAND_SHA: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      ZC_JOB: "4"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          path: candidate
+          persist-credentials: false
+      - name: Verify immutable original artifacts and derive the recovery runner
+        timeout-minutes: 15
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/zero-cost-recovery"
+          cat > "$RUNNER_TEMP/zero-cost-recovery/recover.py" <<'RECOVERY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import stat
+          import sys
+          import tempfile
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          ORIGIN = {"workflow": "b5424c7c17a52e8e59e89d39324e9f2ffaca3188", "run": "41198369006", "attempt": "1"}
+          BASE = "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486"
+          CAND = "923a57d63cc1a32324cd0a4d514935db3f2ad264"
+          RUNNER_SHA = "beebc56cfa8a54daf31bac21b2afe22fa6184d189d53f19617e4ceb6b3adb5f9"
+          INPUTS_SHA = "bf8fd5cc94b021d046041b2912b7da372b4d9ac56dbc8b4385dfa3911bb0c028"
+          NATIVE_SHA = "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25"
+          DERIVED_SHA = "6dddc158a89a62308e225389bd7ac3c18f12eee569ad76eceded993452b53bd2"
+          PATCHES = json.loads(r'''[
+            {
+              "label": "recovery identity and execution guard",
+              "before": "const save = () => writeFileSync(summaryPath, JSON.stringify(report, null, 2) + \"\\n\");",
+              "after": "const origin = { workflow: \"b5424c7c17a52e8e59e89d39324e9f2ffaca3188\", run: \"41198369006\", attempt: \"1\" };\nconst originalRunnerSha256 = \"beebc56cfa8a54daf31bac21b2afe22fa6184d189d53f19617e4ceb6b3adb5f9\";\nconst inputsSha256 = \"bf8fd5cc94b021d046041b2912b7da372b4d9ac56dbc8b4385dfa3911bb0c028\";\nconst recovery = join(temp, \"zero-cost-recovery\");\nassert.ok(task === \"4\" || task === \"merge\", \"recovery must not rerun another shard\");\nassert.ok([\"initialize\", \"build\", \"gate\", \"merge\", \"finish\"].includes(mode));\nassert.equal(hash(join(assets, \"runner.mjs\")), originalRunnerSha256);\nassert.equal(hash(join(assets, \"inputs.json\")), inputsSha256);\nconst derivation = JSON.parse(readFileSync(join(recovery, \"derivation.json\"), \"utf8\"));\nassert.deepEqual(derivation.origin, origin);\nassert.equal(derivation.originalRunnerSha256, originalRunnerSha256);\nassert.equal(derivation.derivedRunnerSha256, hash(fileURLToPath(import.meta.url)));\nassert.equal(derivation.patchSha256, hash(join(recovery, \"patches.json\")));\nif (report.origin) assert.deepEqual(report.origin, origin);\nif (report.derivation) assert.deepEqual(report.derivation, derivation);\nreport.origin = origin; report.derivation = derivation;\nconst save = () => writeFileSync(summaryPath, JSON.stringify(report, null, 2) + \"\\n\");"
+            },
+            {
+              "label": "capacity receipt before admission",
+              "before": "  const before = memory();\n  assert.equal(process.platform, \"linux\"); assert.equal(process.arch, \"x64\");\n  assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, \"insufficient physical runner capacity\");\n  const minimum = task === \"self\" && before.total >= 40 * GiB ? 40 : 28;\n  const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));",
+              "after": "  const before = memory();\n  const minimum = task === \"self\" && before.total >= 40 * GiB ? 40 : 28;\n  const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));\n  const capacity = { phase: mode, createSwap, before, minimumGiB: minimum,\n    missingSwapGiB: missing, requiredDiskBytes: (missing + 16) * GiB, admitted: false };\n  (report.capacity ??= []).push(capacity); save();\n  assert.equal(process.platform, \"linux\"); assert.equal(process.arch, \"x64\");\n  assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, \"insufficient physical runner capacity\");"
+            },
+            {
+              "label": "post-admission telemetry before assertions",
+              "before": "  const after = memory();\n  assert.ok(after.available + after.swapFree >= minimum * GiB, \"compiler heaps lack RAM/swap headroom\");\n  assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, \"insufficient remaining disk\");\n  (report.capacity ??= []).push({ phase: mode, before, after }); save();",
+              "after": "  const after = memory(); capacity.after = after; save();\n  assert.ok(after.available + after.swapFree >= minimum * GiB, \"compiler heaps lack RAM/swap headroom\");\n  assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, \"insufficient remaining disk\");\n  capacity.admitted = true; save();"
+            },
+            {
+              "label": "immutable native asset origin",
+              "before": "  assert.equal(manifest.workflow, process.env.GITHUB_SHA);\n  assert.equal(manifest.run, process.env.GITHUB_RUN_ID); assert.equal(manifest.attempt, process.env.GITHUB_RUN_ATTEMPT);\n  assert.equal(manifest.runnerSha256, hash(fileURLToPath(import.meta.url)));",
+              "after": "  assert.equal(manifest.workflow, origin.workflow);\n  assert.equal(manifest.run, origin.run); assert.equal(manifest.attempt, origin.attempt);\n  assert.equal(manifest.runnerSha256, originalRunnerSha256);\n  assert.equal(manifest.nativeInputSha256, \"58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25\");"
+            },
+            {
+              "label": "merge assets admission",
+              "before": "  } else if (mode === \"merge\") {\n    report.sourceBefore = sources();",
+              "after": "  } else if (mode === \"merge\") {\n    readAssetManifest();\n    report.sourceBefore = sources();"
+            },
+            {
+              "label": "retained and recovered shard identity",
+              "before": "      for (const [field, expected] of [[\"baseline\", BASE], [\"candidate\", CAND], [\"workflow\", report.workflow],\n        [\"run\", report.run], [\"attempt\", report.attempt]]) assert.equal(summary[field], expected);",
+              "after": "      const execution = job === \"4\" ? report : origin;\n      for (const [field, expected] of [[\"baseline\", BASE], [\"candidate\", CAND], [\"workflow\", execution.workflow],\n        [\"run\", execution.run], [\"attempt\", execution.attempt]]) assert.equal(summary[field], expected);\n      if (job === \"4\") {\n        assert.deepEqual(summary.origin, origin); assert.deepEqual(summary.derivation, derivation);\n      }"
+            }
+          ]''')
+          ARTIFACTS = [
+              ("assets", 13040579599, "2c40893a1d9ed62027eedb5ce3d5f09e9ee46d837facb984ccf80f792d0dc3c9", "zero-cost-assets", "zero-cost-native-assets"),
+              ("native", 13040449714, "3f3ffbcd851735b0726ad100decf296d3ad433487d7ad4cb827a41e13365a618", "zero-cost-original-native", "zero-cost-native-evidence"),
+              ("1", 13041993878, "bdd2232adbdba2b4dbc39c88940a186ce65a258085f38e715209edc5c5073ac3", "zero-cost-results/zero-cost-result-1", "zero-cost-result-1"),
+              ("2", 13042536466, "f6c4eb596df5e035fb91839a131a5e791c39d477a9704ff6c836b52f5f377cbd", "zero-cost-results/zero-cost-result-2", "zero-cost-result-2"),
+              ("3", 13042254338, "22c38a084acfc99196ea78dccfbc47af2233ad605c02b9091b7f302537f5d3e5", "zero-cost-results/zero-cost-result-3", "zero-cost-result-3"),
+              ("5", 13043037598, "c1c3583f4ce57bf11b9164816fcf8592d184df0f58982450cde55bf3690228aa", "zero-cost-results/zero-cost-result-5", "zero-cost-result-5"),
+              ("6", 13043611338, "847da15ce10e135794c6f7e69bfebd89863bb624056896106aec845051c253e7", "zero-cost-results/zero-cost-result-6", "zero-cost-result-6"),
+              ("7", 13044250586, "c746ba33b9503ab8e138ef9df8dce76974b0efbb1a5ae14464dbe8cf23a966c9", "zero-cost-results/zero-cost-result-7", "zero-cost-result-7"),
+              ("8", 13044019661, "4b5357071e3dd2873c3c5f94bb6ea954f8425edee44af6bf3177a77f183beb5b", "zero-cost-results/zero-cost-result-8", "zero-cost-result-8"),
+              ("self", 13043674596, "4c08a13dc5d306b420635f45f6d53aa16a8407184a992a327ddfa579ff9b78dc", "zero-cost-results/zero-cost-result-self", "zero-cost-result-self"),
+          ]
+          ROOT = Path(os.environ["RUNNER_TEMP"])
+          RECOVERY = ROOT / "zero-cost-recovery"
+          CURRENT = {"workflow": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          RECOVERY.mkdir(exist_ok=True)
+          RECEIPT = RECOVERY / "recovery.json"
+
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+
+          def write(path, value):
+              path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+
+          def facts(root):
+              result = []
+              for path in sorted(root.rglob("*")):
+                  assert not path.is_symlink(), "symlink in retained proof"
+                  if path.is_file():
+                      result.append({"path": path.relative_to(root).as_posix(), "size": path.stat().st_size, "sha256": digest(path)})
+                  else:
+                      assert path.is_dir(), "non-regular proof entry"
+              return result
+
+          def extract(archive, target):
+              assert not target.exists(), "artifact destination already exists"
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  assert 0 < len(entries) <= 20000, "artifact entry budget exceeded"
+                  assert sum(item.file_size for item in entries) <= 2 * 1024**3, "artifact expansion budget exceeded"
+                  seen = set()
+                  for item in entries:
+                      name = item.filename
+                      path = PurePosixPath(name)
+                      assert name and "\\" not in name and "\0" not in name
+                      assert not path.is_absolute() and ".." not in path.parts
+                      assert path.as_posix() == name.rstrip("/") and path.parts
+                      assert name.rstrip("/") not in seen, "duplicate artifact entry"
+                      seen.add(name.rstrip("/"))
+                      kind = stat.S_IFMT(item.external_attr >> 16)
+                      assert kind in (0, stat.S_IFREG, stat.S_IFDIR), "non-regular ZIP entry"
+                      assert not item.flag_bits & 1, "encrypted ZIP entry"
+                  target.mkdir(parents=True)
+                  for item in entries:
+                      path = target / item.filename
+                      if item.is_dir():
+                          path.mkdir(parents=True, exist_ok=True)
+                          continue
+                      assert stat.S_IFMT(item.external_attr >> 16) != stat.S_IFDIR
+                      path.parent.mkdir(parents=True, exist_ok=True)
+                      with bundle.open(item) as source, path.open("xb") as output:
+                          remaining = item.file_size
+                          while block := source.read(min(1024 * 1024, remaining + 1)):
+                              remaining -= len(block)
+                              assert remaining >= 0, "ZIP entry exceeds declared size"
+                              output.write(block)
+                          assert remaining == 0, "truncated ZIP entry"
+                      path.chmod(0o444)
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+
+          def retrieve(spec, token, scratch):
+              label, artifact_id, expected, destination, name = spec
+              assert len(expected) == 64 and all(c in "0123456789abcdef" for c in expected)
+              opener = urllib.request.build_opener(NoRedirect)
+              endpoint = f"https://api.github.com/repos/vincentkoc/scriptc/actions/artifacts/{artifact_id}"
+              headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "scriptc-zero-cost-recovery"}
+              with opener.open(urllib.request.Request(endpoint, headers=headers), timeout=120) as response:
+                  raw = response.read(1024**2 + 1)
+              assert len(raw) <= 1024**2, "artifact metadata exceeds budget"
+              metadata = json.loads(raw)
+              assert metadata["id"] == artifact_id and metadata["name"] == name and metadata["expired"] is False
+              assert str(metadata["workflow_run"]["id"]) == ORIGIN["run"]
+              assert metadata["workflow_run"]["head_sha"] == ORIGIN["workflow"]
+              assert metadata["size_in_bytes"] <= 512 * 1024**2, "artifact archive exceeds budget"
+              try:
+                  response = opener.open(urllib.request.Request(endpoint + "/zip", headers=headers), timeout=120)
+              except urllib.error.HTTPError as error:
+                  assert error.code == 302, "artifact redirect refused"
+                  location = error.headers.get("Location", "")
+                  error.close()
+                  parsed = urllib.parse.urlsplit(location)
+                  assert parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password
+                  # The signed storage request never receives the GitHub Authorization header.
+                  response = opener.open(urllib.request.Request(location), timeout=120)
+              archive = scratch / f"{artifact_id}.zip"
+              size = 0
+              with response, archive.open("xb") as output:
+                  while block := response.read(1024 * 1024):
+                      size += len(block)
+                      assert size <= 512 * 1024**2, "artifact archive exceeds budget"
+                      output.write(block)
+              actual = digest(archive)
+              assert actual == expected, f"artifact {artifact_id} archive digest mismatch"
+              target = ROOT / destination
+              extract(archive, target)
+              archive.unlink()
+              return {"label": label, "id": artifact_id, "name": name, "origin": ORIGIN,
+                      "zipSha256": actual, "zipBytes": size, "destination": destination, "files": facts(target)}
+
+          def admit_summary(summary, task, execution):
+              assert summary["task"] == task and summary["complete"] is True, "incomplete shard"
+              assert summary["status"] == "complete" or (
+                  summary["status"] == "failed" and summary.get("failureKind") == "program-verdict"
+              ), "shard execution did not finish"
+              for key, expected in {"baseline": BASE, "candidate": CAND, **execution}.items():
+                  assert summary[key] == expected, "shard identity mismatch: " + key
+              assert summary["sourceAfter"] == summary["sourceBefore"] == summary["sourceAfterCleanup"]
+              assert summary["cleanupPassed"] is True and summary.get("swap", {}).get("active", False) is False
+              assert summary["assetsSha256"] == INPUTS_SHA and summary["nativeInputSha256"] == NATIVE_SHA
+
+          def verify_retained(receipt):
+              assert receipt["origin"] == ORIGIN and receipt["execution"] == CURRENT
+              for artifact in receipt["artifacts"]:
+                  assert facts(ROOT / artifact["destination"]) == artifact["files"], "retained proof changed"
+              if receipt.get("recoveredFiles") is not None:
+                  assert facts(ROOT / "zero-cost-4") == receipt["recoveredFiles"]
+                  assert facts(ROOT / "zero-cost-results/zero-cost-result-4") == receipt["recoveredFiles"]
+
+          def bootstrap(receipt):
+              token = os.environ.pop("GH_TOKEN")
+              with tempfile.TemporaryDirectory(prefix="zero-cost-recovery-downloads-", dir=ROOT) as directory:
+                  for spec in ARTIFACTS:
+                      receipt["artifacts"].append(retrieve(spec, token, Path(directory)))
+                      write(RECEIPT, receipt)
+              assets = ROOT / "zero-cost-assets"
+              assert sorted(path.name for path in assets.iterdir()) == ["inputs.json", "libnode.tar.gz", "native.tar.gz", "runner.mjs"]
+              assert digest(assets / "inputs.json") == INPUTS_SHA
+              assert digest(assets / "runner.mjs") == RUNNER_SHA
+              manifest = json.loads((assets / "inputs.json").read_bytes())
+              for key, expected in {"baseline": BASE, "candidate": CAND, **ORIGIN}.items():
+                  assert manifest[key] == expected
+              assert manifest["runnerSha256"] == RUNNER_SHA and manifest["nativeInputSha256"] == NATIVE_SHA
+              assert digest(assets / "native.tar.gz") == manifest["nativeArchiveSha256"]
+              assert digest(assets / "libnode.tar.gz") == manifest["libnodeArchiveSha256"]
+              native_path = ROOT / "zero-cost-original-native/summary.json"
+              native = json.loads(native_path.read_bytes())
+              for key, expected in {"task": "native", "baseline": BASE, "candidate": CAND, **ORIGIN}.items():
+                  assert native[key] == expected
+              assert native["complete"] is True and native["status"] == "complete"
+              assert native["cleanupPassed"] is True and native.get("swap", {}).get("active", False) is False
+              assert native["sourceBefore"] == native["sourceAfter"] == native["sourceAfterCleanup"]
+              assert native["sourceAfter"]["candidate"] == manifest["source"]
+              assert native["tools"] == manifest["tools"] and native["nativeInputs"] == manifest["nativeInputs"]
+              assert native["nativeInputSha256"] == NATIVE_SHA
+              for task in ["1", "2", "3", "5", "6", "7", "8", "self"]:
+                  summary = json.loads((ROOT / f"zero-cost-results/zero-cost-result-{task}/summary.json").read_bytes())
+                  admit_summary(summary, task, ORIGIN)
+              original = (assets / "runner.mjs").read_text()
+              derived = original
+              for patch in PATCHES:
+                  assert derived.count(patch["before"]) == 1, "runner patch cardinality: " + patch["label"]
+                  derived = derived.replace(patch["before"], patch["after"], 1)
+              derived_path = RECOVERY / "runner.mjs"
+              derived_path.write_text(derived)
+              assert digest(derived_path) == DERIVED_SHA, "derived runner differs from reviewed bytes"
+              write(RECOVERY / "patches.json", PATCHES)
+              derivation = {"origin": ORIGIN, "execution": CURRENT, "originalRunnerSha256": RUNNER_SHA,
+                            "derivedRunnerSha256": DERIVED_SHA, "patchSha256": digest(RECOVERY / "patches.json"),
+                            "inputsSha256": INPUTS_SHA, "patches": [{"label": patch["label"], "count": 1} for patch in PATCHES]}
+              write(RECOVERY / "derivation.json", derivation)
+              receipt["nativeSummarySha256"] = digest(native_path)
+              receipt["inputsSha256"] = INPUTS_SHA
+              receipt["derivation"] = derivation
+              receipt["bootstrapComplete"] = True
+
+          def stage_merge(receipt):
+              assert receipt.get("bootstrapComplete") is True
+              verify_retained(receipt)
+              summary = json.loads((ROOT / "zero-cost-4/summary.json").read_bytes())
+              admit_summary(summary, "4", CURRENT)
+              assert summary["origin"] == ORIGIN and summary["derivation"] == receipt["derivation"]
+              source = ROOT / "zero-cost-4"
+              destination = ROOT / "zero-cost-results/zero-cost-result-4"
+              assert not destination.exists()
+              shutil.copytree(source, destination)
+              receipt["recoveredFiles"] = facts(source)
+              receipt["mergeAdmitted"] = True
+
+          mode = sys.argv[1]
+          receipt = json.loads(RECEIPT.read_bytes()) if RECEIPT.exists() else {
+              "schema": 1, "origin": ORIGIN, "execution": CURRENT, "artifacts": [], "bootstrapComplete": False
+          }
+          try:
+              if mode == "bootstrap":
+                  assert not receipt["artifacts"], "recovery download already started"
+                  bootstrap(receipt)
+              elif mode == "stage-merge":
+                  stage_merge(receipt)
+              elif mode == "verify":
+                  assert receipt.get("bootstrapComplete") is True
+                  verify_retained(receipt)
+                  receipt["immutableInputsVerifiedAfter"] = True
+              else:
+                  raise AssertionError("unknown recovery mode")
+              receipt["lastPhase"] = mode
+              write(RECEIPT, receipt)
+              print(json.dumps({"phase": mode, "status": "complete", "artifacts": len(receipt["artifacts"])}))
+          except Exception as error:
+              # Network exceptions can contain signed storage URLs; record only the type.
+              detail = str(error) if isinstance(error, AssertionError) else type(error).__name__
+              receipt.setdefault("errors", []).append({"phase": mode, "error": detail})
+              write(RECEIPT, receipt)
+              print(json.dumps({"phase": mode, "status": "failed", "error": detail}), file=sys.stderr)
+              print("[typed-local-js-zero-cost-recovery] FAILED (exit 1)", file=sys.stderr)
+              sys.exit(1)
+          RECOVERY
+          python3 "$RUNNER_TEMP/zero-cost-recovery/recover.py" bootstrap
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: candidate/.node-version
+          cache: pnpm
+          cache-dependency-path: |
+            baseline/pnpm-lock.yaml
+            candidate/pnpm-lock.yaml
+      - name: Check derived runner syntax
+        run: node --check "$RUNNER_TEMP/zero-cost-recovery/runner.mjs"
+      - name: Verify source and exact inventory; admit paired-build capacity
+        timeout-minutes: 10
+        run: node "$RUNNER_TEMP/zero-cost-recovery/runner.mjs" initialize
+      - uses: ./candidate/.github/actions/llvm-linux
+      - name: Build each checkout with the original native artifacts
+        timeout-minutes: 70
+        run: node "$RUNNER_TEMP/zero-cost-recovery/runner.mjs" build
+      - name: Compare only canonical shard 4
+        timeout-minutes: 123
+        run: |
+          ulimit -c 0
+          sudo sysctl -w kernel.core_pattern=core
+          node "$RUNNER_TEMP/zero-cost-recovery/runner.mjs" gate
+      - name: Finalize shard 4 source and owned swap
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if test -f "$RUNNER_TEMP/zero-cost-recovery/runner.mjs"; then
+            node "$RUNNER_TEMP/zero-cost-recovery/runner.mjs" finish
+          else
+            echo '[typed-local-js-zero-cost-recovery] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - name: Admit the recovered receipt and preserve all eight original results
+        id: merge_admission
+        if: always()
+        timeout-minutes: 5
+        run: python3 "$RUNNER_TEMP/zero-cost-recovery/recover.py" stage-merge
+      - name: Merge all nine canonical reports
+        if: always() && steps.merge_admission.outcome == 'success'
+        timeout-minutes: 10
+        env:
+          ZC_JOB: merge
+        run: node "$RUNNER_TEMP/zero-cost-recovery/runner.mjs" merge
+      - name: Finalize aggregate source proof
+        if: always()
+        timeout-minutes: 5
+        env:
+          ZC_JOB: merge
+        run: |
+          if test -f "$RUNNER_TEMP/zero-cost-merge/summary.json"; then
+            node "$RUNNER_TEMP/zero-cost-recovery/runner.mjs" finish
+          else
+            echo '[typed-local-js-zero-cost-recovery] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - name: Verify immutable inputs and retained receipts after execution
+        if: always()
+        timeout-minutes: 5
+        run: python3 "$RUNNER_TEMP/zero-cost-recovery/recover.py" verify
+      - name: Retain receipts if setup or merge admission failed
+        if: always()
+        run: |
+          python3 - <<'RECEIPT'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          for task in ("4", "merge"):
+              path = root / ("zero-cost-" + task) / "summary.json"
+              if not path.exists():
+                  path.parent.mkdir(exist_ok=True)
+                  path.write_text(json.dumps({
+                      "schema": 1, "task": task, "complete": False, "status": "failed",
+                      "workflow": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"],
+                      "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                      "origin": {"workflow": "b5424c7c17a52e8e59e89d39324e9f2ffaca3188", "run": "41198369006", "attempt": "1"},
+                      "error": "recovery setup or prerequisite proof incomplete"
+                  }, indent=2) + "\n")
+          RECEIPT
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-cost-result-4-recovered
+          path: ${{ runner.temp }}/zero-cost-4
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-cost-merged-recovered-evidence
+          path: ${{ runner.temp }}/zero-cost-merge
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zero-cost-shard4-recovery-provenance
+          path: |
+            ${{ runner.temp }}/zero-cost-recovery
+            ${{ runner.temp }}/zero-cost-assets/inputs.json
+            ${{ runner.temp }}/zero-cost-assets/runner.mjs
+            ${{ runner.temp }}/zero-cost-original-native/summary.json
+          if-no-files-found: error
+          retention-days: 1
