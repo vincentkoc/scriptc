@@ -75,13 +75,14 @@ const cases: CheckpointCase[] = [
 const lifecycleCases = [
   {
     id: "late-listeners-and-work",
-    source: `const removed = () => console.log("removed");
+    source: `// Module-level storage keeps this array dynamic during native lowering.
+const deferred: any[] = [];
+const removed = () => console.log("removed");
 process.on("rejectionHandled", removed);
 process.on("unhandledRejection", (_reason, pending) => {
   console.log("unhandled");
   // Dynamic catch observes at attachment; the typed helper observes at await.
   // Keep attachment between removing and restoring handled listeners.
-  const deferred: any[] = [];
   deferred.push(pending);
   setImmediate(() => {
     console.log("attach");
@@ -232,11 +233,12 @@ cases.push({
   macrotask: false,
   directCatch: false,
   lateHandling: true,
-  source: `process.on("rejectionHandled", () => console.log("handled"));
+  source: `// Module-level storage keeps this array dynamic during native lowering.
+const deferred: any[] = [];
+process.on("rejectionHandled", () => console.log("handled"));
 process.on("unhandledRejection", (_reason, pending) => {
   console.log("unhandled");
   // Dynamic catch observes before host startup; the typed await observes later.
-  const deferred: any[] = [];
   deferred.push(pending);
   setImmediate(() => {
     console.log("attach");
