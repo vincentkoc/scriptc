@@ -81,7 +81,8 @@ process.on("unhandledRejection", (_reason, pending) => {
   console.log("unhandled");
   // Dynamic catch observes at attachment; the typed helper observes at await.
   // Keep attachment between removing and restoring handled listeners.
-  const deferred: any[] = [pending];
+  const deferred: any[] = [];
+  deferred.push(pending);
   setImmediate(() => {
     console.log("attach");
     process.off("rejectionHandled", removed);
@@ -235,7 +236,8 @@ cases.push({
 process.on("unhandledRejection", (_reason, pending) => {
   console.log("unhandled");
   // Dynamic catch observes before host startup; the typed await observes later.
-  const deferred: any[] = [pending];
+  const deferred: any[] = [];
+  deferred.push(pending);
   setImmediate(() => {
     console.log("attach");
     deferred[0].catch(() => console.log("caught"));
