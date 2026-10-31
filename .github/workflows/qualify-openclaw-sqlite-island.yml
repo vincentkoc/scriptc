@@ -1,4 +1,4 @@
-name: Qualify OpenClaw SQLite admission through embedded Node
+name: Qualify OpenClaw launcher runtime admission
 
 on:
   push:
@@ -44,7 +44,7 @@ jobs:
       - run: pnpm build
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Compare the unchanged admission module with Node
+      - name: Observe unchanged launcher admission in native and explicit island modes
         env:
           SCRIPTC_LIBNODE: ${{ runner.temp }}/openclaw-libnode
         run: |
@@ -52,8 +52,8 @@ jobs:
           import assert from "node:assert/strict";
           import { spawnSync } from "node:child_process";
           import { createHash } from "node:crypto";
-          import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-          import { join } from "node:path";
+          import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+          import { basename, join, relative } from "node:path";
           import { pathToFileURL } from "node:url";
 
           const root = process.cwd();
@@ -66,16 +66,17 @@ jobs:
             source: head, openclawSource: openclawHead,
             workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
             attempt: process.env.GITHUB_RUN_ATTEMPT, status: "running",
-            scope: "native SQLite admission module using embedded Node builtins",
-            probeExecution: "native", libnodePlacement: "beside",
+            scope: "unchanged OpenClaw launcher admission in native and explicit module island modes",
+            entryExecution: "native", callerVersionSource: "native process.versions.node",
             pureNativeSqlite: false, completeGateway: false, completeSuite: false,
-            startedAt: new Date().toISOString(), steps: [], results: {}, artifacts: {},
+            diagnosticComplete: false, qualificationComplete: false,
+            startedAt: new Date().toISOString(), steps: [], results: {}, artifacts: {}, modes: {},
           };
           const hash = path => createHash("sha256").update(readFileSync(path)).digest("hex");
           const scrub = value => String(value).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
           const save = () => writeFileSync(join(out, "summary.json"), scrub(JSON.stringify(report, null, 2)) + "\n");
           let sequence = 0;
-          const execute = (name, command, args, seconds = 60, env = {}) => {
+          const execute = (name, command, args, seconds = 60, env = {}, observeFailure = false) => {
             const stem = String(++sequence).padStart(2, "0") + "-" + name;
             const start = Date.now();
             // GNU timeout owns the command group and escalates TERM after five seconds.
@@ -94,10 +95,17 @@ jobs:
               stderrSha256: hash(join(out, stem + ".stderr.log")),
             });
             save();
+            if (observeFailure) return {
+              code: result.status, signal: result.signal, error: result.error?.message,
+              stdout: stdout.trim(), stderr, step: stem,
+            };
             if (result.error || result.status !== 0 || result.signal)
               throw new Error(name + " failed: " + scrub(JSON.stringify({ code: result.status, signal: result.signal, error: result.error?.message, stderr: stderr.slice(-4000) })));
             return stdout.trim();
           };
+          const processOutcome = result => result.error ? "tool-error" : result.signal ? "signal" :
+            result.code === 124 ? "timeout" : result.code === 137 ? "killed" :
+            result.code === 0 ? "completed" : "nonzero-exit";
           const inputs = {
             "packages/compiler/src/backend/runtime-abi.ts": "410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f",
             "packages/compiler/src/node-islands/libnode.ts": "2edc204155bf59fd173a1e940b469e097eb6e4442c62ddd0b5f227a4a028816d",
@@ -116,20 +124,50 @@ jobs:
             "packages/compiler/src/frontend/ts7/program-host.ts": "adc5a76dcda60708bed553f07e6401ebfb5440492df87497e73a51229d620d5e",
             "packages/compiler/src/frontend/npm-static-type-exports-host.ts": "a85deb5382748ff712e08a494856a12eaaff76f752a08e2effcec26107d0037c",
             "packages/compiler/src/frontend/program-node.ts": "ffb2931f97266923981eac111f04bfd441099f614fcb02860ef74a56b5c330a5",
-            "packages/compiler/src/frontend/project-sidecars.ts": "89605378de27b0ea05dcf1d43814ce07c0c6f69ca696401223fe1b39ca0b1995"
+            "packages/compiler/src/frontend/project-sidecars.ts": "89605378de27b0ea05dcf1d43814ce07c0c6f69ca696401223fe1b39ca0b1995",
+            "packages/compiler/src/frontend/lowering/builtins/process.ts": "92db7d1019dadcb07bb2710f11e4238c47c89e9a05b2f77cdbb8099c1df8f40e",
+            "packages/compiler/src/frontend/builtin-modules.ts": "59e413122acfbb61c57794ba62be50d08fa34804f7ae737f73161a8e03b87f9e",
+            "packages/compiler/src/frontend/lowering/lower-builtin-values.ts": "5d22f7a84244eeec800104a249592249feff78b4dacc7aec1eadb99f7eec87fe",
+            "packages/compiler/src/executable/prepare.ts": "299c8b71c40db653f10a8aef2dfef3e7c274309144bb6df577a7e2673de3a85d",
+            "packages/compiler/src/node-islands/policy.ts": "e651aac43783cb63c37654d0d4e678db79569d22eb096ed91cfb061e9d338dcc",
+            "packages/compiler/src/node-islands/modules.ts": "18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54",
+            "packages/compiler/src/index.ts": "33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c",
+            "packages/compiler/src/cli/command.ts": "1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4",
+            "packages/compiler/src/diagnostics/envelope.ts": "edc9782d8f2935c6204d0d3f76023c6cd3cdc9c20a0fecfe1df75c0ae41143e1",
+            "packages/runtime/src/scr_lib.c": "3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef",
+            "packages/runtime/src/scr_node_builtin.c": "99ad4f3f795b1d70f7fabc99cffbebb613ff6a57ad0f8f21051d4971ec09d26f"
           };
+          const openclawInputs = {
+            "node-sqlite.mjs": "3d4ea2eaca499c7ece12ce75e4c47fe8c5d67c1c468b55a8e88139e25851870c",
+            "node-sqlite.d.mts": "40da05d66d624b829a56aef9053d36df9782a4b5c4847c732752d78fd3e5fcc1",
+            "node-version.mjs": "7227aeb44e2aa356dd7173f4e18bc1543c30e957609ee88e9279bd109c8219ba",
+            "node-version.d.mts": "6477afab8530172170e18c6cfc30dbc6472bba7680c64f9f2e11e173c6ae2e08",
+            "node-sqlite-capabilities.mjs": "bdc5cc1082ed101b02dc67dac8bc625adb9c65c3471bfa908f2bcd5470fc54a0",
+            "node-sqlite-capabilities.d.mts": "579ece58ca424a210e769ad2fdc96ae8c71911dae3e8ce7ac6f9ec87e24ebad9",
+          };
+          const entry = join(fixture, "main.mts");
+          const verifyFixture = () => {
+            for (const [file, expected] of Object.entries(openclawInputs)) assert.equal(hash(join(fixture, file)), expected, file);
+            assert.equal(hash(entry), report.fixtureSha256);
+          };
+          const moduleFiles = (dir, base = dir) => readdirSync(dir).sort().flatMap(name => {
+            const path = join(dir, name), info = lstatSync(path);
+            if (info.isDirectory()) return moduleFiles(path, base);
+            assert.ok(info.isFile(), "unexpected non-file in shipped module tree");
+            return [{ path: relative(base, path), size: info.size, sha256: hash(path) }];
+          });
           const source = () => {
             assert.equal(execute("source-head", "git", ["rev-parse", "HEAD"]), head);
             assert.equal(execute("source-status", "git", ["status", "--porcelain"]), "");
             for (const [file, expected] of Object.entries(inputs)) assert.equal(hash(file), expected, file);
             report.inputs = inputs;
           };
-          const validate = result => {
+          const validateOracle = result => {
             assert.equal(result.node, "24.22.1");
             for (const key of ["available", "text", "blob", "json"]) assert.equal(result.sqlite[key], true, key);
             assert.equal(typeof result.sqlite.version, "string");
             assert.equal(Object.hasOwn(result.sqlite, "error"), false);
-            assert.equal(result.walSafe, true);
+            assert.equal(result.failure, null);
           };
           save();
           try {
@@ -150,66 +188,159 @@ jobs:
             assert.equal(runtime.runtime_abi.marker, "scr_runtime_abi_v48");
             report.runtimePack = { abi: runtime.runtime_abi, manifestSha256: hash(runtimeManifest) };
 
-            assert.equal(existsSync(process.env.SCRIPTC_LIBNODE), false, "libnode output already exists");
-            execute("prepare-dev-libnode", process.execPath, ["packages/libnode-common/fetch-dev-pack.mjs", "--out", process.env.SCRIPTC_LIBNODE], 600);
-            const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
-            const pack = readLibnodePack(process.env.SCRIPTC_LIBNODE, { verifyHashes: true });
-            assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
-            assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
-            report.libnode = { manifest: pack.manifest, manifestSha256: hash(join(pack.root, "manifest.json")) };
-
             assert.equal(existsSync(fixture), false, "fixture already exists");
-            mkdirSync(join(fixture, "node_modules", "@scriptc"), { recursive: true });
-            symlinkSync(join(root, "packages/node"), join(fixture, "node_modules", "@scriptc", "node"), "dir");
-            const openclawInputs = {
-              "node-sqlite-capabilities.mjs": "bdc5cc1082ed101b02dc67dac8bc625adb9c65c3471bfa908f2bcd5470fc54a0",
-              "node-sqlite-capabilities.d.mts": "579ece58ca424a210e769ad2fdc96ae8c71911dae3e8ce7ac6f9ec87e24ebad9",
-            };
+            mkdirSync(fixture);
             for (const [file, expected] of Object.entries(openclawInputs)) {
               const url = "https://raw.githubusercontent.com/openclaw/openclaw/" + openclawHead + "/" + file;
               execute("fetch-" + file, "curl", ["--fail", "--location", "--silent", "--show-error", "--connect-timeout", "15", "--max-time", "45", "--max-filesize", "65536", "--output", join(fixture, file), url]);
               assert.equal(hash(join(fixture, file)), expected, file);
             }
             report.openclawInputs = openclawInputs;
-            const entry = join(fixture, "main.mts");
             writeFileSync(entry, [
-              'import { requireModule } from "@scriptc/node";',
-              'import { probeSqlite, isSqliteWalResetSafeVersion } from "./node-sqlite-capabilities.mjs";',
-              'const DatabaseSync = requireModule("node:sqlite").DatabaseSync;',
-              'const node = requireModule("node:process").versions.node;',
-              'const sqlite = probeSqlite(DatabaseSync);',
-              'const walSafe = isSqliteWalResetSafeVersion(sqlite.version ?? "");',
-              'console.log(JSON.stringify({ node, sqlite, walSafe }));',
+              'import { detectCurrentSqliteCapabilities, nodeRuntimeFailure } from "./node-sqlite.mjs";',
+              'const node = process.versions.node;',
+              'const probe = await detectCurrentSqliteCapabilities();',
+              'const failure = nodeRuntimeFailure(node, probe);',
+              'const sqlite = { available: probe.available, version: probe.version, text: probe.text,',
+              '  blob: probe.blob, json: probe.json, error: probe.error };',
+              'console.log(JSON.stringify({ node, sqlite, failure }));',
               '',
             ].join("\n"));
             report.fixtureSha256 = hash(entry);
-            const cache = join(fixture, "cache");
-            mkdirSync(cache, { mode: 0o700 });
-            const env = { SCRIPTC_CACHE_DIR: cache, SCRIPTC_SAN: "" };
-            const oracle = JSON.parse(execute("node-oracle", process.execPath, [entry], 60, env));
+            verifyFixture(); report.fixtureVerifiedBefore = true;
+            const oracle = JSON.parse(execute("node-oracle", process.execPath, [entry], 60, { SCRIPTC_SAN: "" }));
             report.results.node = oracle;
-            validate(oracle);
-            for (const flavor of ["plain", "san"]) {
-              const binary = join(fixture, "sqlite-" + flavor);
-              const args = ["packages/cli/dist/main.js", "build", entry, "--node-islands=off", "--libnode=beside", "-o", binary];
-              if (flavor === "san") args.push("--sanitize");
-              execute("compile-" + flavor, process.execPath, args, 600, env);
-              const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
-              assert.deepEqual(beside.manifest, pack.manifest);
-              report.artifacts[flavor] = { binarySha256: hash(binary), libnodeManifestSha256: hash(join(beside.root, "manifest.json")) };
-              const actual = JSON.parse(execute("native-" + flavor, binary, [], 60, { ...env, SCRIPTC_LIBNODE: "" }));
-              report.results[flavor] = actual;
-              validate(actual);
-              assert.deepEqual(actual, oracle, flavor + " differs from the Node oracle");
+            validateOracle(oracle);
+            for (const mode of ["native", "island"]) {
+              const island = mode === "island";
+              const modeReport = report.modes[mode] = {
+                policy: island ? "explicit" : "off",
+                requestedAdmissionExecution: island ? "embedded-node" : "native",
+                markedModules: island ? ["node-sqlite.mjs"] : [],
+                libnodePlacement: island ? "beside" : "none", cases: {},
+                setup: { status: island ? "pending" : "not-required" },
+              };
+              report.results[mode] = {};
+              let readLibnodePack, pack;
+              if (island) {
+                try {
+                  assert.equal(existsSync(process.env.SCRIPTC_LIBNODE), false, "libnode output already exists");
+                  execute("prepare-dev-libnode", process.execPath, ["packages/libnode-common/fetch-dev-pack.mjs", "--out", process.env.SCRIPTC_LIBNODE], 600);
+                  ({ readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js"))));
+                  pack = readLibnodePack(process.env.SCRIPTC_LIBNODE, { verifyHashes: true });
+                  assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
+                  assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
+                  report.libnode = { manifest: pack.manifest, manifestSha256: hash(join(pack.root, "manifest.json")) };
+                  modeReport.setup.status = "passed";
+                } catch (error) {
+                  modeReport.setup = { status: "failed", error: scrub(error.stack ?? error) };
+                  for (const flavor of ["plain", "san"]) modeReport.cases[flavor] = {
+                    status: "setup-failed", reason: "explicit island libnode setup failed",
+                    compile: { status: "not-reached" }, execution: { status: "not-reached" }, parity: "not-compared",
+                  };
+                  save(); continue;
+                }
+              }
+              let frontendRefusal = false;
+              for (const flavor of ["plain", "san"]) {
+                const name = mode + "-" + flavor;
+                const observed = modeReport.cases[flavor] = {
+                  status: "running", compile: { status: "not-started" }, execution: { status: "not-reached" }, parity: "not-compared",
+                };
+                if (frontendRefusal) {
+                  Object.assign(observed, { status: "not-reached", reason: "plain compilation refused in the frontend" });
+                  observed.compile.status = "not-reached"; save(); continue;
+                }
+                try {
+                  verifyFixture();
+                  const binary = join(fixture, "sqlite-" + name), cache = join(fixture, "cache-" + name);
+                  assert.equal(existsSync(binary), false); assert.equal(existsSync(binary + ".libnode"), false);
+                  mkdirSync(cache, { mode: 0o700 });
+                  const env = { SCRIPTC_CACHE_DIR: cache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: island ? pack.root : "" };
+                  const args = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics", "-o", binary,
+                    ...(island ? ["--node-islands=explicit", "--node-island=" + join(fixture, "node-sqlite.mjs"), "--libnode=beside"] : ["--node-islands=off"])];
+                  if (flavor === "san") args.push("--sanitize");
+                  const compiled = execute("compile-" + name, process.execPath, args, 600, env, true);
+                  observed.compile = { status: processOutcome(compiled), code: compiled.code, signal: compiled.signal, error: compiled.error, step: compiled.step };
+                  assert.equal(compiled.error, undefined); assert.equal(compiled.signal, null);
+                  assert.ok(compiled.code === 0 || compiled.code === 1, "compiler did not produce a normal result");
+                  observed.compile.status = "invalid-diagnostics";
+                  const diagnostics = JSON.parse(compiled.stdout);
+                  assert.equal(diagnostics.schema, "scriptc-diagnostics"); assert.equal(diagnostics.schemaVersion, 1);
+                  assert.equal(diagnostics.command, "build"); assert.equal(diagnostics.entry, entry);
+                  assert.ok(Array.isArray(diagnostics.diagnostics));
+                  observed.compile.diagnostics = diagnostics;
+                  const errors = diagnostics.diagnostics.filter(item => item.severity === "error");
+                  if (compiled.code !== 0) {
+                    assert.equal(diagnostics.success, false); assert.ok(errors.length > 0);
+                    const refused = ["preflight", "compile"].includes(diagnostics.phase) &&
+                      errors.every(item => ["invalid-source", "unsupported"].includes(item.category));
+                    observed.compile.status = refused ? "frontend-refusal" : "failed";
+                    frontendRefusal = flavor === "plain" && refused;
+                    throw new Error(name + " compilation failed; see recorded diagnostics");
+                  }
+                  assert.equal(diagnostics.success, true); assert.equal(diagnostics.phase, "complete");
+                  assert.equal(diagnostics.artifact, binary); assert.equal(errors.length, 0);
+                  observed.compile.status = "passed";
+                  const notes = diagnostics.diagnostics.filter(item => item.code === "SC8001");
+                  if (island) {
+                    assert.equal(notes.length, 1, "explicit island selection differs");
+                    assert.equal(notes[0].file, join(fixture, "node-sqlite.mjs"));
+                  } else assert.equal(notes.length, 0, "native case selected a Node island");
+                  const artifact = report.artifacts[name] = { binarySha256: hash(binary), binaryBytes: lstatSync(binary).size };
+                  if (island) {
+                    const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
+                    assert.deepEqual(beside.manifest, pack.manifest);
+                    artifact.libnodeManifestSha256 = hash(join(beside.root, "manifest.json"));
+                    artifact.modules = moduleFiles(join(beside.root, "modules"));
+                    for (const [file, expected] of Object.entries(openclawInputs).filter(([file]) => file.endsWith(".mjs"))) {
+                      const copies = artifact.modules.filter(item => basename(item.path) === file);
+                      assert.equal(copies.length, 1, "missing or duplicated shipped module: " + file);
+                      assert.equal(copies[0].sha256, expected, file);
+                    }
+                  } else assert.equal(existsSync(binary + ".libnode"), false, "native case produced a beside libnode pack");
+                  observed.execution.status = "started"; save();
+                  const executed = execute("execute-" + name, binary, [], 60, { ...env, SCRIPTC_LIBNODE: "" }, true);
+                  observed.execution = { status: processOutcome(executed), code: executed.code, signal: executed.signal, error: executed.error, step: executed.step };
+                  assert.equal(observed.execution.status, "completed", name + " execution failed");
+                  const actual = JSON.parse(executed.stdout);
+                  report.results[mode][flavor] = actual;
+                  observed.admissionAccepted = actual.failure === null;
+                  observed.callerNode = actual.node;
+                  assert.equal(hash(binary), artifact.binarySha256);
+                  if (island) {
+                    assert.deepEqual(readLibnodePack(binary + ".libnode", { verifyHashes: true }).manifest, pack.manifest);
+                    assert.deepEqual(moduleFiles(join(binary + ".libnode", "modules")), artifact.modules);
+                  } else assert.equal(existsSync(binary + ".libnode"), false);
+                  observed.parity = "mismatch";
+                  assert.deepEqual(actual, oracle, name + " differs from the Node oracle");
+                  observed.parity = "matched"; observed.status = "passed";
+                } catch (error) {
+                  observed.status = "failed"; observed.error = scrub(error.stack ?? error);
+                } finally {
+                  verifyFixture(); save();
+                }
+              }
             }
-            for (const [file, expected] of Object.entries(openclawInputs)) assert.equal(hash(join(fixture, file)), expected, file);
-            assert.equal(hash(entry), report.fixtureSha256);
+            report.diagnosticComplete = Object.values(report.modes).length === 2 &&
+              Object.values(report.modes).every(mode => Object.keys(mode.cases).length === 2 &&
+                Object.values(mode.cases).every(result => ["passed", "failed", "not-reached", "setup-failed"].includes(result.status)));
+            assert.equal(report.diagnosticComplete, true, "incomplete mode inventory");
+            assert.ok(Object.values(report.modes).every(mode => Object.values(mode.cases).every(result => result.status === "passed")),
+              "launcher qualification refused, mismatched, or incomplete; see per-mode results");
+            verifyFixture();
+            report.qualificationComplete = true;
             report.status = "passed";
           } catch (error) {
             report.status = "failed"; report.error = scrub(error.stack ?? error); process.exitCode = 1;
           } finally {
             try { source(); report.sourceVerifiedAfter = true; }
             catch (error) { report.status = "failed"; report.sourceError = scrub(error.stack ?? error); process.exitCode = 1; }
+            if (report.fixtureSha256 !== undefined) {
+              try { verifyFixture(); report.fixtureVerifiedAfter = true; }
+              catch (error) { report.status = "failed"; report.fixtureError = scrub(error.stack ?? error); process.exitCode = 1; }
+            }
+            if (report.status !== "passed") report.qualificationComplete = false;
             report.finishedAt = new Date().toISOString(); save();
             console.log(JSON.stringify({ status: report.status, results: report.results, scope: report.scope }));
             if (process.exitCode) console.error("[openclaw-sqlite-island] FAILED (exit 1)");
@@ -236,8 +367,9 @@ jobs:
               workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
               attempt: process.env.GITHUB_RUN_ATTEMPT, status: "failed",
               error: "setup failed before the proof runner produced a receipt",
-              scope: "native SQLite admission module using embedded Node builtins",
-            probeExecution: "native", libnodePlacement: "beside",
+              scope: "unchanged OpenClaw launcher admission in native and explicit module island modes",
+              entryExecution: "native", callerVersionSource: "native process.versions.node",
+              diagnosticComplete: false, qualificationComplete: false,
               pureNativeSqlite: false, completeGateway: false, completeSuite: false,
               sourceVerifiedAfter: head.status === 0 && status.status === 0 && head.stdout.trim() === "923a57d63cc1a32324cd0a4d514935db3f2ad264" && status.stdout.trim() === "",
               finishedAt: new Date().toISOString(),
