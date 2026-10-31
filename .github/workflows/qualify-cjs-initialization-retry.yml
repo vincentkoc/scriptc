@@ -16,23 +16,15 @@ jobs:
   diagnose:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: baseline
-            source: 71a9441c824262150f35acd2b8359f156ed3289c
-          - label: candidate
-            source: 5a4a3f0e6a2660cb84aab0d77d8a781ace0b2643
     env:
       NODE_OPTIONS: --max-old-space-size=4096
-      DIAGNOSTIC_SOURCE: ${{ matrix.source }}
-      DIAGNOSTIC_LABEL: ${{ matrix.label }}
+      DIAGNOSTIC_SOURCE: 640b847a991f93a50fb38224f333229f1936c46a
+      DIAGNOSTIC_LABEL: candidate
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: ${{ matrix.source }}
+          ref: 640b847a991f93a50fb38224f333229f1936c46a
           persist-credentials: false
       - name: Verify source before setup
         run: |
@@ -53,7 +45,7 @@ jobs:
           target: linux-x64-gnu
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Compare CommonJS retry and qualify candidate
+      - name: Qualify retrying initializer numeric storage
         run: |
           cat > "$RUNNER_TEMP/cjs-retry-diagnostic.mjs" <<'PROOF'
           import assert from "node:assert/strict";
@@ -73,8 +65,8 @@ jobs:
           const report = {
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
-            status: "running", diagnosticComplete: false, qualificationComplete: false, regressionObserved: false,
-            templateCommit: "5b3681054778fc53ded8f1a9838bcfcc86761037",
+            status: "running", diagnosticComplete: false, qualificationComplete: false,
+            templateCommit: "d5c71b876119fbe1cd0b24af9631f4ec8f48da53",
             completeSuite: false, scope: "cjs-initialization-retry",
             expectedExecutionAttempts: 4, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [], gates: [],
           };
@@ -96,12 +88,12 @@ jobs:
             } finally { fds.forEach(closeSync); }
             const observed = {
               name, command, args, seconds: (Date.now() - started) / 1000, limitSeconds: seconds,
-              code: result.status, signal: result.signal, error: result.error?.message,
+              code: result.status, signal: result.signal, error: result.error?.message ?? null,
               stdout: relative(out, stdout), stderr: relative(out, stderr),
               stdoutSha256: hash(stdout), stderrSha256: hash(stderr),
               stdoutBytes: lstatSync(stdout).size, stderrBytes: lstatSync(stderr).size,
             };
-            observed.status = observed.error ? "tool-error" : observed.signal ? "signal" :
+            observed.status = observed.error || [125, 126, 127].includes(observed.code) ? "tool-error" : observed.signal ? "signal" :
               observed.code === 124 ? "timeout" : observed.code === 137 ? "killed" :
               observed.code === 0 ? "completed" : "nonzero-exit";
             report.steps.push(observed); save(); return observed;
@@ -140,7 +132,7 @@ jobs:
               status: step.status, code: step.code, signal: step.signal, error: step.error,
               stdout: step.stdout, stdoutSha256: step.stdoutSha256, stderr, stderrSha256: digest(normalized),
               normalization: { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
-                ruleSource: "tests/harness/module-initialization.test.ts:68", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags },
+                ruleSource: "tests/harness/module-initialization.test.ts:87", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags },
             };
           };
           const completeCase = item => item.oracle?.expectedMatched === true && item.oracle.status === "completed" &&
@@ -152,15 +144,9 @@ jobs:
                 Boolean(native.llvm && native.binarySha256) && native.inputsVerifiedAfter === true &&
                 execution?.attempted === true && !execution.error &&
                 !["SIGKILL", "SIGTERM", "SIGHUP", "SIGINT"].includes(execution.signal) &&
-                ![129, 130, 137, 143].includes(execution.code) &&
+                ![125, 126, 127, 129, 130, 137, 143].includes(execution.code) &&
                 ["completed", "nonzero-exit", "signal"].includes(execution.status) && Boolean(execution.parityOutcome);
             });
-          const regressionObserved = item => completeCase(item) && ["plain", "san"].every(flavor => {
-            const native = item.flavors[flavor], execution = native.execution, actual = execution.parityOutcome;
-            return native.parity === "mismatch" && execution.status === "completed" && execution.code === 0 && execution.signal === null &&
-              actual.stdoutSha256 === item.baselineStdoutSha256 && actual.stdoutSha256 !== item.expectedStdoutSha256 &&
-              actual.stderrSha256 === digest("");
-          });
           const verifyGateData = (spec, data, collection) => {
             assert.ok(Array.isArray(data.testResults));
             const fileOf = value => {
@@ -206,6 +192,7 @@ jobs:
             return { tests: selected, executedCount: executed.length,
               fileCounts: Object.fromEntries(spec.files.map(file => [file, selected.filter(row => row.file === file).length])) };
           };
+          const sourcePins = {"packages/compiler/src/frontend/lowering/lower-modules.ts":"f3e2a228ffdecff36fa8e9bab90b9aa8d2eaf5fdca29b232380f2cfdc9156d69","packages/compiler/src/frontend/lowering/lowerer.ts":"e65497e1854753c5635dcc73c5e05de92d0e1f3fc3cf4ec6d95a54d2e69a3a02","packages/compiler/src/frontend/program.ts":"650b1930e34f06de8c2adb512b5751672eb9aca56f456b0634833b6267fee438","packages/compiler/src/frontend/program-node.ts":"4a52e964e293c313f2d70007e277330d6ce095912f6056e5aaaf6da7ba11e45d","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/ir/ir.ts":"b7107ae9ee9ac4d390ee74352ce1ff617b705f08871e41a0215491b5aa7536d2","packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/backend/llvm/emitter.ts":"b21e443b82ddc39083d4b51139eaf1abbf0c178e34d4c64be0a44aa03b3d7055","packages/compiler/src/backend/llvm/unwind-abi.ts":"dc656d7ab4c0230c4f05319cad49b0d6928814c47ffca981c875376b3a9293b7","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/native-codegen-core.ts":"dab5c5a2de6a4ac34a191eaaf82412f504641148b14d2b39634944dfb8d92a54","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e","native/llvm-codegen/src/target.h":"6e814839b13df133fbd8b19898862334dac7f5e96b47501333e62738d68a7bac","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_exception.c":"84ece59a9e29977a649315ade1f341c064b3d07b61efe04eb3668c4eec33c306","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","CHANGELOG.md":"33f999864619ac598b8fb266bb8ae49df2a1e2598bde3a706254ce9e64aa231e","packages/compiler/src/ir/initializer-bindings.ts":"8c766e90eb7895415f585228968cdde04828525278506bb5553c31c55b947c0f","packages/compiler/src/ir/int32-slots.ts":"b726fc111de53a48432f5fe7321d3f18d344603efdea8f17ccda28a29b64b553","packages/compiler/src/ir/integer-ranges.ts":"3f44316a079940c19a903d4e54ea21524dfa9c5ddd7a79074abeffbbf2045469","packages/compiler/src/backend/llvm/integer-views.ts":"fbb90d2478fcd713ddd80400583402ddbabf23ea5225a12c60ec6c3d5f0b377c","packages/compiler/src/backend/llvm/emit-function.ts":"0821e55aa5a78b0a7e1de1e613e05f333ef0fb2ce964630ab6e71f1dd7d74358","packages/compiler/src/ir/initializer-bindings.test.ts":"923e41e5367bd646f2c1d68774a674cb33132541a4b229c4063cff0aa961632f","packages/compiler/src/ir/int32-slots.test.ts":"4159e0363eb98d899d75deec449ab4235cfbc79950cf04f1554aa64e36fa8345","packages/compiler/src/ir/integer-ranges.test.ts":"166062c66e97e689b75612092614a221d93adaaa1d688a9ecae50bb05378af24","packages/compiler/src/backend/llvm/integer-views.test.ts":"db445815066088d93acb364bd591a1d099b15bbe6bf603ed232bf0683cc78732","packages/compiler/test/int32-slots-transfer.test.ts":"1aee58a29d8fd54e9a165f9c5464ef26b4dd326cf5de492ff8bfc44d5ef852ce","packages/compiler/test/int32-local-emission.test.ts":"c98d7c4cef1853093cb1c030698bf0010a4c52d9ef53bf9260b2970adc6d9d2b","tests/harness/module-initialization.test.ts":"7b2af9b57b9d1df6d77e1d765661722c1bf2c566f84ecaff28f9e417b5e0912b","tests/corpus/2880-cjs-module-graph/main.cjs":"7f9ee317c1e82debf17ed2c04c2d31bbcc7d0f0c1e267272e3c34ede47b54802","tests/corpus/1621-cjs-require-cache-hit/main.js":"c81670c8d73b600a3e02e3bcb4bbf8d6874acb36db3844a7118de7a6de412dfd","tests/corpus/6150-cjs-inline-require/main.js":"c66bef6ab843f9d53afcef8b2751b5867f5a8adf3e019645def8db04df984a65","tests/corpus/4083-dynamic-import-failure/main.ts":"18b86c1f8a27aea58297541276c34a7df41549bdc5dc849408b5041c648ae2bc","tests/corpus/2050-dynamic-import-own-module/main.ts":"f5763bb347515de17133f4b04ac0222dec3536f27e60ad06f57a0870ab8133b6","tests/corpus/5324-int32-initializer-locals.ts":"c3832365753a90758ff6eaa4a34a2ba784d46c2d0cc27f2183e15d67e104c7fa","tests/corpus/global-accumulator-loops.ts":"6acb816b972349047cff36af2049843471f3ad20486c31bf08a9a71bfcb13503"};
           const sourceFiles = [
             "packages/compiler/src/frontend/lowering/lower-modules.ts",
             "packages/compiler/src/frontend/lowering/lowerer.ts",
@@ -234,13 +221,27 @@ jobs:
             "vitest.config.ts",
             "tests/harness/differential.test.ts",
             "tests/harness/llvm-differential.test.ts",
-            "packages/compiler/src/frontend/lowering/lower-modules.test.ts",
-            "packages/compiler/src/frontend/program.test.ts",
-            "packages/compiler/src/backend/llvm/emitter.test.ts",
-            "packages/compiler/src/backend/llvm/unwind-abi.test.ts",
-            "CHANGELOG.md"
+            "CHANGELOG.md",
+            "packages/compiler/src/ir/initializer-bindings.ts",
+            "packages/compiler/src/ir/int32-slots.ts",
+            "packages/compiler/src/ir/integer-ranges.ts",
+            "packages/compiler/src/backend/llvm/integer-views.ts",
+            "packages/compiler/src/backend/llvm/emit-function.ts",
+            "packages/compiler/src/ir/initializer-bindings.test.ts",
+            "packages/compiler/src/ir/int32-slots.test.ts",
+            "packages/compiler/src/ir/integer-ranges.test.ts",
+            "packages/compiler/src/backend/llvm/integer-views.test.ts",
+            "packages/compiler/test/int32-slots-transfer.test.ts",
+            "packages/compiler/test/int32-local-emission.test.ts",
+            "tests/harness/module-initialization.test.ts",
+            "tests/corpus/2880-cjs-module-graph/main.cjs",
+            "tests/corpus/1621-cjs-require-cache-hit/main.js",
+            "tests/corpus/6150-cjs-inline-require/main.js",
+            "tests/corpus/4083-dynamic-import-failure/main.ts",
+            "tests/corpus/2050-dynamic-import-own-module/main.ts",
+            "tests/corpus/5324-int32-initializer-locals.ts",
+            "tests/corpus/global-accumulator-loops.ts"
           ];
-          if (report.label === "candidate") sourceFiles.push("tests/harness/module-initialization.test.ts");
           const source = () => {
             assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
             assert.equal(capture("source-status", "git", ["status", "--porcelain"]), "");
@@ -253,15 +254,14 @@ jobs:
             if (info.isDirectory()) return moduleFiles(path).map(file => ({ ...file, path: entry.name + "/" + file.path }));
             assert.ok(info.isFile()); return [{ path: entry.name, bytes: info.size, sha256: hash(path) }];
           });
-          const specs = [{"id":"cjs-retry-cjs","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"5a4a3f0e6a2660cb84aab0d77d8a781ace0b2643","transform":"expand committed fixture with extension=cjs graph=false esm=false; no source rewrite","fixtureDefinitionSha256":"985b9890f8ae897af80882233705f8ed8455581f89cee6082ac5c53311652ed8","files":{"main.cjs":"for (let i = 0; i < 2; i++) {\n  try { require(\"./failed.cjs\"); }\n  catch (error) {\n    console.log(error instanceof Error ? error.message : String(error));\n  }\n}\nrequire(\"./ok.cjs\");\nrequire(\"./ok.cjs\");\nconsole.log(\"done\");\n","failed.cjs":"console.log(\"failed\");\nthrow new Error(\"retry\");\n","ok.cjs":"const value = 7;\nconsole.log(\"ok\", value);\n"},"expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n","baselineExpected":"failed\nretry\nok 7\ndone\n"},{"id":"cjs-retry-cts","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"5a4a3f0e6a2660cb84aab0d77d8a781ace0b2643","transform":"expand committed fixture with extension=cts graph=false esm=false; no source rewrite","fixtureDefinitionSha256":"985b9890f8ae897af80882233705f8ed8455581f89cee6082ac5c53311652ed8","files":{"main.cjs":"for (let i = 0; i < 2; i++) {\n  try { require(\"./failed.cts\"); }\n  catch (error) {\n    console.log(error instanceof Error ? error.message : String(error));\n  }\n}\nrequire(\"./ok.cts\");\nrequire(\"./ok.cts\");\nconsole.log(\"done\");\n","failed.cts":"console.log(\"failed\");\nthrow new Error(\"retry\");\n","ok.cts":"const value: number = 7;\nconsole.log(\"ok\", value);\n"},"expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n","baselineExpected":"failed\nretry\nok 7\ndone\n"}];
-          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"files":["packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"collect":true,"seconds":900},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":false,"seconds":1200},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"regression-san","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":true,"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const specs = [{"id":"cjs-retry-cjs","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"640b847a991f93a50fb38224f333229f1936c46a","transform":"expand committed fixture with extension=cjs graph=false esm=false numeric=false; no source rewrite","fixtureDefinitionSha256":"45588acee57ed7d522d000d836c6c291eddfbe34a4feaa0d02f7252fd69254ae","files":{"main.cjs":"for (let i = 0; i < 2; i++) {\n  try { require(\"./failed.cjs\"); }\n  catch (error) {\n    console.log(error instanceof Error ? error.message : String(error));\n  }\n}\nrequire(\"./ok.cjs\");\nrequire(\"./ok.cjs\");\nconsole.log(\"done\");\n","failed.cjs":"console.log(\"failed\");\nthrow new Error(\"retry\");\n","ok.cjs":"const value = 7;\nconsole.log(\"ok\", value);\n"},"expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n"},{"id":"cjs-retry-cts","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"640b847a991f93a50fb38224f333229f1936c46a","transform":"expand committed fixture with extension=cts graph=false esm=false numeric=false; no source rewrite","fixtureDefinitionSha256":"45588acee57ed7d522d000d836c6c291eddfbe34a4feaa0d02f7252fd69254ae","files":{"main.cjs":"for (let i = 0; i < 2; i++) {\n  try { require(\"./failed.cts\"); }\n  catch (error) {\n    console.log(error instanceof Error ? error.message : String(error));\n  }\n}\nrequire(\"./ok.cts\");\nrequire(\"./ok.cts\");\nconsole.log(\"done\");\n","failed.cts":"console.log(\"failed\");\nthrow new Error(\"retry\");\n","ok.cts":"const value: number = 7;\nconsole.log(\"ok\", value);\n"},"expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n"}];
+          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/ir/initializer-bindings.test.ts","packages/compiler/src/ir/int32-slots.test.ts","packages/compiler/src/ir/integer-ranges.test.ts","packages/compiler/src/backend/llvm/integer-views.test.ts","packages/compiler/test/int32-slots-transfer.test.ts","packages/compiler/test/int32-local-emission.test.ts"],"files":["packages/compiler/src/ir/initializer-bindings.test.ts","packages/compiler/src/ir/int32-slots.test.ts","packages/compiler/src/ir/integer-ranges.test.ts","packages/compiler/src/backend/llvm/integer-views.test.ts","packages/compiler/test/int32-slots-transfer.test.ts","packages/compiler/test/int32-local-emission.test.ts"],"collect":true,"seconds":900},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false, numeric=false)","failed module evaluation preserves cjs caching (metadata=true, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=true, numeric=false)","failed module evaluation preserves mjs caching (metadata=false, numeric=false)","failed module evaluation preserves mts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=true)","failed module evaluation preserves cts caching (metadata=true, numeric=true)"],"sanitize":false,"seconds":1200},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"regression-san","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false, numeric=false)","failed module evaluation preserves cjs caching (metadata=true, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=true, numeric=false)","failed module evaluation preserves mjs caching (metadata=false, numeric=false)","failed module evaluation preserves mts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=true)","failed module evaluation preserves cts caching (metadata=true, numeric=true)"],"sanitize":true,"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
           const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
           for (const spec of specs) {
             const dir = join(fixtures, spec.id); mkdirSync(dir);
             for (const [file, contents] of Object.entries(spec.files))
               writeFileSync(join(dir, file), contents);
             writeFileSync(join(dir, "expected.stdout.log"), spec.expected);
-            writeFileSync(join(dir, "baseline-expected.stdout.log"), spec.baselineExpected);
           }
           const fixtureManifest = moduleFiles(fixtures);
           report.fixtureManifest = fixtureManifest; report.fixtureDigest = digest(JSON.stringify(fixtureManifest));
@@ -269,8 +269,9 @@ jobs:
           const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
           save();
           try {
-            assert.equal(report.fixtureDigest, "273988da85243c1179ea0a6e7ae22d9f4e37363d5c47646e422e9e022aff394d", "authored fixture bytes changed");
+            assert.equal(report.fixtureDigest, "f77068e9673f0c01f0d692361823df67bc1d77677f284c6088d725e943a35534", "authored fixture bytes changed");
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
+            assert.deepEqual(report.sourceInputs, sourcePins);
             assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
             report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
             assert.deepEqual(report.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
@@ -293,7 +294,7 @@ jobs:
               assert.equal(hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen"), report.helperBinarySha256);
             };
             for (const spec of specs) {
-              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, entry: spec.entry, expectedStdoutSha256: digest(spec.expected), baselineStdoutSha256: digest(spec.baselineExpected), flavors: {} };
+              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, entry: spec.entry, expectedStdoutSha256: digest(spec.expected), flavors: {} };
               report.cases.push(observed);
               const dir = join(fixtures, spec.id), entry = join(dir, spec.entry), markedIslands = [];
               const artifacts = join(out, spec.id); mkdirSync(artifacts);
@@ -354,7 +355,7 @@ jobs:
               }
               observed.complete = completeCase(observed); save();
             }
-            if (report.label === "candidate") {
+            {
               const harnessLink = join(root, "node_modules/.cache/scriptc-tests");
               assert.equal(lstatSync(harnessLink, { throwIfNoEntry: false }), undefined, "harness output already has an owner");
               const harnessOutput = join(work, "harness-output"); mkdirSync(harnessOutput);
@@ -398,11 +399,10 @@ jobs:
             report.executionAttempts = report.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
             report.diagnosticComplete = report.cases.length === specs.length && report.cases.every(item => item.complete);
             report.diagnosticComplete &&= report.executionAttempts === report.expectedExecutionAttempts;
-            report.regressionObserved = report.label === "baseline" && report.diagnosticComplete && report.cases.every(regressionObserved);
             report.qualificationComplete = report.diagnosticComplete && report.cases.every(item =>
               ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed" && item.flavors[flavor].parity === "matched")) &&
-              (report.label === "baseline" || report.gates.length === gateSpecs.length && report.gates.every(gate => gate.status === "passed"));
-            report.status = report.qualificationComplete ? "passed" : report.regressionObserved ? "regression-observed" : "failed";
+              (report.gates.length === gateSpecs.length && report.gates.every(gate => gate.status === "passed"));
+            report.status = report.qualificationComplete ? "passed" : "failed";
           } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
           finally {
             try {
@@ -412,11 +412,11 @@ jobs:
               report.nativeInputsVerifiedAfter = true;
               assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true;
             }
-            catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.regressionObserved = false; report.sourceError = scrub(error.stack ?? error); }
+            catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.sourceError = scrub(error.stack ?? error); }
             report.finishedAt = new Date().toISOString(); save();
             writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
             console.log(JSON.stringify({ label: report.label, status: report.status, diagnosticComplete: report.diagnosticComplete, qualificationComplete: report.qualificationComplete }));
-            if (!(report.label === "baseline" ? report.diagnosticComplete && report.regressionObserved : report.qualificationComplete)) { console.error("[cjs-retry-diagnostic] FAILED (exit 1)"); process.exitCode = 1; }
+            if (!report.qualificationComplete) { console.error("[cjs-retry-diagnostic] FAILED (exit 1)"); process.exitCode = 1; }
           }
           PROOF
           ulimit -c 0
@@ -455,10 +455,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cjs-initialization-retry-${{ matrix.label }}
+          name: cjs-initialization-retry-candidate
           path: ${{ runner.temp }}/cjs-retry-proof
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   aggregate:
     needs: diagnose
@@ -473,16 +473,17 @@ jobs:
         with:
           pattern: cjs-initialization-retry-*
           path: ${{ runner.temp }}/cjs-initialization-retry-results
-      - name: Verify paired retry and candidate gates
+      - name: Verify candidate retry and numeric gates
         run: |
           node --input-type=module <<'COMPARE'
           import assert from "node:assert/strict";
           import { createHash } from "node:crypto";
           import { readFileSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
-          const heads = { baseline: "71a9441c824262150f35acd2b8359f156ed3289c", candidate: "5a4a3f0e6a2660cb84aab0d77d8a781ace0b2643" };
-          const specs = [{"id":"cjs-retry-cjs","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"5a4a3f0e6a2660cb84aab0d77d8a781ace0b2643","transform":"expand committed fixture with extension=cjs graph=false esm=false; no source rewrite","fixtureDefinitionSha256":"985b9890f8ae897af80882233705f8ed8455581f89cee6082ac5c53311652ed8","expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n","baselineExpected":"failed\nretry\nok 7\ndone\n"},{"id":"cjs-retry-cts","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"5a4a3f0e6a2660cb84aab0d77d8a781ace0b2643","transform":"expand committed fixture with extension=cts graph=false esm=false; no source rewrite","fixtureDefinitionSha256":"985b9890f8ae897af80882233705f8ed8455581f89cee6082ac5c53311652ed8","expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n","baselineExpected":"failed\nretry\nok 7\ndone\n"}];
-          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"files":["packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/backend/llvm/emitter.test.ts","packages/compiler/src/backend/llvm/unwind-abi.test.ts"],"collect":true,"seconds":900},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":false,"seconds":1200},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"regression-san","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false)","failed module evaluation preserves cjs caching (metadata=true)","failed module evaluation preserves cts caching (metadata=false)","failed module evaluation preserves cts caching (metadata=true)","failed module evaluation preserves mjs caching (metadata=false)","failed module evaluation preserves mts caching (metadata=false)"],"sanitize":true,"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const heads = { candidate: "640b847a991f93a50fb38224f333229f1936c46a" };
+          const specs = [{"id":"cjs-retry-cjs","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"640b847a991f93a50fb38224f333229f1936c46a","transform":"expand committed fixture with extension=cjs graph=false esm=false numeric=false; no source rewrite","fixtureDefinitionSha256":"45588acee57ed7d522d000d836c6c291eddfbe34a4feaa0d02f7252fd69254ae","expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n"},{"id":"cjs-retry-cts","entry":"main.cjs","origin":"tests/harness/module-initialization.test.ts","fixtureSource":"640b847a991f93a50fb38224f333229f1936c46a","transform":"expand committed fixture with extension=cts graph=false esm=false numeric=false; no source rewrite","fixtureDefinitionSha256":"45588acee57ed7d522d000d836c6c291eddfbe34a4feaa0d02f7252fd69254ae","expected":"failed\nretry\nfailed\nretry\nok 7\ndone\n"}];
+          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/ir/initializer-bindings.test.ts","packages/compiler/src/ir/int32-slots.test.ts","packages/compiler/src/ir/integer-ranges.test.ts","packages/compiler/src/backend/llvm/integer-views.test.ts","packages/compiler/test/int32-slots-transfer.test.ts","packages/compiler/test/int32-local-emission.test.ts"],"files":["packages/compiler/src/ir/initializer-bindings.test.ts","packages/compiler/src/ir/int32-slots.test.ts","packages/compiler/src/ir/integer-ranges.test.ts","packages/compiler/src/backend/llvm/integer-views.test.ts","packages/compiler/test/int32-slots-transfer.test.ts","packages/compiler/test/int32-local-emission.test.ts"],"collect":true,"seconds":900},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false, numeric=false)","failed module evaluation preserves cjs caching (metadata=true, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=true, numeric=false)","failed module evaluation preserves mjs caching (metadata=false, numeric=false)","failed module evaluation preserves mts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=true)","failed module evaluation preserves cts caching (metadata=true, numeric=true)"],"sanitize":false,"seconds":1200},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"regression-san","args":["exec","vitest","run","tests/harness/module-initialization.test.ts"],"files":["tests/harness/module-initialization.test.ts"],"tests":["failed module evaluation preserves cjs caching (metadata=false, numeric=false)","failed module evaluation preserves cjs caching (metadata=true, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=true, numeric=false)","failed module evaluation preserves mjs caching (metadata=false, numeric=false)","failed module evaluation preserves mts caching (metadata=false, numeric=false)","failed module evaluation preserves cts caching (metadata=false, numeric=true)","failed module evaluation preserves cts caching (metadata=true, numeric=true)"],"sanitize":true,"seconds":1200},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2880-cjs-module-graph/main\\.cjs|1621-cjs-require-cache-hit/main\\.js|6150-cjs-inline-require/main\\.js|4083-dynamic-import-failure/main\\.ts|2050-dynamic-import-own-module/main\\.ts|5324-int32-initializer-locals\\.ts|global-accumulator-loops\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2880-cjs-module-graph/main.cjs","1621-cjs-require-cache-hit/main.js","6150-cjs-inline-require/main.js","4083-dynamic-import-failure/main.ts","2050-dynamic-import-own-module/main.ts","5324-int32-initializer-locals.ts","global-accumulator-loops.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const sourcePins = {"packages/compiler/src/frontend/lowering/lower-modules.ts":"f3e2a228ffdecff36fa8e9bab90b9aa8d2eaf5fdca29b232380f2cfdc9156d69","packages/compiler/src/frontend/lowering/lowerer.ts":"e65497e1854753c5635dcc73c5e05de92d0e1f3fc3cf4ec6d95a54d2e69a3a02","packages/compiler/src/frontend/program.ts":"650b1930e34f06de8c2adb512b5751672eb9aca56f456b0634833b6267fee438","packages/compiler/src/frontend/program-node.ts":"4a52e964e293c313f2d70007e277330d6ce095912f6056e5aaaf6da7ba11e45d","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/ir/ir.ts":"b7107ae9ee9ac4d390ee74352ce1ff617b705f08871e41a0215491b5aa7536d2","packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/backend/llvm/emitter.ts":"b21e443b82ddc39083d4b51139eaf1abbf0c178e34d4c64be0a44aa03b3d7055","packages/compiler/src/backend/llvm/unwind-abi.ts":"dc656d7ab4c0230c4f05319cad49b0d6928814c47ffca981c875376b3a9293b7","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/native-codegen-core.ts":"dab5c5a2de6a4ac34a191eaaf82412f504641148b14d2b39634944dfb8d92a54","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e","native/llvm-codegen/src/target.h":"6e814839b13df133fbd8b19898862334dac7f5e96b47501333e62738d68a7bac","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_exception.c":"84ece59a9e29977a649315ade1f341c064b3d07b61efe04eb3668c4eec33c306","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","CHANGELOG.md":"33f999864619ac598b8fb266bb8ae49df2a1e2598bde3a706254ce9e64aa231e","packages/compiler/src/ir/initializer-bindings.ts":"8c766e90eb7895415f585228968cdde04828525278506bb5553c31c55b947c0f","packages/compiler/src/ir/int32-slots.ts":"b726fc111de53a48432f5fe7321d3f18d344603efdea8f17ccda28a29b64b553","packages/compiler/src/ir/integer-ranges.ts":"3f44316a079940c19a903d4e54ea21524dfa9c5ddd7a79074abeffbbf2045469","packages/compiler/src/backend/llvm/integer-views.ts":"fbb90d2478fcd713ddd80400583402ddbabf23ea5225a12c60ec6c3d5f0b377c","packages/compiler/src/backend/llvm/emit-function.ts":"0821e55aa5a78b0a7e1de1e613e05f333ef0fb2ce964630ab6e71f1dd7d74358","packages/compiler/src/ir/initializer-bindings.test.ts":"923e41e5367bd646f2c1d68774a674cb33132541a4b229c4063cff0aa961632f","packages/compiler/src/ir/int32-slots.test.ts":"4159e0363eb98d899d75deec449ab4235cfbc79950cf04f1554aa64e36fa8345","packages/compiler/src/ir/integer-ranges.test.ts":"166062c66e97e689b75612092614a221d93adaaa1d688a9ecae50bb05378af24","packages/compiler/src/backend/llvm/integer-views.test.ts":"db445815066088d93acb364bd591a1d099b15bbe6bf603ed232bf0683cc78732","packages/compiler/test/int32-slots-transfer.test.ts":"1aee58a29d8fd54e9a165f9c5464ef26b4dd326cf5de492ff8bfc44d5ef852ce","packages/compiler/test/int32-local-emission.test.ts":"c98d7c4cef1853093cb1c030698bf0010a4c52d9ef53bf9260b2970adc6d9d2b","tests/harness/module-initialization.test.ts":"7b2af9b57b9d1df6d77e1d765661722c1bf2c566f84ecaff28f9e417b5e0912b","tests/corpus/2880-cjs-module-graph/main.cjs":"7f9ee317c1e82debf17ed2c04c2d31bbcc7d0f0c1e267272e3c34ede47b54802","tests/corpus/1621-cjs-require-cache-hit/main.js":"c81670c8d73b600a3e02e3bcb4bbf8d6874acb36db3844a7118de7a6de412dfd","tests/corpus/6150-cjs-inline-require/main.js":"c66bef6ab843f9d53afcef8b2751b5867f5a8adf3e019645def8db04df984a65","tests/corpus/4083-dynamic-import-failure/main.ts":"18b86c1f8a27aea58297541276c34a7df41549bdc5dc849408b5041c648ae2bc","tests/corpus/2050-dynamic-import-own-module/main.ts":"f5763bb347515de17133f4b04ac0222dec3536f27e60ad06f57a0870ab8133b6","tests/corpus/5324-int32-initializer-locals.ts":"c3832365753a90758ff6eaa4a34a2ba784d46c2d0cc27f2183e15d67e104c7fa","tests/corpus/global-accumulator-loops.ts":"6acb816b972349047cff36af2049843471f3ad20486c31bf08a9a71bfcb13503"};
           const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             scope: "cjs-initialization-retry", diagnosticComplete: false, qualificationComplete: false, sources: {} };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -496,15 +497,9 @@ jobs:
                 Boolean(native.llvm && native.binarySha256) && native.inputsVerifiedAfter === true &&
                 execution?.attempted === true && !execution.error &&
                 !["SIGKILL", "SIGTERM", "SIGHUP", "SIGINT"].includes(execution.signal) &&
-                ![129, 130, 137, 143].includes(execution.code) &&
+                ![125, 126, 127, 129, 130, 137, 143].includes(execution.code) &&
                 ["completed", "nonzero-exit", "signal"].includes(execution.status) && Boolean(execution.parityOutcome);
             });
-          const regressionObserved = item => completeCase(item) && ["plain", "san"].every(flavor => {
-            const native = item.flavors[flavor], execution = native.execution, actual = execution.parityOutcome;
-            return native.parity === "mismatch" && execution.status === "completed" && execution.code === 0 && execution.signal === null &&
-              actual.stdoutSha256 === item.baselineStdoutSha256 && actual.stdoutSha256 !== item.expectedStdoutSha256 &&
-              actual.stderrSha256 === digest("");
-          });
           const verifyGateData = (spec, data, collection) => {
             assert.ok(Array.isArray(data.testResults));
             const fileOf = value => {
@@ -568,7 +563,7 @@ jobs:
                 assert.equal(outcome.stdout, execution.stdout); assert.equal(outcome.status, execution.status);
                 assert.equal(outcome.code, execution.code); assert.equal(outcome.signal, execution.signal);
                 assert.deepEqual(outcome.normalization, { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
-                  ruleSource: "tests/harness/module-initialization.test.ts:68", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags });
+                  ruleSource: "tests/harness/module-initialization.test.ts:87", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags });
               };
               const verifyDiagnostics = (compile, spec, suffix) => {
                 if (compile?.diagnosticsStatus !== "passed") return;
@@ -586,10 +581,11 @@ jobs:
               const bytes = readFileSync(join(dir, "summary.json")), summary = JSON.parse(bytes);
               result.sources[label] = { summarySha256: digest(bytes), summary };
               assert.equal(digest(bytes), readFileSync(join(dir, "summary.sha256"), "utf8").trim());
+              assert.deepEqual(summary.sourceInputs, sourcePins);
               assert.equal(summary.head, head); assert.equal(summary.label, label); assert.equal(summary.scope, result.scope);
-              assert.equal(summary.templateCommit, "5b3681054778fc53ded8f1a9838bcfcc86761037");
+              assert.equal(summary.templateCommit, "d5c71b876119fbe1cd0b24af9631f4ec8f48da53");
               assert.equal(summary.workflow, result.workflow); assert.equal(summary.runId, result.runId); assert.equal(summary.attempt, result.attempt);
-              assert.equal(summary.fixtureDigest, "273988da85243c1179ea0a6e7ae22d9f4e37363d5c47646e422e9e022aff394d");
+              assert.equal(summary.fixtureDigest, "f77068e9673f0c01f0d692361823df67bc1d77677f284c6088d725e943a35534");
               assert.equal(digest(JSON.stringify(summary.fixtureManifest)), summary.fixtureDigest);
               assert.deepEqual(summary.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
               assert.equal(summary.vitestVersion, "3.2.7");
@@ -603,7 +599,7 @@ jobs:
               assert.equal(cleanup.runId, result.runId); assert.equal(cleanup.attempt, result.attempt);
               assert.equal(cleanup.workflow, result.workflow); assert.equal(cleanup.label, label);
               assert.equal(cleanup.error, undefined); assert.equal(cleanup.work, "removed"); assert.equal(cleanup.payload, "removed");
-              assert.equal(cleanup.harnessLink, label === "candidate" ? "removed" : "absent");
+              assert.equal(cleanup.harnessLink, "removed");
               result.sources[label].cleanup = cleanup;
               assert.deepEqual(summary.cases.map(item => item.id), specs.map(spec => spec.id));
               for (const file of summary.fixtureManifest) verifyFile({ ...file, path: "fixtures/" + file.path });
@@ -613,9 +609,7 @@ jobs:
                 const item = summary.cases.find(item => item.id === spec.id), id = spec.id;
                 for (const key of ["origin", "fixtureSource", "fixtureDefinitionSha256", "transform", "entry"]) assert.equal(item[key], spec[key]);
                 assert.equal(item.expectedStdoutSha256, digest(spec.expected));
-                assert.equal(item.baselineStdoutSha256, digest(spec.baselineExpected));
                 assert.equal(readFileSync(join(dir, "fixtures", id, "expected.stdout.log"), "utf8"), spec.expected);
-                assert.equal(readFileSync(join(dir, "fixtures", id, "baseline-expected.stdout.log"), "utf8"), spec.baselineExpected);
                 if (item.oracle) {
                   verifyOutcome(item.oracle, false);
                   const step = summary.steps.find(step => step.name === id + "-node");
@@ -658,7 +652,7 @@ jobs:
               const complete = summary.cases.every(completeCase) && attempts === 4 && summary.sourceVerifiedBefore === true &&
                 summary.sourceVerifiedAfter === true && summary.fixturesVerifiedAfter === true && summary.nativeInputsVerifiedAfter === true;
               assert.equal(summary.diagnosticComplete, complete);
-              assert.deepEqual(summary.gates.map(gate => gate.id), label === "candidate" ? gateSpecs.map(gate => gate.id) : []);
+              assert.deepEqual(summary.gates.map(gate => gate.id), gateSpecs.map(gate => gate.id));
               for (const gate of summary.gates) {
                 const spec = gateSpecs.find(spec => spec.id === gate.id);
                 assert.deepEqual(gate.expectedTests, spec.tests ?? []); assert.deepEqual(gate.llvmModes, spec.llvmModes ?? null);
@@ -687,17 +681,13 @@ jobs:
               }
               const qualified = complete && summary.cases.every(item => ["plain", "san"].every(flavor =>
                 item.flavors[flavor].status === "passed" && item.flavors[flavor].parity === "matched")) &&
-                (label === "baseline" || summary.gates.every(gate => gate.status === "passed"));
+                summary.gates.every(gate => gate.status === "passed");
               assert.equal(summary.qualificationComplete, qualified);
-              assert.equal(summary.regressionObserved, label === "baseline" && complete && summary.cases.every(regressionObserved));
-              assert.equal(summary.status, qualified ? "passed" : summary.regressionObserved ? "regression-observed" : "failed");
+              assert.equal(summary.status, qualified ? "passed" : "failed");
             }
-            const baseline = result.sources.baseline.summary, candidate = result.sources.candidate.summary;
-            assert.equal(baseline.fixtureDigest, candidate.fixtureDigest);
-            result.nativeIdentity = { runtimeManifestEqual: baseline.runtimeManifestSha256 === candidate.runtimeManifestSha256,
-              helperBinaryEqual: baseline.helperBinarySha256 === candidate.helperBinarySha256, sharedPack: false };
-            result.diagnosticComplete = baseline.diagnosticComplete && candidate.diagnosticComplete;
-            result.qualificationComplete = result.diagnosticComplete && baseline.regressionObserved && candidate.qualificationComplete;
+            const candidate = result.sources.candidate.summary;
+            result.diagnosticComplete = candidate.diagnosticComplete;
+            result.qualificationComplete = result.diagnosticComplete && candidate.qualificationComplete;
           } catch (error) { result.error = String(error); result.diagnosticComplete = false; result.qualificationComplete = false; }
           writeFileSync(join(process.env.RUNNER_TEMP, "cjs-initialization-retry-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
           console.log(JSON.stringify({ diagnosticComplete: result.diagnosticComplete, qualificationComplete: result.qualificationComplete }));
@@ -709,4 +699,4 @@ jobs:
           name: cjs-initialization-retry-aggregate
           path: ${{ runner.temp }}/cjs-initialization-retry-aggregate.json
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
