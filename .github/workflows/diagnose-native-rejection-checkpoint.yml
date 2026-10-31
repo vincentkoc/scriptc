@@ -1,0 +1,588 @@
+name: Diagnose native rejection checkpoint
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-native-rejection-checkpoint.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-native-rejection-checkpoint
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      DIAGNOSTIC_SOURCE: 022f251fc38b4c169333f133398ee5150172f2bc
+      DIAGNOSTIC_LABEL: integrated
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = "$DIAGNOSTIC_SOURCE"
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Observe native rejection checkpoints
+        run: |
+          cat > "$RUNNER_TEMP/native-rejection-checkpoint-diagnostic.mjs" <<'PROOF'
+          import assert from "node:assert/strict";
+          import { spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+          import { dirname, join, relative } from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const root = process.cwd(), head = process.env.DIAGNOSTIC_SOURCE;
+          delete process.env.FORCE_COLOR; delete process.env.NO_COLOR;
+          const out = join(process.env.RUNNER_TEMP, "native-rejection-checkpoint-proof");
+          const work = join(process.env.RUNNER_TEMP, "native-rejection-checkpoint-work");
+          mkdirSync(out); mkdirSync(work);
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          writeFileSync(join(work, ".diagnostic-owner.json"), JSON.stringify(owner), { flag: "wx" });
+          const report = {
+            label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
+            runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", diagnosticComplete: false, qualificationComplete: false,
+            templateCommit: "5b3681054778fc53ded8f1a9838bcfcc86761037",
+            completeSuite: false, scope: "native-rejection-checkpoint", priorProofReused: false,
+            expectedExecutionAttempts: 8, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
+          };
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const scrub = value => String(value).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
+          const save = () => writeFileSync(join(out, "summary.json"), scrub(JSON.stringify(report, null, 2)) + "\n");
+          let sequence = 0;
+          const execute = (name, command, args, seconds = 60, env = {}) => {
+            const stem = String(++sequence).padStart(2, "0") + "-" + name;
+            const stdout = join(out, stem + ".stdout.log"), stderr = join(out, stem + ".stderr.log");
+            const fds = [openSync(stdout, "wx"), openSync(stderr, "wx")], started = Date.now();
+            let result;
+            try {
+              // GNU timeout owns the command group, including compiler descendants.
+              result = spawnSync("timeout", ["--signal=TERM", "--kill-after=5s", seconds + "s", command, ...args], {
+                cwd: root, env: { ...process.env, ...env }, stdio: ["ignore", ...fds],
+              });
+            } finally { fds.forEach(closeSync); }
+            const observed = {
+              name, command, args, seconds: (Date.now() - started) / 1000, limitSeconds: seconds,
+              code: result.status, signal: result.signal, error: result.error?.message ?? null,
+              stdout: relative(out, stdout), stderr: relative(out, stderr),
+              stdoutSha256: hash(stdout), stderrSha256: hash(stderr),
+              stdoutBytes: lstatSync(stdout).size, stderrBytes: lstatSync(stderr).size,
+            };
+            observed.status = observed.error || [125, 126, 127].includes(observed.code) ? "tool-error" : observed.signal ? "signal" :
+              observed.code === 124 ? "timeout" : observed.code === 137 ? "killed" :
+              observed.code === 0 ? "completed" : "nonzero-exit";
+            report.steps.push(observed); save(); return observed;
+          };
+          const text = step => {
+            assert.ok(step.stdoutBytes <= 16 * 1024 ** 2, "bounded text reader exceeded; raw log retained");
+            return readFileSync(join(out, step.stdout), "utf8");
+          };
+          const requireSuccess = step => { assert.equal(step.status, "completed", step.name); return step; };
+          const capture = (name, command, args) => text(requireSuccess(execute(name, command, args))).trim();
+          const validateCompile = (step, entry, artifact, spec) => {
+            try {
+              requireSuccess(step);
+              const diagnostics = JSON.parse(text(step));
+              assert.equal(diagnostics.schema, "scriptc-diagnostics"); assert.equal(diagnostics.schemaVersion, 1);
+              assert.equal(diagnostics.command, "build"); assert.equal(diagnostics.entry, entry);
+              assert.equal(diagnostics.artifact, artifact); assert.equal(diagnostics.phase, "complete");
+              assert.equal(diagnostics.success, true); assert.ok(Array.isArray(diagnostics.diagnostics));
+              assert.equal(diagnostics.diagnostics.filter(item => item.severity === "error").length, 0);
+              const islands = diagnostics.diagnostics.filter(item => item.code === "SC8001");
+              assert.equal(islands.length, spec.hosted ? 1 : 0);
+              if (spec.hosted) {
+                assert.equal(islands[0].file, entry); assert.equal(islands[0].severity, "warning");
+                assert.equal(islands[0].scope, "reached");
+                assert.equal(islands[0].message, 'package \'checkpoint-host@1.0.0\' runs in a Node island: marked: marked "node" in scriptc.packages');
+              }
+              step.islandNotes = islands;
+              step.diagnosticsStatus = "passed"; return true;
+            } catch (error) {
+              step.diagnosticsStatus = "failed"; step.diagnosticsError = scrub(error.stack ?? error); return false;
+            } finally { save(); }
+          };
+          // Exact harness exception: keep every other sanitizer message and all raw bytes.
+          const ASAN_SWAP = /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext.*\n/gm;
+          const parityOutcome = (step, sanitize = false) => {
+            assert.ok(step.stderrBytes <= 16 * 1024 ** 2, "bounded normalization reader exceeded; raw log retained");
+            const raw = readFileSync(join(out, step.stderr), "utf8");
+            let removedLines = 0;
+            const normalized = sanitize ? raw.replace(ASAN_SWAP, () => { removedLines += 1; return ""; }) : raw;
+            const stderr = step.stderr + ".normalized.log"; writeFileSync(join(out, stderr), normalized);
+            return {
+              status: step.status, code: step.code, signal: step.signal, error: step.error,
+              stdout: step.stdout, stdoutSha256: step.stdoutSha256, stderr, stderrSha256: digest(normalized),
+              normalization: { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
+                ruleSource: "tests/harness/node-island-order.test.ts:63", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags },
+            };
+          };
+          // Native verdict failures remain complete evidence only after compile admission and input readback.
+          const completeCase = item => item.oracle?.expectedMatched === true && item.oracle.status === "completed" &&
+            item.ir?.status === "passed" && item.ir.compile?.status === "completed" &&
+            item.ir.compile.diagnosticsStatus === "passed" && Boolean(item.ir.artifact) &&
+            ["plain", "san"].every(flavor => {
+              const native = item.flavors[flavor], execution = native?.execution;
+              return native?.compile?.status === "completed" && native.compile.diagnosticsStatus === "passed" &&
+                Boolean(native.llvm && native.moduleOwners) && native.deploymentVerified === true && native.inputsVerifiedAfter === true &&
+                execution?.attempted === true && !execution.error &&
+                !["SIGKILL", "SIGTERM", "SIGHUP", "SIGINT"].includes(execution.signal) &&
+                ![125, 126, 127, 129, 130, 137, 143].includes(execution.code) &&
+                ["completed", "nonzero-exit", "signal"].includes(execution.status) && Boolean(execution.parityOutcome);
+            });
+          const collect = (value, predicate, found = []) => {
+            if (value && typeof value === "object") {
+              if (predicate(value)) found.push(value);
+              for (const child of Object.values(value)) collect(child, predicate, found);
+            }
+            return found;
+          };
+          const irEvidence = (program, spec, entry) => {
+            assert.equal(program.irVersion, 17); assert.ok(Array.isArray(program.functions));
+            assert.equal(typeof program.entry, "string"); assert.notEqual(program.commonJsEntry, true);
+            const functions = new Map(program.functions.map(fn => [fn.name, fn]));
+            const programEntry = functions.get(program.entry); assert.ok(programEntry);
+            const first = programEntry.body[0];
+            assert.ok(!(first?.kind === "throw" && first.value?.kind === "libCall" && first.value.fn === "error.new"), "IR contains a startup refusal");
+            assert.equal(functions.size, program.functions.length);
+            const own = fn => {
+              assert.ok(fn && fn.loc?.file === entry && Array.isArray(fn.body) && fn.body.length > 0,
+                "callback must have an authored native body");
+              return fn;
+            };
+            const nodes = program.functions.flatMap(fn => collect(fn.body, () => true));
+            const islandCall = node => node.kind === "libCall" && node.fn.startsWith("nodeIsland.");
+            const islands = nodes.filter(islandCall);
+            if (!spec.hosted) {
+              assert.equal(islands.length, 0, "native-only IR calls Node");
+              assert.equal(program.nodeIsland, undefined, "native-only IR records Node startup");
+            } else {
+              assert.ok(islands.some(node => ["nodeIsland.require", "nodeIsland.defer"].includes(node.fn)), "hosted import must load its package");
+              const tree = program.nodeIsland?.modules;
+              assert.ok(tree && Array.isArray(tree.files)); assert.deepEqual(tree.links, []);
+              const paths = Object.keys(spec.files).filter(file => file.startsWith("node_modules/")).sort();
+              assert.deepEqual(tree.files.map(file => file.path).sort(), paths);
+              for (const file of tree.files) {
+                assert.notEqual(file.placeholder, true); assert.equal(file.size, Buffer.byteLength(spec.files[file.path]));
+                assert.equal(file.sha256, digest(spec.files[file.path]));
+              }
+            }
+            const rejected = nodes.filter(node => node.kind === "intrinsic" && node.name === "promise.reject");
+            assert.equal(rejected.length, 1); assert.deepEqual(rejected[0].type, { kind: "promise", inner: { kind: "void" } });
+            const only = (values, why) => { assert.equal(values.length, 1, why); return values[0]; };
+            const callback = call => {
+              assert.equal(call.args.length, 1);
+              assert.equal(call.args[0].kind, "closure", "scheduler callback must be a native closure");
+              return own(functions.get(call.args[0].fnName));
+            };
+            const queue = only(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.queueMicrotask"), "one native microtask");
+            const micro = callback(queue), chain = [micro];
+            const ticks = collect(micro.body, node => node.kind === "libCall" && node.fn === "process.nextTick");
+            assert.equal(ticks.length, spec.directCatch ? 0 : 1);
+            const catchOwner = spec.directCatch ? micro : callback(ticks[0]);
+            if (!spec.directCatch) chain.push(catchOwner);
+            const catchCall = only(collect(catchOwner.body, node => node.kind === "callValue" && node.callee?.kind === "closure"),
+              "queued callback must invoke the native catch closure");
+            const caught = own(functions.get(catchCall.callee.fnName)); chain.push(caught);
+            assert.equal(caught.async, true); assert.equal(caught.params.length, 1);
+            const parameter = caught.params[0];
+            assert.deepEqual(parameter.type, { kind: "promise", inner: { kind: "void" } });
+            assert.equal(catchCall.args.length, 1); assert.deepEqual(catchCall.args[0].type, parameter.type);
+            assert.ok(catchCall.args[0].kind === "varRef", "catch receiver must remain an unboxed native promise");
+            const handler = only(caught.body.filter(node => node.kind === "tryCatch"), "catch closure try/catch");
+            const awaited = only(collect(handler.tryBody, node => node.kind === "awaitExpr"), "direct native await");
+            assert.equal(awaited.value.kind, "varRef"); assert.equal(awaited.value.localId, parameter.localId);
+            assert.deepEqual(awaited.value.type, parameter.type);
+            const log = only(collect(handler.catchBody, node => node.kind === "intrinsic" && node.name === "console.log"),
+              "caught log must stay inside catch body");
+            assert.ok(collect(log.args, node => node.kind === "strLit" && node.value === "caught").length === 1);
+            const queueOwners = program.functions.filter(fn => collect(fn.body, node => node === queue).length);
+            const queueOwner = own(only(queueOwners, "native microtask owner"));
+            if (spec.macrotask) {
+              const outer = only(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.setImmediate" &&
+                node.args[0]?.kind === "closure" && node.args[0].fnName === queueOwner.name), "outer native macrotask");
+              assert.equal(callback(outer), queueOwner); chain.unshift(queueOwner);
+            }
+            const reachable = new Set(), roots = [programEntry];
+            while (roots.length) {
+              const fn = roots.pop(); if (reachable.has(fn.name)) continue; reachable.add(fn.name);
+              for (const node of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
+                const name = node.kind === "call" ? node.callee : node.fnName;
+                if (functions.has(name)) roots.push(functions.get(name));
+              }
+            }
+            for (const fn of [queueOwner, ...chain]) assert.ok(reachable.has(fn.name), "detached callback chain");
+            // Follow native helper and closure edges too: a nested delegate cannot hide a Node callback.
+            const visited = new Set(), pending = [...chain];
+            while (pending.length) {
+              const fn = pending.pop(); if (visited.has(fn.name)) continue; visited.add(fn.name);
+              assert.equal(collect(fn.body, islandCall).length, 0, "callback chain delegates to Node");
+              for (const node of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
+                const name = node.kind === "call" ? node.callee : node.fnName;
+                if (functions.has(name)) pending.push(functions.get(name));
+              }
+            }
+            return { status: "passed", startupRefusalAbsent: true, reachableFunctions: [...reachable].sort(), irVersion: program.irVersion, commonJsEntry: program.commonJsEntry ?? false,
+              rejectionType: rejected[0].type, queueOwner: queueOwner.name, microtask: micro.name,
+              nextTick: spec.directCatch ? null : catchOwner.name, catchClosure: caught.name,
+              awaitParameter: { localId: parameter.localId, type: parameter.type }, callbackFunctions: [...visited].sort(),
+              islandCalls: islands.map(node => node.fn), shippedFiles: program.nodeIsland?.modules?.files ?? [],
+              functions: program.functions.map(fn => ({ name: fn.name, sourceName: fn.sourceName ?? null,
+                file: fn.loc?.file ?? null, statements: fn.body.length })) };
+          };
+          const sourceFiles = [
+            "packages/compiler/src/index.ts",
+            "packages/compiler/src/cli/command.ts",
+            "packages/compiler/src/diagnostics/diagnostic.ts",
+            "packages/compiler/src/executable/prepare.ts",
+            "packages/compiler/src/frontend/pipeline.ts",
+            "packages/compiler/src/frontend/lowering/lowerer.ts",
+            "packages/compiler/src/frontend/lowering/lower-calls.ts",
+            "packages/compiler/src/frontend/lowering/lower-exprs.ts",
+            "packages/compiler/src/frontend/lowering/lower-timers.ts",
+            "packages/compiler/src/frontend/lowering/builtins/process.ts",
+            "packages/compiler/src/frontend/lowering/lower-node-island.ts",
+            "packages/compiler/src/frontend/lowering/lower-modules.ts",
+            "packages/compiler/src/ir/ir.ts",
+            "packages/compiler/src/ir/serialize.ts",
+            "packages/compiler/src/backend/runtime-abi.ts",
+            "packages/compiler/src/backend/llvm/emit-module.ts",
+            "packages/compiler/src/backend/llvm/lib-shared.ts",
+            "packages/compiler/src/backend/llvm/lib-dispatch.ts",
+            "packages/compiler/src/node-islands/modules.ts",
+            "packages/compiler/src/node-islands/policy.ts",
+            "packages/compiler/src/node-islands/snapshot.ts",
+            "packages/compiler/src/node-islands/libnode-pack.ts",
+            "packages/runtime/src/scr_async.c",
+            "packages/runtime/src/scr_async.h",
+            "packages/runtime/src/scr_async_dyn.c",
+            "packages/runtime/src/scr_node_island.c",
+            "packages/runtime/src/scr_node_island_boot.c",
+            "packages/libnode-common/dev-pack.json",
+            "packages/libnode-common/fetch-dev-pack.mjs",
+            "packages/libnode-common/build-pack.mjs",
+            "packages/libnode-common/bridge/scr_node_bridge.cc",
+            "packages/runtime/src/scr_node_bridge.h",
+            "native/llvm-codegen/src/target.h",
+            "native/llvm-codegen/src/main.cpp",
+            "packages/compiler/src/backend/native-codegen-core.ts",
+            "tests/harness/node-island-order.test.ts",
+            "pnpm-lock.yaml"
+          ];
+          const source = () => {
+            assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("source-status", "git", ["status", "--porcelain"]), "");
+            requireSuccess(execute("source-diff", "git", ["diff", "--exit-code", "HEAD"]));
+            return Object.fromEntries(sourceFiles.map(file => [file, hash(file)]));
+          };
+          const moduleFiles = base => readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(entry => {
+            const path = join(base, entry.name), info = lstatSync(path);
+            assert.ok(!info.isSymbolicLink());
+            if (info.isDirectory()) return moduleFiles(path).map(file => ({ ...file, path: entry.name + "/" + file.path }));
+            assert.ok(info.isFile()); return [{ path: entry.name, bytes: info.size, sha256: hash(path) }];
+          });
+          // One shared definition digest binds body(), the case table, and the authored files-map construction.
+          // The fixture manifest below binds each expanded file and expected output separately.
+          const specs = [
+            {
+              "id": "native-next-tick",
+              "hosted": false,
+              "macrotask": false,
+              "directCatch": false,
+              "files": {
+                "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false}}}",
+                "main.ts": "const pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  process.nextTick(() => {\n    console.log(\"tick\");\n    pending.catch(() => console.log(\"caught\"));\n  });\n});\nsetImmediate(() => console.log(\"done\"));\n"
+              },
+              "expected": "microtask\ntick\ncaught\ndone\n",
+              "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
+              "fixtureSource": "authored-uncommitted",
+              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
+              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
+              "transform": "exact authored case construction; no fixture source rewrite"
+            },
+            {
+              "id": "hosted-next-tick",
+              "hosted": true,
+              "macrotask": false,
+              "directCatch": false,
+              "files": {
+                "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
+                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  process.nextTick(() => {\n    console.log(\"tick\");\n    pending.catch(() => console.log(\"caught\"));\n  });\n});\nsetImmediate(() => console.log(\"done\"));\n",
+                "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
+                "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
+                "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
+              },
+              "expected": "island ready\nmicrotask\ntick\ncaught\ndone\n",
+              "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
+              "fixtureSource": "authored-uncommitted",
+              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
+              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
+              "transform": "exact authored case construction; no fixture source rewrite"
+            },
+            {
+              "id": "hosted-macrotask-next-tick",
+              "hosted": true,
+              "macrotask": true,
+              "directCatch": false,
+              "files": {
+                "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
+                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nsetImmediate(() => {\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  process.nextTick(() => {\n    console.log(\"tick\");\n    pending.catch(() => console.log(\"caught\"));\n  });\n});\nsetImmediate(() => console.log(\"done\"));\n});\n",
+                "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
+                "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
+                "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
+              },
+              "expected": "island ready\nmicrotask\ntick\ncaught\ndone\n",
+              "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
+              "fixtureSource": "authored-uncommitted",
+              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
+              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
+              "transform": "exact authored case construction; no fixture source rewrite"
+            },
+            {
+              "id": "hosted-direct-catch",
+              "hosted": true,
+              "macrotask": false,
+              "directCatch": true,
+              "files": {
+                "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
+                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  pending.catch(() => console.log(\"caught\"));\n});\nsetImmediate(() => console.log(\"done\"));\n",
+                "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
+                "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
+                "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
+              },
+              "expected": "island ready\nmicrotask\ncaught\ndone\n",
+              "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
+              "fixtureSource": "authored-uncommitted",
+              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
+              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
+              "transform": "exact authored case construction; no fixture source rewrite"
+            }
+          ];
+          const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
+          for (const spec of specs) {
+            const dir = join(fixtures, spec.id); mkdirSync(dir);
+            for (const [file, contents] of Object.entries(spec.files)) {
+              mkdirSync(dirname(join(dir, file)), { recursive: true }); writeFileSync(join(dir, file), contents);
+            }
+            writeFileSync(join(dir, "expected.stdout.log"), spec.expected);
+          }
+          const fixtureManifest = moduleFiles(fixtures);
+          report.fixtureManifest = fixtureManifest; report.fixtureDigest = digest(JSON.stringify(fixtureManifest));
+          const verifyFixtures = () => assert.deepEqual(moduleFiles(fixtures), fixtureManifest);
+          const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
+          let verifyNativeInputs = null;
+          save();
+          try {
+            assert.equal(report.fixtureDigest, "56ef3aa79d352b345c681499710c79e145ad93a31daa3ae7b03fcd2686229a65", "authored fixture bytes changed");
+            report.sourceInputs = source(); report.sourceVerifiedBefore = true;
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
+            report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
+            assert.deepEqual(report.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
+            requireSuccess(execute("verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]));
+            report.runtimeManifestSha256 = hash("packages/runtime-linux-x64-gnu/runtime-pack.json");
+            copyFileSync("packages/runtime-linux-x64-gnu/runtime-pack.json", join(out, "runtime-pack.json"));
+            report.build = execute("workspace-build", "pnpm", ["build"], 600); requireSuccess(report.build);
+            report.helper = JSON.parse(capture("helper", "packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+            assert.equal(report.helper.ok, true);
+            report.helperBinarySha256 = hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen");
+            assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
+            assert.equal(report.helper.scriptc_package_version, JSON.parse(readFileSync("packages/llvm-linux-x64-gnu/package.json", "utf8")).version);
+            const toolIdentity = (name, command) => {
+              const path = realpathSync(capture(name + "-path", "sh", ["-c", 'command -v "$1"', "diagnostic", command]));
+              return { command, path, sha256: hash(path), version: capture(name + "-version", command, ["--version"]) };
+            };
+            const cxx = process.env.CXX || "g++";
+            report.bridgeBuild = {
+              kind: "independent-reproduction", sharedPack: false, crossRevisionByteIdentity: "not-assumed",
+              compiler: toolIdentity("bridge-cxx", cxx), strip: toolIdentity("bridge-strip", "strip"),
+              linker: toolIdentity("bridge-linker", capture("bridge-linker-name", cxx, ["-print-prog-name=ld"])),
+              compilerTarget: capture("bridge-cxx-target", cxx, ["-dumpmachine"]),
+              image: { os: process.env.ImageOS, version: process.env.ImageVersion },
+              buildRecipe: "packages/libnode-common/build-pack.mjs:66", source: "packages/libnode-common/bridge/scr_node_bridge.cc",
+              sourceSha256: report.sourceInputs["packages/libnode-common/bridge/scr_node_bridge.cc"],
+              pinnedLibnodeSha256: "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838",
+            };
+            const packRoot = join(work, "libnode");
+            requireSuccess(execute("fetch-libnode", process.execPath, ["packages/libnode-common/fetch-dev-pack.mjs", "--out", packRoot], 600));
+            const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
+            const pack = readLibnodePack(packRoot, { verifyHashes: true });
+            assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
+            assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
+            report.libnode = { manifest: pack.manifest, manifestSha256: hash(join(packRoot, "manifest.json")) };
+            report.bridgeBuild.currentBridgeSha256 = pack.manifest.files[pack.manifest.bridge].sha256;
+            report.bridgeBuild.currentLibnodeSha256 = pack.manifest.files[pack.manifest.libnode].sha256;
+            assert.equal(report.bridgeBuild.currentLibnodeSha256, report.bridgeBuild.pinnedLibnodeSha256);
+            report.nodeBinary = { path: realpathSync(process.execPath), sha256: hash(realpathSync(process.execPath)) };
+            copyFileSync(join(packRoot, "manifest.json"), join(out, "libnode-pack.json"));
+            verifyNativeInputs = () => {
+              requireSuccess(execute("verify-runtime-after", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]));
+              assert.equal(hash("packages/runtime-linux-x64-gnu/runtime-pack.json"), report.runtimeManifestSha256);
+              assert.equal(hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen"), report.helperBinarySha256);
+              assert.equal(hash(report.nodeBinary.path), report.nodeBinary.sha256);
+              assert.deepEqual(readLibnodePack(packRoot, { verifyHashes: true }).manifest, pack.manifest);
+              for (const tool of [report.bridgeBuild.compiler, report.bridgeBuild.strip, report.bridgeBuild.linker])
+                assert.equal(hash(tool.path), tool.sha256);
+              report.nativeInputsVerifiedAfter = true;
+            };
+            for (const spec of specs) {
+              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, hosted: spec.hosted, macrotask: spec.macrotask, directCatch: spec.directCatch, fixtureSourceSha256: spec.fixtureSourceSha256, expectedStdoutSha256: digest(spec.expected), flavors: {} };
+              report.cases.push(observed);
+              const dir = join(fixtures, spec.id), entry = join(dir, "main.ts");
+              const artifacts = join(out, spec.id); mkdirSync(artifacts);
+              verifyFixtures();
+              try {
+                observed.oracle = execute(spec.id + "-node", process.execPath, [entry], 30, { SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.oracle.attempted = observed.oracle.status !== "tool-error";
+                observed.oracle.parityOutcome = parityOutcome(observed.oracle);
+                observed.oracle.expectedMatched = observed.oracle.status === "completed" &&
+                  observed.oracle.stdoutSha256 === digest(spec.expected) && observed.oracle.stderrBytes === 0;
+              } catch (error) { observed.oracleError = scrub(error.stack ?? error); }
+              const common = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics", "--node-islands=explicit"];
+              const irPath = join(artifacts, "program.ir.json"), irCache = join(work, spec.id + "-ir-cache"); mkdirSync(irCache, { mode: 0o700 });
+              observed.ir = { status: "running", attempted: false };
+              try {
+                observed.ir.compile = execute(spec.id + "-ir", process.execPath, [...common, "--emit=ir", "-o", irPath], 180,
+                  { SCRIPTC_CACHE_DIR: irCache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.ir.attempted = observed.ir.compile.status !== "tool-error";
+                if (existsSync(irPath)) observed.ir.artifact = recordFile(irPath);
+                assert.ok(validateCompile(observed.ir.compile, entry, irPath, spec), "IR compilation or diagnostics failed");
+                assert.ok(observed.ir.artifact, "successful IR build did not produce its artifact");
+                observed.ir.ownership = irEvidence(JSON.parse(readFileSync(irPath, "utf8")), spec, entry);
+                observed.ir.status = "passed";
+              } catch (error) { observed.ir.status = "failed"; observed.ir.error = scrub(error.stack ?? error); }
+              finally { save(); }
+              for (const flavor of ["plain", "san"]) {
+                const result = observed.flavors[flavor] = { status: "running", execution: { status: "not-executed", attempted: false }, parity: "not-compared" };
+                const build = join(work, spec.id + "-" + flavor); mkdirSync(build);
+                const binary = join(build, "program"), cache = join(build, "cache"); mkdirSync(cache, { mode: 0o700 });
+                const env = { SCRIPTC_CACHE_DIR: cache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: spec.hosted ? packRoot : "", ASAN_OPTIONS: "detect_leaks=0" };
+                try {
+                  const args = [...common, "-o", binary, "--keep-llvm", ...(spec.hosted ? ["--libnode=beside"] : []), ...(flavor === "san" ? ["--sanitize"] : [])];
+                  result.compile = execute(spec.id + "-" + flavor + "-compile", process.execPath, args, 300, env);
+                  // The compiler retains LLVM by entry stem, not executable name.
+                  if (existsSync(join(build, "main.ll"))) {
+                    const llvm = join(artifacts, flavor + ".ll"); copyFileSync(join(build, "main.ll"), llvm); result.llvm = recordFile(llvm);
+                  }
+                  assert.ok(validateCompile(result.compile, entry, binary, spec), "native compilation or diagnostics failed");
+                  result.execution = { status: "blocked-before-execution", attempted: false };
+                  assert.equal(observed.ir.status, "passed", "native execution requires admitted IR");
+                  assert.ok(result.llvm, "successful native build did not retain LLVM");
+                  const llvmText = readFileSync(join(out, result.llvm.path), "utf8");
+                  const modules = binary + ".libnode/modules";
+                  const verifyDeployment = () => {
+                    if (spec.hosted) {
+                      const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
+                      assert.deepEqual(beside.manifest, pack.manifest);
+                      const expected = Object.keys(spec.files).filter(file => file.startsWith("node_modules/")).sort();
+                      const shipped = moduleFiles(modules);
+                      assert.deepEqual(shipped.map(file => file.path).sort(), expected);
+                      for (const file of shipped) {
+                        assert.equal(file.bytes, Buffer.byteLength(spec.files[file.path]));
+                        assert.equal(file.sha256, digest(spec.files[file.path]));
+                      }
+                      if (result.moduleFiles) assert.deepEqual(shipped, result.moduleFiles);
+                      else result.moduleFiles = shipped;
+                    } else {
+                      assert.equal(existsSync(binary + ".libnode"), false, "native-only build deployed libnode");
+                      assert.ok(!/call void @scr_node_island_install(?:_modules)?\(/.test(llvmText), "native-only LLVM installs Node modules");
+                      assert.ok(!/@scr_ni_/.test(llvmText), "native-only LLVM calls the Node bridge");
+                    }
+                  };
+                  verifyDeployment(); result.deploymentVerified = true;
+                  result.moduleOwners = { entry: "native", callbackChain: "native", islands: spec.hosted ? ["checkpoint-host"] : [] };
+                  result.binarySha256 = hash(binary);
+                  if (spec.hosted) {
+                    const manifestCopy = join(artifacts, flavor + ".libnode-manifest.json");
+                    copyFileSync(binary + ".libnode/manifest.json", manifestCopy); result.libnodeManifest = recordFile(manifestCopy);
+                  }
+                  result.execution = execute(spec.id + "-" + flavor + "-run", binary, [], 30, { ...env, SCRIPTC_LIBNODE: "" });
+                  result.execution.attempted = result.execution.status !== "tool-error";
+                  result.execution.parityOutcome = parityOutcome(result.execution, flavor === "san");
+                  const expectedOutcome = observed.oracle?.parityOutcome, actualOutcome = result.execution.parityOutcome;
+                  result.parity = observed.oracle?.expectedMatched && expectedOutcome && result.execution.status === "completed" &&
+                    actualOutcome.code === expectedOutcome.code && actualOutcome.signal === expectedOutcome.signal &&
+                    actualOutcome.stdoutSha256 === expectedOutcome.stdoutSha256 && actualOutcome.stderrSha256 === expectedOutcome.stderrSha256 ? "matched" : "mismatch";
+                  assert.equal(hash(binary), result.binarySha256);
+                  verifyDeployment();
+                  verifyFixtures();
+                  result.inputsVerifiedAfter = true;
+                  assert.ok(result.llvm, "successful native build did not retain LLVM");
+                  assert.equal(result.parity, "matched"); result.status = "passed";
+                } catch (error) { result.status = "failed"; result.error = scrub(error.stack ?? error); }
+                finally { save(); }
+              }
+              observed.complete = completeCase(observed); save();
+            }
+            report.executionAttempts = report.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
+            report.diagnosticComplete = report.cases.length === specs.length && report.cases.every(item => item.complete);
+            report.diagnosticComplete &&= report.executionAttempts === report.expectedExecutionAttempts;
+            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item =>
+              ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed" && item.flavors[flavor].parity === "matched"));
+            report.status = report.qualificationComplete ? "passed" : "failed";
+          } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
+          finally {
+            try { assert.ok(verifyNativeInputs, "native preparation was incomplete"); verifyNativeInputs(); assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true; }
+            catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.sourceError = scrub(error.stack ?? error); }
+            report.finishedAt = new Date().toISOString(); save();
+            writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
+            console.log(JSON.stringify({ label: report.label, status: report.status, diagnosticComplete: report.diagnosticComplete, qualificationComplete: report.qualificationComplete }));
+            if (!report.qualificationComplete) { console.error("[native-rejection-checkpoint-diagnostic] FAILED (exit 1)"); process.exitCode = 1; }
+          }
+          PROOF
+          ulimit -c 0
+          node "$RUNNER_TEMP/native-rejection-checkpoint-diagnostic.mjs"
+      - name: Remove this diagnostic's build scratch
+        if: always()
+        run: |
+          node --input-type=module <<'CLEANUP'
+          import assert from "node:assert/strict";
+          import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const temp = process.env.RUNNER_TEMP, work = join(temp, "native-rejection-checkpoint-work"), out = join(temp, "native-rejection-checkpoint-proof");
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          const receipt = { ...owner, work: "absent", payload: "absent" };
+          try {
+            if (existsSync(work)) {
+              assert.deepEqual(JSON.parse(readFileSync(join(work, ".diagnostic-owner.json"), "utf8")), owner);
+              rmSync(work, { recursive: true }); receipt.work = "removed";
+            }
+            const payload = join(temp, "native-rejection-checkpoint-diagnostic.mjs");
+            if (existsSync(payload)) { rmSync(payload); receipt.payload = "removed"; }
+          } catch (error) { receipt.error = String(error); process.exitCode = 1; }
+          finally {
+            mkdirSync(out, { recursive: true });
+            writeFileSync(join(out, "cleanup.json"), JSON.stringify(receipt, null, 2) + "\n");
+            if (process.exitCode) console.error("[native-rejection-checkpoint-cleanup] FAILED (exit 1)");
+          }
+          CLEANUP
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-rejection-checkpoint-integrated
+          path: ${{ runner.temp }}/native-rejection-checkpoint-proof
+          if-no-files-found: error
+          retention-days: 1
