@@ -1,0 +1,638 @@
+name: Qualify Darwin shard debug identity
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-darwin-shard-debug-identity.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-darwin-shard-debug-identity-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 38c118b415f9079f3ed55b539ff0dfdf3f768f5b
+
+jobs:
+  qualify:
+    if: github.repository == 'vincentkoc/scriptc'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: darwin-arm64
+          - os: ubuntu-24.04
+            target: linux-x64-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    env:
+      PROOF_CAPACITY_NAME: shard-debug-capacity
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          git cat-file -e 22491ba63ed59a04d6172c0f7e4575caa4efd746:packages/compiler/src/backend/llvm/split.ts
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+      - name: Prepare owned proof runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/shard-debug-runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { basename, join, relative } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self = fileURLToPath(import.meta.url), root = process.cwd();
+          const out = join(process.env.RUNNER_TEMP ?? "/tmp", "shard-debug-proof");
+          const work = join(process.env.RUNNER_TEMP ?? "/tmp", "shard-debug-work");
+          const head = process.env.SOURCE_SHA, base = "22491ba63ed59a04d6172c0f7e4575caa4efd746";
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: head, platform: process.platform };
+          const splitPath = "packages/compiler/src/backend/llvm/split.ts";
+          const fixture = "tests/fixtures/three/procedural-geometry.mjs";
+          const CAP = 16 * 1024 * 1024;
+          const expected = {"darwin":{"packages/compiler/src/backend/llvm/split.test.ts":{"names":["splits generated LLVM functions and promotes only private cross-shard definitions","thread-local definitions and declarations preserve their storage model across shards","private unnamed_addr lookup tables are promoted like internal globals","aggregate initializers over several lines stay whole in the globals shard","globals after the attributes and metadata join the globals shard","a module split from its file has the shards of the same module split in memory","split and merged native modules keep globals independent on concurrent threads","shared metadata bounds shard growth while preserving every definition","merged debug maps retain authored and generated functions in their defining shards","shard CUs have distinct physical identities and preserve authored metadata","unrecognized debug file forms retain the canonical module fallback","debug metadata stays on definitions when splitting LLVM modules","personality routines stay on definitions when splitting LLVM modules","dev libraries split at the measured 2MB crossover while executables retain 4MB","every shard compiles and its merged object exposes only canonical public definitions"],"skipped":[]},"packages/compiler/test/source-debugging.test.ts":{"names":["dev llvm builds preserve source breakpoints across cache hits","dev LLVM object and assembly outputs carry source locations","dev code generation preserves control flow: 800-switch-basics.ts","dev code generation preserves control flow: 1021-async-ordering.ts","dev code generation preserves control flow: 1452-return-through-finally.ts","dev code generation preserves control flow: 2013-generators-sent-values.ts","dev code generation preserves control flow: 603-closures-rc-stress.ts"],"skipped":[]},"packages/compiler/test/native-partitions.test.ts":{"names":["LLVM program partitions opt-level 2 partitions link deterministically and reuse unchanged partitions","LLVM program partitions opt-level 0 partitions link deterministically and reuse unchanged partitions","LLVM program partitions an internal function that other partitions reach through an import keeps its name across edits","LLVM program partitions split code generation links deterministically and defines every function once","LLVM program partitions split code generation keeps local a definition that only its own part uses","LLVM program partitions split code generation links a thread-local global that only one part uses","LLVM program partitions split code generation keeps a module that one function dominates whole","LLVM program partitions an optimized module whose largest partition would hold most of its function text is optimized whole","LLVM program partitions split code generation requires several optimized outputs and no cache","LLVM program partitions in a small module, a function that one function of another source file calls shares its partition","LLVM program partitions functions under one group line share a partition","LLVM program partitions internal definitions nothing reaches are left out of every partition","LLVM program partitions a helper that one function uses goes to that function's partition","LLVM program partitions a function that its referrer only takes the address of is placed by its own name","LLVM program partitions a fallback body that its referrer calls is placed by its own name","LLVM program partitions functions are balanced over a few partitions, and a small edit keeps their places","LLVM program partitions the entry line gives the top-level code and its chain a partition of their own","LLVM program partitions a small helper that an edit adds moves no other function","LLVM program partitions small helpers spread when one partition is left below the cap","LLVM program partitions a table written one element per line keeps the text partitioner and its reuse","LLVM program partitions inputs outside the text partitioner's grammar are still partitioned","LLVM program partitions unoptimized debug metadata follows each physical partition","LLVM program partitions optimized debug metadata follows each physical partition","LLVM program partitions parsed fallback debug metadata follows each physical partition","LLVM program partitions split codegen debug metadata follows each physical partition","LLVM program partitions without source path debug metadata follows each physical partition"],"skipped":["LLVM program partitions an x86-64-v3 copy shares its baseline copy's partition and takes its code unless it has wider vectors"]},"packages/compiler/src/native/cache.test.ts":{"names":["a file's digest read in blocks is the digest of its bytes","cache hits require an intact payload and digest","text parts publish one digest-checked entry and oversized reads are misses","text parts written by content are named by their digest and read back only intact","a failed cache publication does not fail the build or replace unrelated files","eviction removes oldest complete entries and leaves unrelated paths alone","eviction also ages helper partition entries","private-directory admission and cache disable options fail closed"],"skipped":[]},"packages/compiler/src/native/executable-cache.test.ts":{"names":["restores a complete executable and its debug information (false)","restores a complete executable and its debug information (true)","invalidates runtime replacement even with restored size and mtime","invalidates library replacement even with restored size and mtime","adding a new SDK library search candidate invalidates the previous link","a library search change during tracing prevents publication","retargeting an input symlink invalidates the previous link","corrupt executable payloads are misses","corrupt binary payloads are misses","corrupt dsym payloads are misses","invalid cache metadata is rejected even with a matching integrity digest","changing an input during emission prevents cache publication","metadata cannot omit a required runtime input","a failed or empty link trace cannot publish a completed executable","a Linux key's first link records the linker, startup objects and libc; replacing the ld misses","a Linux key's first link records the linker, startup objects and libc; replacing the crt misses","a Linux key's first link records the linker, startup objects and libc; replacing the libc misses","a Linux build whose output changed links again, and then stores the executable","a Linux build that keeps its output does not read the deferred inputs","a Linux link that runs as its linker job is traced from the job's run, and otherwise records it"],"skipped":[]},"packages/compiler/src/executable/executable-cache.test.ts":{"names":["early executable cache restores the emitted TU, IR, and native feature gates","early dev cache restores the matching dSYM and rejects a missing payload","early executable cache preserves worker runtime selection when only frontend output restores","early executable cache misses on source and resolution changes","early executable keys isolate compile modes, paths, implementation, checker, function layouts, shape inference, and FFI manifests","speed entries round-trip their posture and stay isolated from release and dev","early executable cache rejects corruption and refreshes payload LRU times","early executable cache restores a validated final binary","routed executable hits require an unchanged compiler implementation proof","native dependency validation rejects malformed cache data","missing and disabled routes skip deferred native driver discovery","source misses skip deferred driver discovery and preserve caller outputs","payload misses skip deferred driver discovery and preserve caller outputs","frontend-only misses skip deferred driver discovery and preserve caller outputs","a deferred driver fingerprint is checked once before restoring a routed hit","environment changes during deferred discovery refuse restoration","failure changes during deferred discovery refuse restoration","source changes during deferred discovery refuse restoration","declarations changes during deferred discovery refuse restoration","implementation changes during deferred discovery refuse restoration","native changes during deferred discovery refuse restoration","a stale implementation proof refuses a deferred routed hit","a stale native proof refuses a deferred routed hit","a stale declarations proof refuses a deferred routed hit","a stale resolution proof refuses a deferred routed hit","the route index still isolates eager and deferred native environments","a recorded native build is found by its invocation"],"skipped":[]},"packages/compiler/src/backend/native-toolchain.test.ts":{"names":["LLVM library shards reuse unaffected program objects after a localized edit","LLVM executable dev shards reuse unaffected program objects after a localized edit"],"skipped":[]}},"linux":{"packages/compiler/src/backend/llvm/split.test.ts":{"names":["splits generated LLVM functions and promotes only private cross-shard definitions","thread-local definitions and declarations preserve their storage model across shards","private unnamed_addr lookup tables are promoted like internal globals","aggregate initializers over several lines stay whole in the globals shard","globals after the attributes and metadata join the globals shard","a module split from its file has the shards of the same module split in memory","split and merged native modules keep globals independent on concurrent threads","shared metadata bounds shard growth while preserving every definition","shard CUs have distinct physical identities and preserve authored metadata","unrecognized debug file forms retain the canonical module fallback","debug metadata stays on definitions when splitting LLVM modules","personality routines stay on definitions when splitting LLVM modules","dev libraries split at the measured 2MB crossover while executables retain 4MB","every shard compiles and its merged object exposes only canonical public definitions"],"skipped":["merged debug maps retain authored and generated functions in their defining shards"]},"packages/compiler/test/source-debugging.test.ts":{"names":["dev code generation preserves control flow: 800-switch-basics.ts","dev code generation preserves control flow: 1021-async-ordering.ts","dev code generation preserves control flow: 1452-return-through-finally.ts","dev code generation preserves control flow: 2013-generators-sent-values.ts","dev code generation preserves control flow: 603-closures-rc-stress.ts"],"skipped":["dev llvm builds preserve source breakpoints across cache hits","dev LLVM object and assembly outputs carry source locations"]},"packages/compiler/test/native-partitions.test.ts":{"names":["LLVM program partitions opt-level 2 partitions link deterministically and reuse unchanged partitions","LLVM program partitions opt-level 0 partitions link deterministically and reuse unchanged partitions","LLVM program partitions an internal function that other partitions reach through an import keeps its name across edits","LLVM program partitions split code generation links deterministically and defines every function once","LLVM program partitions split code generation keeps local a definition that only its own part uses","LLVM program partitions split code generation links a thread-local global that only one part uses","LLVM program partitions split code generation keeps a module that one function dominates whole","LLVM program partitions an optimized module whose largest partition would hold most of its function text is optimized whole","LLVM program partitions split code generation requires several optimized outputs and no cache","LLVM program partitions in a small module, a function that one function of another source file calls shares its partition","LLVM program partitions functions under one group line share a partition","LLVM program partitions an x86-64-v3 copy shares its baseline copy's partition and takes its code unless it has wider vectors","LLVM program partitions internal definitions nothing reaches are left out of every partition","LLVM program partitions a helper that one function uses goes to that function's partition","LLVM program partitions a function that its referrer only takes the address of is placed by its own name","LLVM program partitions a fallback body that its referrer calls is placed by its own name","LLVM program partitions functions are balanced over a few partitions, and a small edit keeps their places","LLVM program partitions the entry line gives the top-level code and its chain a partition of their own","LLVM program partitions a small helper that an edit adds moves no other function","LLVM program partitions small helpers spread when one partition is left below the cap","LLVM program partitions a table written one element per line keeps the text partitioner and its reuse","LLVM program partitions inputs outside the text partitioner's grammar are still partitioned","LLVM program partitions unoptimized debug metadata follows each physical partition","LLVM program partitions optimized debug metadata follows each physical partition","LLVM program partitions parsed fallback debug metadata follows each physical partition","LLVM program partitions split codegen debug metadata follows each physical partition","LLVM program partitions without source path debug metadata follows each physical partition"],"skipped":[]},"packages/compiler/src/native/cache.test.ts":{"names":["a file's digest read in blocks is the digest of its bytes","cache hits require an intact payload and digest","text parts publish one digest-checked entry and oversized reads are misses","text parts written by content are named by their digest and read back only intact","a failed cache publication does not fail the build or replace unrelated files","eviction removes oldest complete entries and leaves unrelated paths alone","eviction also ages helper partition entries","private-directory admission and cache disable options fail closed"],"skipped":[]},"packages/compiler/src/native/executable-cache.test.ts":{"names":["restores a complete executable and its debug information (false)","restores a complete executable and its debug information (true)","invalidates runtime replacement even with restored size and mtime","invalidates library replacement even with restored size and mtime","adding a new SDK library search candidate invalidates the previous link","a library search change during tracing prevents publication","retargeting an input symlink invalidates the previous link","corrupt executable payloads are misses","corrupt binary payloads are misses","corrupt dsym payloads are misses","invalid cache metadata is rejected even with a matching integrity digest","changing an input during emission prevents cache publication","metadata cannot omit a required runtime input","a failed or empty link trace cannot publish a completed executable","a Linux key's first link records the linker, startup objects and libc; replacing the ld misses","a Linux key's first link records the linker, startup objects and libc; replacing the crt misses","a Linux key's first link records the linker, startup objects and libc; replacing the libc misses","a Linux build whose output changed links again, and then stores the executable","a Linux build that keeps its output does not read the deferred inputs","a Linux link that runs as its linker job is traced from the job's run, and otherwise records it"],"skipped":[]},"packages/compiler/src/executable/executable-cache.test.ts":{"names":["early executable cache restores the emitted TU, IR, and native feature gates","early dev cache restores the matching dSYM and rejects a missing payload","early executable cache preserves worker runtime selection when only frontend output restores","early executable cache misses on source and resolution changes","early executable keys isolate compile modes, paths, implementation, checker, function layouts, shape inference, and FFI manifests","speed entries round-trip their posture and stay isolated from release and dev","early executable cache rejects corruption and refreshes payload LRU times","early executable cache restores a validated final binary","routed executable hits require an unchanged compiler implementation proof","native dependency validation rejects malformed cache data","missing and disabled routes skip deferred native driver discovery","source misses skip deferred driver discovery and preserve caller outputs","payload misses skip deferred driver discovery and preserve caller outputs","frontend-only misses skip deferred driver discovery and preserve caller outputs","a deferred driver fingerprint is checked once before restoring a routed hit","environment changes during deferred discovery refuse restoration","failure changes during deferred discovery refuse restoration","source changes during deferred discovery refuse restoration","declarations changes during deferred discovery refuse restoration","implementation changes during deferred discovery refuse restoration","native changes during deferred discovery refuse restoration","a stale implementation proof refuses a deferred routed hit","a stale native proof refuses a deferred routed hit","a stale declarations proof refuses a deferred routed hit","a stale resolution proof refuses a deferred routed hit","the route index still isolates eager and deferred native environments","a recorded native build is found by its invocation"],"skipped":[]},"packages/compiler/src/backend/native-toolchain.test.ts":{"names":["LLVM library shards reuse unaffected program objects after a localized edit","LLVM executable dev shards reuse unaffected program objects after a localized edit"],"skipped":[]}}};
+          const sourceFiles = ["packages/compiler/src/backend/llvm/split.test.ts","packages/compiler/test/source-debugging.test.ts","packages/compiler/test/native-partitions.test.ts","packages/compiler/src/native/cache.test.ts","packages/compiler/src/native/executable-cache.test.ts","packages/compiler/src/executable/executable-cache.test.ts","packages/compiler/src/backend/native-toolchain.test.ts","packages/compiler/src/backend/darwin-debug-map.test-support.ts","packages/compiler/src/backend/llvm/split.ts","packages/compiler/src/backend/llvm/debug-info.ts","packages/compiler/src/backend/native/executable.ts","packages/compiler/src/backend/debug-symbols.ts","packages/compiler/src/backend/native/session.ts","packages/compiler/src/backend/native-toolchain.ts","packages/compiler/src/native/toolchain.ts","packages/compiler/src/native/executable-cache.ts","packages/compiler/src/executable/executable-cache.ts","packages/compiler/src/index.ts","packages/compiler/src/backend/runtime-abi.ts","packages/compiler/src/backend/build-cache.ts","native/llvm-codegen/src/emit.cpp","native/llvm-codegen/CMakeLists.txt","tests/harness/three.test.ts","tests/fixtures/three/procedural-geometry.mjs","vitest.config.ts","pnpm-lock.yaml","pnpm-workspace.yaml","package.json",".node-version",".oxfmtrc.jsonc",".github/actions/native-packages/action.yml",".github/actions/llvm-linux/action.yml",".github/actions/zig/action.yml"];
+          const sourcePins = {"packages/compiler/src/backend/llvm/split.test.ts":"572d6841f087fbf4db87e564f90609d7bd4d13a708627eace456ddcaeca5eb66","packages/compiler/test/source-debugging.test.ts":"3399f43f626815f23f563582ef07aaae27bf897a0757d9ad34ae50d749c22a6c","packages/compiler/test/native-partitions.test.ts":"96353ab7473daf3670d37bcbfe0ce99b6668dc5bb496eabe46f2c7bdb6a05555","packages/compiler/src/native/cache.test.ts":"d67b33a0ec36b0c558a057649cd4b4f78010e3a80682a64b2fe3b2744928f19e","packages/compiler/src/native/executable-cache.test.ts":"caca978be6c617b3de7f30d0e2c41532855ad1047dd0151393c0a7da3647bc41","packages/compiler/src/executable/executable-cache.test.ts":"0c1316f3bda522b547ec2ac7ba7106beb69f35969592f41282bfb7875ab2fdb4","packages/compiler/src/backend/native-toolchain.test.ts":"fe3345e4d820a3251b4b6e63005c3e177ba072c84da97f5f204b47488054d5bc","packages/compiler/src/backend/darwin-debug-map.test-support.ts":"f864404a1648fb70f3cd9c26f521fda5e3253d60a88bbba40b77cac5bda3cbad","packages/compiler/src/backend/llvm/split.ts":"cda6cab0d2152c7813fe863a2593a765f94b2cfa70c35ba441b6fe18b87237f3","packages/compiler/src/backend/llvm/debug-info.ts":"1c9fc956e85b997d752f1b3fe9e4d1894f334261077b0b1170c5d5d5613a1e86","packages/compiler/src/backend/native/executable.ts":"d7ddb55fb19429a51294a850406ea34bf00c173e7262854bcf4f3c70b408fb7f","packages/compiler/src/backend/debug-symbols.ts":"979ae280386fc98ab75643e925e7067357b31d495b69026e960e2376c280bbb3","packages/compiler/src/backend/native/session.ts":"b82407816ed96933fee39c9cd5dd7f47bb0be6a4a025bd1841e7c3ca2baf56ce","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/compiler/src/native/toolchain.ts":"eb53dc69446c4ec17cd15953d3de446a06eb829d1f238e29869c8bdd50039fa1","packages/compiler/src/native/executable-cache.ts":"1ba740d0c663dd6267c37a1d820d11dfad289bd938dc5ccfc270a2b1c94c48b9","packages/compiler/src/executable/executable-cache.ts":"d11ff5645f26e1bd7644d3041c5040b527e0c3f8c9aafdd4bdb7ec40bd769722","packages/compiler/src/index.ts":"d41310098b22397b62ce0bbea07926f41a270c5f783f92549be72f90ab939184","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/build-cache.ts":"f4a3dfa56c1063cb1b5fd9642bd30af79e6727e51e6250b2de27b2a2448c33e2","native/llvm-codegen/src/emit.cpp":"ca7d0236f057ccaee0eaf159f70934be1cde16d7b59d01fb3334294adde525de","native/llvm-codegen/CMakeLists.txt":"9e73b8a0efdcd2465c6e99436316b278559b081b684dc2e5ba9b1ac1d9891e79","tests/harness/three.test.ts":"6260fb23d1f98752b201192db3a14e8c01f6c8419c9508a6d311c9962327c86a","tests/fixtures/three/procedural-geometry.mjs":"e6fa26f371d954d0f3473a649646234dfa455534646b319d3293fe979ade9615","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44",".oxfmtrc.jsonc":"39e3e80a4b4aaabdac8b12e5a56ebc6f130a99c271d8e0bc1965a68dff0b60fb",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed"};
+          const nativeExpected = {"count":1018,"sha256":"31c8522f2e1b6e6b68789f40436f65ebbe21e805f1df5380e314d2deb7431773"};
+          const mutationNames = ["shard CUs have distinct physical identities and preserve authored metadata", "merged debug maps retain authored and generated functions in their defining shards"];
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          const capture = (command, args = []) => {
+            const value = spawnSync(command, args, { cwd: root, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.error, undefined, command + " launcher failed"); assert.equal(value.status, 0, command + ": " + value.stderr);
+            return value.stdout.trim();
+          };
+          const escape = text => text.replace(/[.*+?^$()|[\]{}\\]/g, char => "\\" + char);
+          const normalize = text => text.replace(/^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext functions and may produce false positives in some cases!\n/gm, "");
+          function verifyWorkOwner() {
+            const info = lstatSync(work); assert.ok(info.isDirectory() && !info.isSymbolicLink()); assert.equal(info.mode & 0o777, 0o700);
+            assert.deepEqual(json(join(work, "owner.json")), owner);
+          }
+          function source() {
+            assert.equal(head, "38c118b415f9079f3ed55b539ff0dfdf3f768f5b"); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const tree = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]);
+            assert.equal(digest(tree), "be9f57d540035cb34d4066663324ff2abee173c8d4c88598f823e355d12c232d");
+            const pins = Object.fromEntries(sourceFiles.map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(pins, sourcePins);
+            return { head, clean: true, treeSha256: digest(tree), files: pins };
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const path = row.slice(row.indexOf("\t") + 1);
+              return path.startsWith("native/llvm-codegen/") || /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+)\//.test(path) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig)\//.test(path) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(path);
+            });
+            assert.equal(rows.length, nativeExpected.count); assert.equal(digest(rows.join("\n")), nativeExpected.sha256);
+            return { rows, sha256: digest(rows.join("\n")), disk: rows.map(row => { const path = row.split("\t")[1]; return { path, sha256: hash(join(root, path)) }; }) };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a,b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink()); if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile()); return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function nativeFiles(target) {
+            return ["packages/llvm-" + target + "/bin", "packages/runtime-" + target + "/artifacts"].flatMap(path => files(join(root, path)).map(row => ({ ...row, path: path + "/" + row.path })))
+              .concat([{ path: "packages/runtime-" + target + "/runtime-pack.json", sha256: hash(join(root, "packages/runtime-" + target + "/runtime-pack.json")) }]);
+          }
+          function tool(command, args = ["--version"]) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            const result = spawnSync(command, args, { encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(result.error, undefined); assert.equal(result.status, 0);
+            return { path, sha256: hash(path), version: (result.stdout + result.stderr).trim() };
+          }
+          function tools() {
+            const common = { node: tool(process.execPath), pnpm: tool("pnpm"), clang: tool("clang"), ld: tool("ld", process.platform === "darwin" ? ["-v"] : ["--version"]), nm: tool("nm") };
+            if (process.platform === "darwin") {
+              const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+              return { ...common, dsymutil: tool("dsymutil"), dwarfdump: tool("dwarfdump"), lldb: tool("lldb"),
+                sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]), settingsSha256: hash(join(sdk, "SDKSettings.json")) },
+                xcode: capture("xcodebuild", ["-version"]), developer: capture("xcode-select", ["-p"]), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+            }
+            return { ...common, llvm: tool("llvm-config", ["--version"]), zig: tool("zig", ["version"]), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+          }
+          function makeEnvironment(id, sanitize) {
+            const dir = join(work, id); mkdirSync(dir, { mode: 0o700 });
+            for (const name of ["cache", "tmp", "xdg"]) mkdirSync(join(dir, name), { mode: 0o700 });
+            return { SCRIPTC_SAN: sanitize ? "1" : "", SCRIPTC_TEST_WORKERS: "1", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1",
+              SCRIPTC_CACHE_DIR: join(dir, "cache"), TMPDIR: join(dir, "tmp"), XDG_CACHE_HOME: join(dir, "xdg") };
+          }
+          function verifyTests(data, collection, file, names, failure = false) {
+            assert.ok(Array.isArray(collection) && collection.length > 0);
+            const listed = collection.filter(row => row.file === file || row.file.endsWith("/" + file)).map(row => row.name.replaceAll(" > ", " "));
+            for (const name of names) assert.equal(listed.filter(value => value === name).length, 1, "missing/duplicate collected test");
+            assert.equal(data.testResults.length, 1); const suite = data.testResults[0];
+            assert.ok(suite.name === file || suite.name.endsWith("/" + file));
+            const rows = suite.assertionResults, selected = rows.filter(row => names.includes(row.fullName));
+            assert.equal(selected.length, names.length); assert.equal(new Set(selected.map(row => row.fullName)).size, names.length);
+            assert.deepEqual(selected.map(row => row.fullName).sort(), [...names].sort());
+            assert.ok(rows.filter(row => !names.includes(row.fullName)).every(row => ["pending", "skipped"].includes(row.status)), "unexpected execution");
+            assert.equal(data.numTotalTests, rows.length);
+            assert.equal(data.numFailedTestSuites, failure ? 1 : 0); assert.equal(data.numFailedTests, failure ? names.length : 0);
+            assert.equal(data.numPassedTests, failure ? 0 : names.length); assert.equal(data.success, !failure);
+            for (const row of selected) {
+              assert.equal(row.status, failure ? "failed" : "passed");
+              if (failure) {
+                assert.ok(row.failureMessages.length > 0);
+                const text = row.failureMessages.join("\n"); assert.match(text, /AssertionError/);
+                assert.match(text, /split\.test\.ts|darwin-debug-map\.test-support\.ts/);
+              }
+            }
+            return { names: selected.map(row => row.fullName), count: selected.length, expectedFailure: failure };
+          }
+          async function testGate(id, file, names, env, failure = false) {
+            const collect = join(out, id + ".collection.json"), result = join(out, id + ".json"), pattern = "^(?:" + names.map(escape).join("|") + ")$";
+            requireSuccess(await run(id + "-collect", "pnpm", ["exec", "vitest", "list", file, "-t", pattern, "--json=" + collect], 180, env));
+            const execution = await run(id, "pnpm", ["test", file, "-t", pattern, "--reporter=json", "--outputFile=" + result], 900, env);
+            requireSuccess({ ...execution, code: failure && execution.code === 1 ? 0 : execution.code });
+            return { id, execution, collection: record(collect), result: record(result), inventory: verifyTests(json(result), json(collect), file, names, failure) };
+          }
+          function restoreSplit() {
+            assert.ok(allDrained(), "restore refused: owned process custody unresolved");
+            const receiptPath = join(work, "mutation.json"); if (!existsSync(receiptPath)) return { required: false, restored: true };
+            const receipt = json(receiptPath), path = join(root, splitPath), backup = join(work, "candidate-split.ts");
+            assert.equal(hash(backup), receipt.candidate); assert.ok([receipt.candidate, receipt.baseline].includes(hash(path)), "unknown split bytes; retain scratch");
+            if (hash(path) === receipt.baseline) writeFileSync(path, readFileSync(backup));
+            assert.equal(hash(path), receipt.candidate); return { required: true, restored: true, candidate: receipt.candidate, baseline: receipt.baseline };
+          }
+          async function mutation() {
+            assert.equal(process.platform, "darwin");
+            const path = join(root, splitPath), candidate = readFileSync(path);
+            const value = spawnSync("git", ["show", base + ":" + splitPath], { cwd: root, timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.status, 0); const baseline = value.stdout;
+            assert.notEqual(digest(baseline), digest(candidate));
+            copyFileSync(path, join(work, "candidate-split.ts"));
+            writeFileSync(join(work, "mutation.json"), JSON.stringify({ candidate: digest(candidate), baseline: digest(baseline), base }));
+            const receipt = { base, path: splitPath, candidate: digest(candidate), baseline: digest(baseline), tests: mutationNames, restored: false };
+            save("mutation.json", receipt);
+            try {
+              writeFileSync(path, baseline); assert.equal(hash(path), receipt.baseline);
+              assert.equal(capture("git", ["diff", "--name-only"]), splitPath);
+              receipt.gate = await testGate("baseline-split-mutation", splitPath.replace(".ts", ".test.ts"), mutationNames, makeEnvironment("mutation", false), true);
+              receipt.observedAssertionFailures = 2;
+            } finally {
+              receipt.restore = restoreSplit(); receipt.restored = receipt.restore.restored;
+              save("mutation.json", receipt);
+            }
+            assert.equal(receipt.observedAssertionFailures, 2); return receipt;
+          }
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+          function retainWorkload(flavor) {
+            assert.ok(allDrained(), "capture requires drained groups");
+            const dir = join(work, "workload-" + flavor);
+            if (!existsSync(dir)) return { present: false };
+            const selected = readdirSync(dir).filter(name => name === "procedural-geometry" || name === "procedural-geometry.dSYM" || /^procedural-geometry\.(ll|ir\.json)$/.test(name)).flatMap(name => {
+              const path = join(dir, name), info = lstatSync(path); assert.ok(!info.isSymbolicLink());
+              return info.isDirectory() ? files(path, name + "/") : [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+            assert.ok(selected.reduce((sum, row) => sum + row.bytes, 0) <= 2 * 1024 ** 3, "workload artifact budget exceeded");
+            const dest = join(out, "three-" + flavor); mkdirSync(dest, { recursive: true });
+            for (const row of selected) {
+              const path = join(dest, row.path); mkdirSync(join(path, ".."), { recursive: true });
+              copyFileSync(join(dir, row.path), path); assert.equal(hash(path), row.sha256);
+            }
+            return { present: true, files: selected };
+          }
+          async function compileWorkload(flavor) {
+            const dir = join(work, "workload-" + flavor), env = makeEnvironment("workload-" + flavor, flavor === "san");
+            const output = join(dir, "procedural-geometry");
+            const built = await run("three-" + flavor + "-compile", "compile", [flavor], 1200, env); requireSuccess(built);
+            const attempt = json(join(out, "three-" + flavor + "-compile.json"));
+            assert.equal(attempt.compileCalls, 1); assert.equal(attempt.ok, true); assert.equal(attempt.runtimeExecuted, false);
+            const oracle = await run("three-" + flavor + "-node", process.execPath, ["--no-warnings", join(root, fixture)], 30, env);
+            const native = await run("three-" + flavor + "-native", output, [], 30, env);
+            requireSuccess(oracle); requireSuccess(native);
+            const read = receipt => ({ stdout: readFileSync(join(out, receipt.stdout.path), "utf8"), stderr: normalize(readFileSync(join(out, receipt.stderr.path), "utf8")), code: receipt.code, signal: receipt.signal });
+            assert.deepEqual(read(native), read(oracle), "three runtime parity");
+            const evidence = { flavor, compile: built, attempt, oracle, native, parity: true, normalization: "only anchored ASAN_SWAP" };
+            if (process.platform === "darwin") {
+              const dsym = output + ".dSYM", dwarf = join(dsym, "Contents/Resources/DWARF/procedural-geometry");
+              assert.ok(statSync(dwarf).size > 0); const rows = files(dsym);
+              const binaryUuid = await run("three-" + flavor + "-binary-uuid", "dwarfdump", ["--uuid", output], 30, env);
+              const dwarfUuid = await run("three-" + flavor + "-dsym-uuid", "dwarfdump", ["--uuid", dsym], 30, env);
+              requireSuccess(binaryUuid); requireSuccess(dwarfUuid);
+              const uuids = r => [...readFileSync(join(out, r.stdout.path), "utf8").matchAll(/^UUID: ([A-Fa-f0-9-]+) \(([^)]+)\)/gm)].map(m => [m[1].toLowerCase(), m[2]]);
+              assert.equal(uuids(binaryUuid).length, 1); assert.deepEqual(uuids(binaryUuid), uuids(dwarfUuid));
+              const debug = await run("three-" + flavor + "-breakpoint", "lldb", ["--batch", output, "-o", "breakpoint set --file procedural-geometry.mjs --line 11 --move-to-nearest-code false", "-o", "breakpoint list"], 60, env);
+              requireSuccess(debug); const text = readFileSync(join(out, debug.stdout.path), "utf8");
+              assert.ok(!text.includes("pending")); assert.match(text, /procedural-geometry\.mjs:11/);
+              evidence.debug = { binaryUuid, dwarfUuid, breakpoint: debug, dsym: rows };
+            }
+            evidence.artifacts = retainWorkload(flavor); return evidence;
+          }
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            if (process.argv[3] !== "compile") {
+              const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+              child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+              child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+              return;
+            }
+            const flavor = process.argv[4], dir = join(work, "workload-" + flavor);
+            const options = { outDir: dir, outPath: join(dir, "procedural-geometry"), backend: "llvm", npmStatic: ["three"], optimization: "dev", sanitize: flavor === "san" };
+            const attempt = { compileCalls: 0, options, entry: fixture, runtimeExecuted: false, ok: false };
+            try {
+              assert.ok(["plain", "san"].includes(flavor)); assert.equal(process.env.SCRIPTC_SAN, flavor === "san" ? "1" : "");
+              assert.equal(process.env.SCRIPTC_TEST_STABLE_TOOLCHAIN, "1");
+              const { prepareBuildCacheRoot } = await import(pathToFileURL(join(root, "packages/compiler/dist/backend/build-cache.js")));
+              assert.equal(await prepareBuildCacheRoot(process.env.SCRIPTC_CACHE_DIR), process.env.SCRIPTC_CACHE_DIR);
+              const { compile } = await import(pathToFileURL(join(root, "packages/compiler/dist/index.js")));
+              attempt.compileCalls = 1; const started = performance.now();
+              const value = await compile(join(root, fixture), options);
+              attempt.elapsedMs = performance.now() - started; attempt.ok = value.ok === true; attempt.result = value;
+              assert.equal(attempt.ok, true); attempt.binary = { bytes: statSync(options.outPath).size, sha256: hash(options.outPath) };
+            } catch (error) {
+              attempt.error = { name: error?.name, message: error?.message, stack: error?.stack };
+              for (const key of ["code", "cmd", "killed", "signal"]) if (Object.hasOwn(error ?? {}, key)) attempt.error[key] = error[key];
+              for (const key of ["stdout", "stderr"]) if (typeof error?.[key] === "string" || Buffer.isBuffer(error?.[key])) {
+                const bytes = Buffer.from(error[key]); writeFileSync(join(out, "three-" + flavor + "-error-" + key + ".raw"), bytes.subarray(0, CAP));
+                attempt.error[key] = { bytes: bytes.length, sha256: digest(bytes), truncated: bytes.length > CAP };
+              }
+              process.exitCode = 1;
+            }
+            save("three-" + flavor + "-compile.json", attempt);
+          }
+          async function quality() {
+            verifyWorkOwner(); const report = json(join(out, "summary.json"));
+            const before = source(); assert.deepEqual(before, report.sourceAtSetup);
+            const env = makeEnvironment("quality", false);
+            try { requireSuccess(await run("lint", "pnpm", ["lint"], 600, env)); report.lintPassed = true; }
+            catch (error) { report.lintError = String(error.stack ?? error); }
+            try {
+              try {
+                requireSuccess(await run("format", "pnpm", ["exec", "oxfmt", "--check", ...formatFiles], 120));
+                report.formatPassed = true;
+              } catch (error) {
+                report.formatError = String(error);
+                // A proposed formatter patch is evidence only; the candidate is never formatted in place.
+                const stage = join(work, "format"); mkdirSync(stage);
+                for (const file of formatFiles) { const path = join(stage, file); mkdirSync(join(path, ".."), { recursive: true }); copyFileSync(file, path); }
+                const formatted = await run("format-proposal", "pnpm", ["exec", "oxfmt", "--write", ...formatFiles.map(file => join(stage, file))], 120);
+                requireSuccess(formatted);
+                for (const [i,file] of formatFiles.entries()) {
+                  const diff = await run("format-diff-" + i, "git", ["diff", "--no-index", "--", join(root, file), join(stage, file)], 30);
+                  requireSuccess({ ...diff, code: diff.code === 1 ? 0 : diff.code });
+                }
+              }
+
+            } catch (error) { report.formatError = String(error.stack ?? error); }
+            report.qualitySourceAfter = source(); assert.deepEqual(report.qualitySourceAfter, before);
+            report.qualityPassed = report.lintPassed === true && report.formatPassed === true;
+            save("summary.json", report); assert.equal(report.qualityPassed, true, "code quality preflight failed");
+          }
+
+          async function main() {
+            verifyWorkOwner();
+            const report = json(join(out, "summary.json")), target = process.platform === "darwin" ? "darwin-arm64" : "linux-x64-gnu";
+            let before, nativeBefore, toolBefore, installed;
+            try {
+              assert.equal(report.qualityPassed, true); assert.equal(report.lintPassed, true); assert.equal(report.formatPassed, true);
+              assert.equal(process.version, "v24.22.0"); assert.equal(capture("pnpm", ["--version"]), "11.1.3");
+              assert.equal(process.arch, process.platform === "darwin" ? "arm64" : "x64");
+              assert.ok(["darwin", "linux"].includes(process.platform)); before = source(); report.sourceBefore = before;
+              report.nativeInputs = nativeInputs(); nativeBefore = nativeFiles(target); report.nativeFiles = nativeBefore;
+              const helper = "packages/llvm-" + target + "/bin/scriptc-llvm-codegen";
+              report.helper = JSON.parse(capture(helper, ["version", "--format=json"]));
+              assert.equal(report.helper.ok, true); assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
+              assert.equal(report.helper.scriptc_package_version, json("packages/llvm-" + target + "/package.json").version);
+              toolBefore = tools(); report.tools = toolBefore;
+              if (process.platform === "linux") { assert.equal(toolBefore.llvm.version, "22.1.8"); assert.equal(toolBefore.zig.version, "0.16.0"); }
+              installed = { lock: hash("node_modules/.pnpm/lock.yaml"), three: files(realpathSync("node_modules/three")) };
+              report.dependencies = installed; report.helperOrigin = "canonical candidate-input/image-keyed native-packages action";
+              save("summary.json", report);
+              requireSuccess(await run("runtime-before", process.execPath, ["packages/runtime-" + target + "/scripts/verify.mjs"], 120));
+              requireSuccess(await run("build", "pnpm", ["build"], 900, makeEnvironment("build", false)));
+              report.distBefore = files("packages/compiler/dist");
+              assert.deepEqual(nativeFiles(target), nativeBefore); assert.deepEqual(source(), before);
+              if (process.platform === "linux") requireSuccess(await run("capacity-pre-proof", "python3", [join(process.env.RUNNER_TEMP, "shard-debug-capacity/capacity.py"), "pre-proof"], 60));
+              if (process.platform === "darwin") report.mutation = await mutation();
+              else report.mutation = { applicable: false, reason: "Darwin job owns the two baseline splitter assertion failures" };
+              assert.deepEqual(source(), before);
+              for (const flavor of ["plain", "san"]) {
+                const env = makeEnvironment("tests-" + flavor, flavor === "san");
+                for (const [file, spec] of Object.entries(expected[process.platform])) {
+                  const id = flavor + "-" + basename(file).replace(".test.ts", "") + "-" + report.gates.length;
+                  try { report.gates.push({ status: "passed", ...await testGate(id, file, spec.names, env) }); }
+                  catch (error) { report.gates.push({ id, status: "failed", error: String(error.stack ?? error) }); }
+                  save("summary.json", report); assert.ok(allDrained(), "unresolved child group");
+                }
+                try { report.workloads.push({ status: "passed", ...await compileWorkload(flavor) }); }
+                catch (error) { report.workloads.push({ flavor, status: "failed", error: String(error.stack ?? error) }); }
+                report.retainedWorkloads ??= {}; report.retainedWorkloads[flavor] = retainWorkload(flavor);
+                save("summary.json", report); assert.ok(allDrained(), "unresolved child group");
+              }
+            } catch (error) { report.error = String(error.stack ?? error); }
+            finally {
+              try {
+                report.restoration = restoreSplit();
+                report.sourceAfter = source(); assert.deepEqual(report.sourceAfter, before);
+                assert.deepEqual(nativeFiles(target), nativeBefore); assert.deepEqual(nativeInputs(), report.nativeInputs);
+                assert.deepEqual(tools(), toolBefore);
+                assert.equal(hash("node_modules/.pnpm/lock.yaml"), installed.lock);
+                assert.deepEqual(files(realpathSync("node_modules/three")), installed.three);
+                assert.deepEqual(files("packages/compiler/dist"), report.distBefore);
+                requireSuccess(await run("runtime-after", process.execPath, ["packages/runtime-" + target + "/scripts/verify.mjs"], 120));
+                report.inputsVerifiedAfter = true;
+              } catch (error) { report.inputError = String(error.stack ?? error); }
+              report.proofPassed = !report.error && !report.inputError && report.qualityPassed === true && report.inputsVerifiedAfter === true &&
+                report.gates.length === 14 && report.gates.every(row => row.status === "passed") &&
+                report.workloads.length === 2 && report.workloads.every(row => row.status === "passed") &&
+                (process.platform !== "darwin" || report.mutation?.observedAssertionFailures === 2 && report.mutation?.restored === true);
+              save("summary.json", report);
+            }
+            assert.equal(report.proofPassed, true, "focused qualification failed");
+          }
+          const formatFiles = [
+            "packages/compiler/src/backend/llvm/split.ts",
+            "packages/compiler/src/backend/llvm/split.test.ts",
+            "packages/compiler/src/backend/darwin-debug-map.test-support.ts",
+            "packages/compiler/test/native-partitions.test.ts",
+          ];
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+          function initialize() {
+            assert.match(head, /^[0-9a-f]{40}$/); assert.equal(process.version, "v24.22.0");
+            mkdirSync(work, { mode: 0o700 }); writeFileSync(join(work, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+            mkdirSync(out, { mode: 0o700 }); copyFileSync(self, join(out, "runner.mjs"));
+            save("summary.json", { schemaVersion: 1, ...owner, runnerSha256: hash(self), baseline: base, gates: [], workloads: [], qualificationComplete: false, completeCampaign: false, sourceAtSetup: source() });
+          }
+          function finalize() {
+            const report = json(join(out, "summary.json")), cleanup = { passed: false, retained: true };
+            try {
+              verifyWorkOwner(); assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k => [k, report[k]])), owner);
+              assert.ok(allDrained(), "owned process custody unresolved"); cleanup.restoration = restoreSplit();
+              cleanup.source = source(); assert.deepEqual(cleanup.source, report.sourceAtSetup);
+              assert.equal(hash(self), report.runnerSha256);
+              rmSync(work, { recursive: true }); cleanup.passed = true; cleanup.retained = false;
+            } catch (error) { cleanup.error = String(error.stack ?? error); }
+            report.cleanup = cleanup; report.qualificationComplete = report.proofPassed === true && cleanup.passed;
+            save("summary.json", report); assert.equal(report.qualificationComplete, true, "qualification or cleanup incomplete");
+          }
+          if (process.argv[2] !== "--probe") {
+            try {
+              if (process.argv[2] === "--init") initialize();
+              else if (process.argv[2] === "--finalize") finalize();
+              else if (process.argv[2] === "--quality") await quality();
+              else if (process.argv[2] === "--child") await childMain();
+              else await main();
+            } catch (error) { process.stderr.write(String(error.stack ?? error) + "\n[shard-debug-qualification] FAILED (exit 1)\n"); process.exitCode = 1; }
+          }
+
+          RUNNER
+          node "$RUNNER_TEMP/shard-debug-runner.mjs" --init
+      - run: pnpm install --frozen-lockfile
+      - name: Code quality before native preparation
+        run: node "$RUNNER_TEMP/shard-debug-runner.mjs" --quality
+      - name: Admit Linux disk capacity before LLVM
+        if: runner.os == 'Linux'
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ["SOURCE_SHA"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
+      - uses: ./.github/actions/llvm-linux
+        if: runner.os == 'Linux'
+      - name: Recheck Linux disk capacity after LLVM
+        if: runner.os == 'Linux'
+        run: python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - uses: ./.github/actions/zig
+        if: runner.os == 'Linux'
+      - uses: ./.github/actions/native-packages
+        with:
+          target: ${{ matrix.target }}
+      - name: Focused tests, mutation and original workload
+        run: node "$RUNNER_TEMP/shard-debug-runner.mjs"
+      - name: Finalize owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/shard-debug-runner.mjs"
+          node "$RUNNER_TEMP/shard-debug-runner.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-debug-identity-${{ matrix.target }}
+          path: ${{ runner.temp }}/shard-debug-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Linux'
+        with:
+          name: shard-debug-capacity-linux
+          path: ${{ runner.temp }}/shard-debug-capacity
+          if-no-files-found: error
+          retention-days: 1
