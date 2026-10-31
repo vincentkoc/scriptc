@@ -234,9 +234,11 @@ cases.push({
   source: `process.on("rejectionHandled", () => console.log("handled"));
 process.on("unhandledRejection", (_reason, pending) => {
   console.log("unhandled");
+  // Dynamic catch observes before host startup; the typed await observes later.
+  const deferred: any[] = [pending];
   setImmediate(() => {
     console.log("attach");
-    pending.catch(() => console.log("caught"));
+    deferred[0].catch(() => console.log("caught"));
     requireModule("checkpoint-host").start();
     console.log("after");
     process.nextTick(() => console.log("tick"));
