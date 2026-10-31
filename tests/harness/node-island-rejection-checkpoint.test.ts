@@ -10,7 +10,20 @@ import { libnodePack } from "./libnode.js";
 const execFileAsync = promisify(execFile);
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
 const pack = libnodePack();
-function body(directCatch: boolean): string {
+function body(directCatch: boolean, lateHandling: boolean): string {
+  if (lateHandling)
+    return `const pending: Promise<void> = Promise.reject(new RangeError("sentinel"));
+process.on("unhandledRejection", () => {
+  console.log("unhandled");
+  setImmediate(() => {
+    console.log("attach");
+    pending.catch(() => console.log("caught"));
+    console.log("after");
+    process.nextTick(() => console.log("tick"));
+  });
+});
+process.on("rejectionHandled", () => console.log("handled"));
+`;
   return `const pending: Promise<void> = Promise.reject(new RangeError("sentinel"));
 queueMicrotask(() => {
   console.log("microtask");
@@ -32,11 +45,27 @@ const cases = [
   { id: "hosted-next-tick", hosted: true, macrotask: false, directCatch: false },
   { id: "hosted-macrotask-next-tick", hosted: true, macrotask: true, directCatch: false },
   { id: "hosted-direct-catch", hosted: true, macrotask: false, directCatch: true },
+  {
+    id: "native-late-handling",
+    hosted: false,
+    macrotask: false,
+    directCatch: false,
+    lateHandling: true,
+  },
+  {
+    id: "hosted-late-handling",
+    hosted: true,
+    macrotask: false,
+    directCatch: false,
+    lateHandling: true,
+  },
 ];
 
-for (const { id, hosted, macrotask, directCatch } of cases) {
+for (const { id, hosted, macrotask, directCatch, lateHandling = false } of cases) {
   test.skipIf(hosted && pack === null)(
-    `a queued catch precedes rejection reporting (${id})`,
+    lateHandling
+      ? `late rejection events follow queued work (${id})`
+      : `a queued catch precedes rejection reporting (${id})`,
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "scriptc-rejection-checkpoint-"));
       try {
@@ -51,7 +80,9 @@ for (const { id, hosted, macrotask, directCatch } of cases) {
           }),
           "main.ts":
             (hosted ? 'import { start } from "checkpoint-host";\nstart();\n' : "") +
-            (macrotask ? `setImmediate(() => {\n${body(directCatch)}});\n` : body(directCatch)),
+            (macrotask
+              ? `setImmediate(() => {\n${body(directCatch, lateHandling)}});\n`
+              : body(directCatch, lateHandling)),
         };
         if (hosted) {
           files["node_modules/checkpoint-host/package.json"] = JSON.stringify({
@@ -77,9 +108,9 @@ for (const { id, hosted, macrotask, directCatch } of cases) {
         });
         expect(expected.stdout).toBe(
           (hosted ? "island ready\n" : "") +
-            "microtask\n" +
-            (directCatch ? "" : "tick\n") +
-            "caught\ndone\n",
+            (lateHandling
+              ? "unhandled\nattach\nafter\ntick\ncaught\nhandled\n"
+              : "microtask\n" + (directCatch ? "" : "tick\n") + "caught\ndone\n"),
         );
         expect(expected.stderr).toBe("");
 
