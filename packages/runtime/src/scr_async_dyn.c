@@ -753,8 +753,8 @@ static void scr_dyn_then_entry(ScrFiber *self, void *ap) {
 ScrDyn *scr_dyn_promise_then(ScrPromise *src, ScrDyn *onf, ScrDyn *onr, ScrDyn *onfin) {
   /* A rejection HANDLER marks the source handled at attach (Node's
    * moment; the reaction fiber's await re-marks harmlessly) — this is
-   * also what lets a .catch inside an 'unhandledRejection' listener fire
-   * 'rejectionHandled' immediately at the attach point. */
+   * also what queues 'rejectionHandled' for a late .catch. The checkpoint's
+   * handled-rejection phase delivers it, never the attachment itself. */
   if (onr != NULL) scr_promise_mark_handled(src);
   ScrDynThenPack *a = malloc(sizeof *a);
   if (!a) scr_ad_oom();

@@ -4,6 +4,8 @@ All notable changes to scriptc will be documented in this file.
 
 ## Unreleased
 
+- Bundled Node declarations infer promise payloads for rejection listeners, error origins for uncaught-exception listeners, and numeric or bigint snapshots for filesystem stat callbacks.
+
 - The native event loop delivers `rejectionHandled` after queued ticks and promise callbacks, using the listeners registered at delivery. Handled uncaught exceptions resume pending work through the existing immediate queue.
 
 - Reassigned function declarations in shared modules are callable before an island enters them, and later module evaluation preserves their replacements.

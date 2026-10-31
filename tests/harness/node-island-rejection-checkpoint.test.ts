@@ -79,11 +79,14 @@ const lifecycleCases = [
 process.on("rejectionHandled", removed);
 process.on("unhandledRejection", (_reason, pending) => {
   console.log("unhandled");
+  // Dynamic catch observes at attachment; the typed helper observes at await.
+  // Keep attachment between removing and restoring handled listeners.
+  const deferred: any[] = [pending];
   setImmediate(() => {
     console.log("attach");
     process.off("rejectionHandled", removed);
-    pending.catch(() => console.log("caught first"));
-    pending.catch(() => console.log("caught second"));
+    deferred[0].catch(() => console.log("caught first"));
+    deferred[0].catch(() => console.log("caught second"));
     process.on("rejectionHandled", removed);
     process.once("rejectionHandled", () => {
       console.log("handled");
