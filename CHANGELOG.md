@@ -6,7 +6,7 @@ All notable changes to scriptc will be documented in this file.
 
 - Reassigned function declarations in shared modules are callable before an island enters them, and later module evaluation preserves their replacements.
 
-- A failed CommonJS module is evaluated again on the next require, including programs that do not read module-graph metadata.
+- A failed CommonJS module is evaluated again on the next require, including programs that do not read module-graph metadata. Private numeric bindings that are overwritten before every read retain their local storage optimization across retries.
 
 - Dynamic callback adapters release owned argument and return values when cancellation interrupts a call, including shared Node-island bindings during shutdown.
 
