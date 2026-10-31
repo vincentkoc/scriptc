@@ -1,4 +1,4 @@
-name: Diagnose promise bridge behavior
+name: Retry promise subscription order
 
 on:
   push:
@@ -45,7 +45,7 @@ jobs:
           target: linux-x64-gnu
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Observe Node, IR, native plain and SAN for promise bridges
+      - name: Observe subscription order with its physical Node API dependency
         run: |
           cat > "$RUNNER_TEMP/shared-module-diagnostic.mjs" <<'PROOF'
           import assert from "node:assert/strict";
@@ -66,14 +66,16 @@ jobs:
           // These fixtures diagnose promise bridges, not module continuation.
           const settledEvidence = {
             repeated: false, usedForQualification: false,
-            runs: ["https://github.com/vincentkoc/scriptc/actions/runs/41203748629", "https://github.com/vincentkoc/scriptc/actions/runs/41205114836"],
+            runs: ["https://github.com/vincentkoc/scriptc/actions/runs/41205789123"],
+            cases: ["node-island-promise-typed-roundtrip"],
           };
           const report = {
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             status: "running", diagnosticComplete: false, qualificationComplete: false,
-            completeSuite: false, scope: "promise-bridge-diagnostic", settledEvidence,
-            expectedExecutionAttempts: 4, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
+            completeSuite: false, scope: "promise-subscription-order-retry", settledEvidence,
+            priorAttempt: { runId: "41205789123", workflow: "7a83f24c90b1149feed09a6e083e50cea28bde08", case: "node-island-promise-subscription-order", blocker: "fixture had no physical @scriptc/node package; compiler emitted startup refusal" },
+            expectedExecutionAttempts: 2, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
           const hash = path => digest(readFileSync(path));
@@ -150,6 +152,8 @@ jobs:
             "packages/node/index.js",
             "packages/node/index.d.ts",
             "packages/compiler/src/frontend/node-api-import.ts",
+            "packages/compiler/src/frontend/program.ts",
+            "packages/compiler/src/frontend/lowering/lower-modules.ts",
             "packages/compiler/src/frontend/lowering/lower-node-island.ts",
             "packages/compiler/src/frontend/lowering/lowerer.ts",
             "packages/compiler/src/frontend/lowering/coercions/function-adapters.ts",
@@ -196,7 +200,7 @@ jobs:
               "id": "node-island-promise-subscription-order",
               "origin": "tests/corpus/node-island-promise-subscription-order",
               "entry": "main.mjs",
-              "oracleRoute": "workspace-node-api",
+              "oracleRoute": "direct",
               "islandNotes": [],
               "shipped": [
                 "lib.cjs"
@@ -206,31 +210,26 @@ jobs:
                 "main.mjs": "// @requires-libnode\nimport { requireModule } from \"@scriptc/node\";\n\nconst { observe } = requireModule(\"./lib.cjs\");\n\nasync function value() {\n  await null;\n  return 7;\n}\n\nasync function nativeObserve(label, p) {\n  console.log(label, \"native\", await p);\n}\n\nasync function run(label, islandFirst) {\n  const p = value();\n  if (islandFirst) {\n    const island = observe(label, p);\n    const native = nativeObserve(label, p);\n    await native;\n    await island;\n  } else {\n    const native = nativeObserve(label, p);\n    const island = observe(label, p);\n    await native;\n    await island;\n  }\n}\n\nasync function main() {\n  await run(\"native-first\", false);\n  await run(\"island-first\", true);\n}\nmain();\n"
               },
               "expected": "native-first native 7\nnative-first island 7\nisland-first island 7\nisland-first native 7\n"
+            }
+          ];
+          const fixtureDependencies = [
+            {
+              "source": "packages/node/package.json",
+              "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/package.json",
+              "bytes": 725,
+              "sha256": "fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947"
             },
             {
-              "id": "node-island-promise-typed-roundtrip",
-              "origin": "tests/corpus/node-island-promise-typed-roundtrip",
-              "entry": "main.ts",
-              "oracleRoute": "direct",
-              "islandNotes": [
-                {
-                  "file": "main.ts",
-                  "messagePrefix": "package 'promise-probe@1.0.0' runs in a Node island: "
-                }
-              ],
-              "shipped": [
-                "node_modules/promise-probe/index.d.ts",
-                "node_modules/promise-probe/index.js",
-                "node_modules/promise-probe/package.json"
-              ],
-              "files": {
-                "main.ts": "// @requires-libnode\nimport {\n  getDynamic,\n  getTyped,\n  isOriginal,\n  observe,\n  observeOriginal,\n  reset,\n  settle,\n} from \"promise-probe\";\n\nasync function run(mode: string): Promise<void> {\n  reset(mode);\n  const dynamic = getDynamic();\n  const typed = getTyped();\n  console.log(mode, \"identity\", typed === dynamic, isOriginal(typed), isOriginal(dynamic));\n\n  const first = observe(mode + \" typed\", typed);\n  const middle = observeOriginal(mode + \" original\");\n  const last = observe(mode + \" dynamic\", dynamic);\n  settle();\n\n  await first;\n  await middle;\n  await last;\n}\n\nasync function main(): Promise<void> {\n  await run(\"pending\");\n  await run(\"fulfilled\");\n  await run(\"rejected\");\n}\nmain();\n",
-                "node_modules/promise-probe/index.d.ts": "export declare function reset(mode: string): void;\nexport declare function getTyped(): Promise<number>;\nexport declare function getDynamic(): Promise<unknown>;\nexport declare function isOriginal(p: unknown): boolean;\nexport declare function observe(label: string, p: Promise<unknown>): Promise<void>;\nexport declare function observeOriginal(label: string): Promise<void>;\nexport declare function settle(): void;\n",
-                "node_modules/promise-probe/index.js": "\"use strict\";\n\nlet current;\nlet release;\nlet reason;\n\nfunction reset(mode) {\n  release = undefined;\n  reason = new RangeError(\"sentinel\");\n  if (mode === \"pending\") {\n    current = new Promise((resolve) => {\n      release = resolve;\n    });\n  } else if (mode === \"fulfilled\") {\n    current = Promise.resolve(7);\n  } else {\n    current = Promise.reject(reason);\n  }\n}\n\nfunction getTyped() {\n  return current;\n}\n\nfunction isOriginal(p) {\n  return p === current;\n}\n\nfunction observe(label, p) {\n  return p.then(\n    (value) => {\n      console.log(label, \"value\", value);\n    },\n    (error) => {\n      console.log(label, \"error\", error === reason, error.name, error.message);\n    },\n  );\n}\n\nfunction observeOriginal(label) {\n  return observe(label, current);\n}\n\nfunction settle() {\n  if (release !== undefined) {\n    const resolve = release;\n    release = undefined;\n    resolve(7);\n  }\n}\n\nmodule.exports = {\n  reset,\n  getTyped,\n  getDynamic: getTyped,\n  isOriginal,\n  observe,\n  observeOriginal,\n  settle,\n};\n",
-                "node_modules/promise-probe/package.json": "{ \"name\": \"promise-probe\", \"version\": \"1.0.0\", \"main\": \"index.js\", \"types\": \"index.d.ts\" }\n",
-                "package.json": "{ \"name\": \"promise-roundtrip\", \"private\": true, \"type\": \"module\", \"scriptc\": { \"packages\": { \"promise-probe\": \"node\" } } }\n"
-              },
-              "expected": "pending identity true true true\npending typed value 7\npending original value 7\npending dynamic value 7\nfulfilled identity true true true\nfulfilled typed value 7\nfulfilled original value 7\nfulfilled dynamic value 7\nrejected identity true true true\nrejected typed error true RangeError sentinel\nrejected original error true RangeError sentinel\nrejected dynamic error true RangeError sentinel\n"
+              "source": "packages/node/index.js",
+              "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.js",
+              "bytes": 4273,
+              "sha256": "3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665"
+            },
+            {
+              "source": "packages/node/index.d.ts",
+              "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.d.ts",
+              "bytes": 2533,
+              "sha256": "00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803"
             }
           ];
           const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
@@ -241,13 +240,26 @@ jobs:
             }
             writeFileSync(join(dir, "expected.stdout.log"), spec.expected);
           }
+          for (const dependency of fixtureDependencies) {
+            const target = join(fixtures, dependency.target);
+            mkdirSync(dirname(target), { recursive: true }); copyFileSync(join(root, dependency.source), target);
+          }
+          report.fixtureDependencies = fixtureDependencies;
+          const verifyDependencies = () => {
+            for (const dependency of fixtureDependencies) {
+              for (const path of [join(root, dependency.source), join(fixtures, dependency.target)]) {
+                assert.equal(hash(path), dependency.sha256); assert.equal(lstatSync(path).size, dependency.bytes);
+              }
+            }
+          };
           const fixtureManifest = moduleFiles(fixtures);
           report.fixtureManifest = fixtureManifest; report.fixtureDigest = digest(JSON.stringify(fixtureManifest));
           const verifyFixtures = () => assert.deepEqual(moduleFiles(fixtures), fixtureManifest);
           const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
           save();
           try {
-            assert.equal(report.fixtureDigest, "c9f552c5481c3da3a6241c8c1d9f72d19b9bd64c97243198f36470debafabe05", "authored fixture bytes changed");
+            assert.equal(report.fixtureDigest, "e2258073a0c23db09b7d2b590068456695b88553148f4ffe92f9aa8ce05dd8eb", "authored fixture bytes changed");
+            verifyDependencies(); report.dependenciesVerifiedBefore = true;
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
             assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
             report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
@@ -284,23 +296,17 @@ jobs:
             report.bridgeBuild.currentBridgeSha256 = pack.manifest.files[pack.manifest.bridge].sha256;
             report.bridgeBuild.currentLibnodeSha256 = pack.manifest.files[pack.manifest.libnode].sha256;
             assert.equal(report.bridgeBuild.currentLibnodeSha256, report.bridgeBuild.pinnedLibnodeSha256);
-            const nodeApi = realpathSync(createRequire(pathToFileURL(join(root, "package.json"))).resolve("@scriptc/node"));
-            assert.equal(nodeApi, realpathSync(join(root, "packages/node/index.js")), "Node oracle must use the canonical workspace implementation");
-            const oracleResolver = join(out, "node-oracle-resolution.mjs");
-            writeFileSync(oracleResolver, "import { createRequire, registerHooks } from \"node:module\";\nimport { join } from \"node:path\";\nimport { pathToFileURL } from \"node:url\";\nconst source = pathToFileURL(createRequire(pathToFileURL(join(process.cwd(), \"package.json\"))).resolve(\"@scriptc/node\")).href;\nregisterHooks({\n  resolve(specifier, context, nextResolve) {\n    return nextResolve(specifier === \"@scriptc/node\" ? source : specifier, context);\n  },\n});\n");
-            report.nodeOracleResolution = {
-              kind: "resolve-only-registerHooks", source: "packages/node/index.js", sourceSha256: hash(nodeApi),
-              packageSha256: hash("packages/node/package.json"), resolver: recordFile(oracleResolver),
-              compilerAdmission: "packages/compiler/src/frontend/node-api-import.ts",
-            };
             for (const spec of specs) {
               const observed = { id: spec.id, origin: spec.origin, entry: spec.entry, oracleRoute: spec.oracleRoute, expectedIslandNotes: spec.islandNotes, expectedShippedFiles: spec.shipped, expectedStdoutSha256: digest(spec.expected), flavors: {} };
               report.cases.push(observed);
               const dir = join(fixtures, spec.id), entry = join(dir, spec.entry);
               const artifacts = join(out, spec.id); mkdirSync(artifacts);
-              verifyFixtures();
+              verifyFixtures(); verifyDependencies();
+              const dependencyEntry = realpathSync(createRequire(pathToFileURL(entry)).resolve("@scriptc/node"));
+              assert.equal(dependencyEntry, realpathSync(join(dir, "node_modules/@scriptc/node/index.js")));
+              observed.dependencyEntry = recordFile(dependencyEntry);
               try {
-                observed.oracle = execute(spec.id + "-node", process.execPath, [...(spec.oracleRoute === "workspace-node-api" ? ["--import", oracleResolver] : []), entry], 30, { SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.oracle = execute(spec.id + "-node", process.execPath, [entry], 30, { SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
                 observed.oracle.attempted = observed.oracle.status !== "tool-error";
                 observed.oracle.parityOutcome = parityOutcome(observed.oracle);
                 observed.oracle.expectedMatched = observed.oracle.status === "completed" &&
@@ -323,8 +329,16 @@ jobs:
                   assert.notEqual(file.placeholder, true);
                   assert.equal(file.sha256, hash(join(dir, file.path))); assert.equal(file.size, lstatSync(join(dir, file.path)).size);
                 }
+                // buildMain prepends this error.new throw when preflight reports startupCrash.
+                const programEntry = module.functions.find(fn => fn.name === module.entry); assert.ok(programEntry);
+                const first = programEntry.body[0];
+                assert.ok(!(first?.kind === "throw" && first.value?.kind === "libCall" && first.value.fn === "error.new"), "IR contains a startup refusal");
+                observed.ir.startupRefusalAbsent = true;
                 const nativeFunctions = module.functions.filter(fn => fn.loc?.file === entry).map(fn => fn.name);
-                assert.ok(nativeFunctions.length > 0, "no native function has the fixture entry as its source");
+                for (const name of ["value", "nativeObserve", "run", "main"]) {
+                  assert.ok(nativeFunctions.includes(name), "authored function missing from native IR: " + name);
+                  assert.ok(module.functions.some(fn => fn.name === name && fn.loc?.file === entry && fn.body.length > 0));
+                }
                 observed.ir.moduleOwnership = { nativeEntryFunctions: nativeFunctions, files: tree.files, links: tree.links };
                 observed.ir.status = "passed";
               } catch (error) { observed.ir.status = "failed"; observed.ir.error = scrub(error.stack ?? error); }
@@ -343,6 +357,8 @@ jobs:
                   }
                   assert.ok(validateCompile(result.compile, entry, binary, spec.islandNotes), "native compilation or diagnostics failed");
                   result.execution = { status: "blocked-before-execution", attempted: false };
+                  assert.equal(observed.ir.status, "passed", "native probe blocked: IR admission failed");
+                  assert.equal(observed.ir.startupRefusalAbsent, true, "native probe blocked: IR startup refusal was not excluded");
                   const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
                   assert.deepEqual(beside.manifest, pack.manifest);
                   const modules = join(beside.root, "modules");
@@ -379,7 +395,7 @@ jobs:
             report.status = report.qualificationComplete ? "passed" : "failed";
           } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
           finally {
-            try { assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true; }
+            try { assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true; verifyDependencies(); report.dependenciesVerifiedAfter = true; }
             catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.sourceError = scrub(error.stack ?? error); }
             report.finishedAt = new Date().toISOString(); save();
             writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
@@ -416,7 +432,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: promise-bridge-current
+          name: promise-order-current
           path: ${{ runner.temp }}/shared-module-proof
           if-no-files-found: error
           retention-days: 3
@@ -432,8 +448,8 @@ jobs:
           node-version: 24.22.1
       - uses: actions/download-artifact@v4
         with:
-          name: promise-bridge-current
-          path: ${{ runner.temp }}/promise-bridge-results
+          name: promise-order-current
+          path: ${{ runner.temp }}/promise-order-results
       - name: Verify promise bridge observations
         run: |
           node --input-type=module <<'COMPARE'
@@ -442,10 +458,10 @@ jobs:
           import { readFileSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
           const head = "71a9441c824262150f35acd2b8359f156ed3289c";
-          const expected = {"node-island-promise-subscription-order":{"id":"node-island-promise-subscription-order","origin":"tests/corpus/node-island-promise-subscription-order","entry":"main.mjs","oracleRoute":"workspace-node-api","islandNotes":[],"shipped":["lib.cjs"]},"node-island-promise-typed-roundtrip":{"id":"node-island-promise-typed-roundtrip","origin":"tests/corpus/node-island-promise-typed-roundtrip","entry":"main.ts","oracleRoute":"direct","islandNotes":[{"file":"main.ts","messagePrefix":"package 'promise-probe@1.0.0' runs in a Node island: "}],"shipped":["node_modules/promise-probe/index.d.ts","node_modules/promise-probe/index.js","node_modules/promise-probe/package.json"]}};
-          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, scope: "promise-bridge-diagnostic", diagnosticComplete: false, qualificationComplete: false };
+          const expected = {"node-island-promise-subscription-order": {"id": "node-island-promise-subscription-order", "origin": "tests/corpus/node-island-promise-subscription-order", "entry": "main.mjs", "oracleRoute": "direct", "islandNotes": [], "shipped": ["lib.cjs"]}};
+          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, scope: "promise-subscription-order-retry", diagnosticComplete: false, qualificationComplete: false };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
-          const dir = join(process.env.RUNNER_TEMP, "promise-bridge-results");
+          const dir = join(process.env.RUNNER_TEMP, "promise-order-results");
           const verifyFile = file => {
             const bytes = readFileSync(join(dir, file.path));
             assert.equal(digest(bytes), file.sha256); assert.equal(bytes.length, file.bytes);
@@ -487,18 +503,21 @@ jobs:
             assert.equal(summary.head, head); assert.equal(summary.label, "current"); assert.equal(summary.scope, result.scope);
             assert.equal(summary.workflow, result.workflow); assert.equal(summary.runId, result.runId); assert.equal(summary.attempt, result.attempt);
             assert.equal(summary.settledEvidence.repeated, false); assert.equal(summary.settledEvidence.usedForQualification, false);
-            assert.equal(summary.fixtureDigest, "c9f552c5481c3da3a6241c8c1d9f72d19b9bd64c97243198f36470debafabe05");
+            assert.equal(summary.fixtureDigest, "e2258073a0c23db09b7d2b590068456695b88553148f4ffe92f9aa8ce05dd8eb");
             assert.equal(digest(JSON.stringify(summary.fixtureManifest)), summary.fixtureDigest);
             assert.deepEqual(summary.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
             assert.equal(summary.build.status, "completed"); assert.equal(summary.helper.protocol_version, "1");
             assert.equal(summary.helper.llvm_version, "22.1.8"); assert.match(summary.helperBinarySha256, /^[a-f0-9]{64}$/);
             assert.equal(summary.libnode.manifest.nodeVersion, "24.22.1"); assert.equal(summary.libnode.manifest.bridgeAbi, 10);
             assert.equal(summary.bridgeBuild.currentLibnodeSha256, "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838");
-            const resolution = summary.nodeOracleResolution;
-            assert.equal(resolution.kind, "resolve-only-registerHooks"); assert.equal(resolution.source, "packages/node/index.js");
-            assert.equal(resolution.sourceSha256, summary.sourceInputs["packages/node/index.js"]);
-            assert.equal(resolution.packageSha256, summary.sourceInputs["packages/node/package.json"]);
-            verifyFile(resolution.resolver); assert.equal(resolution.resolver.sha256, "645b2b1a86eb4a998577644457e3ec46335f936c87ec1394e92685cd39492f96");
+            assert.equal(summary.priorAttempt.runId, "41205789123"); assert.equal(summary.priorAttempt.workflow, "7a83f24c90b1149feed09a6e083e50cea28bde08");
+            assert.equal(summary.dependenciesVerifiedBefore, true); assert.equal(summary.dependenciesVerifiedAfter, true);
+            const expectedDependencies = [{"source": "packages/node/package.json", "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/package.json", "bytes": 725, "sha256": "fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947"}, {"source": "packages/node/index.js", "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.js", "bytes": 4273, "sha256": "3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665"}, {"source": "packages/node/index.d.ts", "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.d.ts", "bytes": 2533, "sha256": "00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803"}];
+            assert.deepEqual(summary.fixtureDependencies, expectedDependencies);
+            for (const dependency of summary.fixtureDependencies) {
+              assert.equal(summary.sourceInputs[dependency.source], dependency.sha256);
+              verifyFile({ path: "fixtures/" + dependency.target, bytes: dependency.bytes, sha256: dependency.sha256 });
+            }
             const cleanup = JSON.parse(readFileSync(join(dir, "cleanup.json"), "utf8"));
             assert.equal(cleanup.runId, result.runId); assert.equal(cleanup.attempt, result.attempt);
             assert.equal(cleanup.workflow, result.workflow); assert.equal(cleanup.label, "current");
@@ -512,6 +531,9 @@ jobs:
               const spec = expected[item.id];
               assert.equal(item.entry, spec.entry); assert.equal(item.oracleRoute, spec.oracleRoute);
               assert.deepEqual(item.expectedIslandNotes, spec.islandNotes); assert.deepEqual(item.expectedShippedFiles, spec.shipped);
+              verifyFile(item.dependencyEntry);
+              assert.equal(item.dependencyEntry.path, "fixtures/" + spec.id + "/node_modules/@scriptc/node/index.js");
+              assert.equal(item.dependencyEntry.sha256, summary.sourceInputs["packages/node/index.js"]);
               const expectedStdout = digest(readFileSync(join(dir, "fixtures", item.id, "expected.stdout.log")));
               assert.equal(item.expectedStdoutSha256, expectedStdout);
               if (item.oracle) {
@@ -519,7 +541,7 @@ jobs:
                 const step = summary.steps.find(step => step.name === spec.id + "-node");
                 assert.ok(step);
                 const entry = "<temp>/shared-module-proof/fixtures/" + spec.id + "/" + spec.entry;
-                assert.deepEqual(step.args, [...(spec.oracleRoute === "workspace-node-api" ? ["--import", "<temp>/shared-module-proof/node-oracle-resolution.mjs"] : []), entry]);
+                assert.deepEqual(step.args, [entry]);
                 assert.equal(step.stdoutSha256, item.oracle.stdoutSha256); assert.equal(step.stderrSha256, item.oracle.stderrSha256);
                 assert.equal(item.oracle.expectedMatched, item.oracle.status === "completed" &&
                   item.oracle.stdoutSha256 === expectedStdout && item.oracle.stderrBytes === 0);
@@ -533,8 +555,15 @@ jobs:
                   assert.notEqual(file.placeholder, true);
                   verifyFile({ path: "fixtures/" + spec.id + "/" + file.path, bytes: file.size, sha256: file.sha256 });
                 }
+                const programEntry = module.functions.find(fn => fn.name === module.entry); assert.ok(programEntry);
+                const first = programEntry.body[0];
+                assert.ok(!(first?.kind === "throw" && first.value?.kind === "libCall" && first.value.fn === "error.new"));
+                assert.equal(item.ir.startupRefusalAbsent, true);
                 const nativeFunctions = module.functions.filter(fn => fn.loc?.file?.endsWith("/fixtures/" + spec.id + "/" + spec.entry)).map(fn => fn.name);
-                assert.ok(nativeFunctions.length > 0);
+                for (const name of ["value", "nativeObserve", "run", "main"]) {
+                  assert.ok(nativeFunctions.includes(name));
+                  assert.ok(module.functions.some(fn => fn.name === name && fn.loc?.file?.endsWith("/fixtures/" + spec.id + "/" + spec.entry) && fn.body.length > 0));
+                }
                 assert.deepEqual(item.ir.moduleOwnership, { nativeEntryFunctions: nativeFunctions, files: tree.files, links: tree.links });
               }
               for (const flavor of ["plain", "san"]) {
@@ -544,6 +573,8 @@ jobs:
                 verifyOutcome(execution, flavor === "san");
                 if (native.status === "passed") assert.equal(native.inputsVerifiedAfter, true);
                 if (execution.attempted) {
+                  assert.equal(item.ir.status, "passed");
+                  assert.equal(item.ir.startupRefusalAbsent, true);
                   const step = summary.steps.find(step => step.name === item.id + "-" + flavor + "-run");
                   assert.ok(step); assert.equal(step.command, "<temp>/shared-module-work/" + item.id + "-" + flavor + "/program");
                   assert.notEqual(step.status, "tool-error"); assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
@@ -561,8 +592,8 @@ jobs:
                 ["plain", "san"].every(flavor => item.flavors[flavor].execution.attempted === true));
             }
             const attempts = summary.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
-            assert.equal(summary.expectedExecutionAttempts, 4); assert.equal(summary.executionAttempts, attempts);
-            result.diagnosticComplete = summary.cases.every(item => item.complete) && attempts === 4 &&
+            assert.equal(summary.expectedExecutionAttempts, 2); assert.equal(summary.executionAttempts, attempts);
+            result.diagnosticComplete = summary.cases.every(item => item.complete) && attempts === 2 &&
               summary.sourceVerifiedBefore === true && summary.sourceVerifiedAfter === true && summary.fixturesVerifiedAfter === true;
             assert.equal(summary.diagnosticComplete, result.diagnosticComplete);
             result.qualificationComplete = result.diagnosticComplete && summary.cases.every(item =>
@@ -570,14 +601,14 @@ jobs:
             assert.equal(summary.qualificationComplete, result.qualificationComplete);
             assert.equal(summary.status, result.qualificationComplete ? "passed" : "failed");
           } catch (error) { result.error = String(error); result.diagnosticComplete = false; result.qualificationComplete = false; }
-          writeFileSync(join(process.env.RUNNER_TEMP, "promise-bridge-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
+          writeFileSync(join(process.env.RUNNER_TEMP, "promise-order-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
           console.log(JSON.stringify({ diagnosticComplete: result.diagnosticComplete, qualificationComplete: result.qualificationComplete }));
           if (!result.qualificationComplete) { console.error("[shared-module-comparison] FAILED (exit 1)"); process.exitCode = 1; }
           COMPARE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: promise-bridge-aggregate
-          path: ${{ runner.temp }}/promise-bridge-aggregate.json
+          name: promise-order-aggregate
+          path: ${{ runner.temp }}/promise-order-aggregate.json
           if-no-files-found: error
           retention-days: 3
