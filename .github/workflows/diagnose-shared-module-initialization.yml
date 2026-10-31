@@ -1,4 +1,4 @@
-name: Diagnose shared module initialization
+name: Retry shared module native execution
 
 on:
   push:
@@ -54,13 +54,13 @@ jobs:
       - run: pnpm build
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Observe every fixture under Node and native plain and SAN
+      - name: Retry native plain and SAN with verified prior Node and IR evidence
         run: |
           cat > "$RUNNER_TEMP/shared-module-diagnostic.mjs" <<'PROOF'
           import assert from "node:assert/strict";
           import { spawnSync } from "node:child_process";
           import { createHash } from "node:crypto";
-          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
           import { join, relative } from "node:path";
           import { pathToFileURL } from "node:url";
 
@@ -71,11 +71,24 @@ jobs:
           mkdirSync(out); mkdirSync(work);
           const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
           writeFileSync(join(work, ".diagnostic-owner.json"), JSON.stringify(owner), { flag: "wx" });
+          const priorArtifacts = {
+            baseline: { artifactId: "13043226117", archiveSha256: "efc20dfd0c2924334d9a497d3bea499999d5bdec723e9f433e800fbb941e78f3", summarySha256: "03f5b48156a4b5e4b0e461b2e1a0d636b7660fb19808b49e09456fc8077d9071", bridgeSha256: "2b3ecb681e949949cd8a8bd9cdba249aa8e9c5b2cc1d6e2f80300eac2ee8e674" },
+            candidate: { artifactId: "13042742708", archiveSha256: "1ef248ab1743a84eb0c075506765bcb4284ff0ca3f4f693835fca3294f6cd336", summarySha256: "f30f1ee185d63ab761d82f747d60c520049137dbaa2bd84b4f5d3f11f5b48a1f", bridgeSha256: "c1bb46279c5ec4f37256683425a4dd5dc1c77692f5c3d88dcd186044094996f6" },
+          };
+          const priorEvidence = {
+            kind: "prior-run-only", repeated: false, runId: "41201443584", workflow: "b9a91ec6f2afccd98378d703ccf77fe052989759", head,
+            runUrl: "https://github.com/vincentkoc/scriptc/actions/runs/41201443584",
+            fixtureDigest: "2c82dfe86bf188fe12742f7d49b56f23c5ddcf828d9783962b0f217ec8919c48",
+            scope: "five matched Node oracles and five passed IR and LLVM diagnostic envelopes, independently verified before retry",
+            ...priorArtifacts[process.env.DIAGNOSTIC_LABEL],
+          };
+          priorEvidence.artifactUrl = priorEvidence.runUrl + "/artifacts/" + priorEvidence.artifactId;
           const report = {
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             status: "running", diagnosticComplete: false, qualificationComplete: false,
-            completeSuite: false, startedAt: new Date().toISOString(), steps: [], cases: [],
+            completeSuite: false, scope: "native-execution-retry", priorEvidence,
+            expectedExecutionAttempts: 10, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
           const hash = path => digest(readFileSync(path));
@@ -151,6 +164,8 @@ jobs:
             "packages/runtime/src/scr_node_island_hooks.cjs", "packages/libnode-common/dev-pack.json", "pnpm-lock.yaml",
             "packages/runtime/src/scr_node_island_export.c", "packages/runtime/src/scr_regex.c", "packages/runtime/src/scr_regex.h",
             "native/llvm-codegen/src/target.h", "native/llvm-codegen/src/main.cpp", "packages/compiler/src/backend/native-codegen-core.ts",
+            "packages/libnode-common/fetch-dev-pack.mjs", "packages/libnode-common/build-pack.mjs",
+            "packages/libnode-common/bridge/scr_node_bridge.cc", "packages/runtime/src/scr_node_bridge.h",
           ];
           const source = () => {
             assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
@@ -229,6 +244,7 @@ jobs:
           const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
           save();
           try {
+            assert.equal(report.fixtureDigest, priorEvidence.fixtureDigest, "retry fixtures differ from verified prior evidence");
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
             assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
             report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
@@ -239,6 +255,23 @@ jobs:
             assert.equal(report.helper.ok, true);
             assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
             assert.equal(report.helper.scriptc_package_version, JSON.parse(readFileSync("packages/llvm-linux-x64-gnu/package.json", "utf8")).version);
+            const toolIdentity = (name, command) => {
+              const path = realpathSync(capture(name + "-path", "sh", ["-c", 'command -v "$1"', "diagnostic", command]));
+              return { command, path, sha256: hash(path), version: capture(name + "-version", command, ["--version"]) };
+            };
+            const cxx = process.env.CXX || "g++";
+            report.bridgeBuild = {
+              kind: "independent-reproduction", sharedPack: false, crossRevisionByteIdentity: "not-assumed",
+              compiler: toolIdentity("bridge-cxx", cxx), strip: toolIdentity("bridge-strip", "strip"),
+              linker: toolIdentity("bridge-linker", capture("bridge-linker-name", cxx, ["-print-prog-name=ld"])),
+              compilerTarget: capture("bridge-cxx-target", cxx, ["-dumpmachine"]),
+              image: { os: process.env.ImageOS, version: process.env.ImageVersion },
+              buildRecipe: "packages/libnode-common/build-pack.mjs:66", source: "packages/libnode-common/bridge/scr_node_bridge.cc",
+              sourceSha256: report.sourceInputs["packages/libnode-common/bridge/scr_node_bridge.cc"],
+              priorBridgeSha256: priorEvidence.bridgeSha256,
+              priorLibnodeSha256: "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838",
+              priorBridgeDifferenceCause: "not established; prior runs did not capture compiler and strip identities",
+            };
             const packRoot = join(work, "libnode");
             requireSuccess(execute("fetch-libnode", process.execPath, ["packages/libnode-common/fetch-dev-pack.mjs", "--out", packRoot], 600));
             const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
@@ -247,26 +280,25 @@ jobs:
             assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
             assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
             report.libnode = { manifest: pack.manifest, manifestSha256: hash(join(packRoot, "manifest.json")) };
+            report.bridgeBuild.currentBridgeSha256 = pack.manifest.files[pack.manifest.bridge].sha256;
+            report.bridgeBuild.currentLibnodeSha256 = pack.manifest.files[pack.manifest.libnode].sha256;
+            assert.equal(report.bridgeBuild.currentLibnodeSha256, report.bridgeBuild.priorLibnodeSha256);
             for (const spec of specs) {
               const observed = { id: spec.id, expectedStdoutSha256: digest(spec.expected), flavors: {} };
               report.cases.push(observed);
               const dir = join(fixtures, spec.id), entry = join(dir, "main.mjs"), island = join(dir, "island.mjs");
               const artifacts = join(out, spec.id); mkdirSync(artifacts);
               verifyFixtures();
-              const oracle = execute(spec.id + "-node", process.execPath, [entry], 30, { SCRIPTC_LIBNODE: "", SCRIPTC_SAN: "" });
-              observed.oracle = { ...oracle, expectedMatched: oracle.status === "completed" && oracle.stdoutSha256 === digest(spec.expected) && oracle.stderrBytes === 0 };
-              observed.oracle.parityOutcome = parityOutcome(oracle);
+              observed.prior = {
+                kind: "prior-run-only", repeated: false, runId: priorEvidence.runId, artifactId: priorEvidence.artifactId,
+                summarySha256: priorEvidence.summarySha256, summaryCase: spec.id,
+                oracle: { expectedMatched: true, status: "completed", code: 0, signal: null, stdoutSha256: digest(spec.expected), stderrSha256: digest("") },
+                ir: { diagnosticsStatus: "passed", artifactPath: spec.id + "/program.ir.json" },
+                llvm: { diagnosticsStatus: "passed", artifactPath: spec.id + "/program.ll" },
+              };
               const common = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics", "--node-islands=explicit", "--node-island=" + island];
-              const ir = join(artifacts, "program.ir.json"), irCache = join(work, spec.id + "-ir-cache"); mkdirSync(irCache);
-              observed.ir = execute(spec.id + "-ir", process.execPath, [...common, "--emit=ir", "-o", ir], 180, { SCRIPTC_CACHE_DIR: irCache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
-              if (existsSync(ir)) observed.ir.artifact = recordFile(ir);
-              validateCompile(observed.ir, entry, ir, island);
-              const llvm = join(artifacts, "program.ll"), llvmCache = join(work, spec.id + "-llvm-cache"); mkdirSync(llvmCache);
-              observed.llvm = execute(spec.id + "-llvm", process.execPath, [...common, "--emit=llvm", "-o", llvm], 180, { SCRIPTC_CACHE_DIR: llvmCache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
-              if (existsSync(llvm)) observed.llvm.artifact = recordFile(llvm);
-              validateCompile(observed.llvm, entry, llvm, island);
               for (const flavor of ["plain", "san"]) {
-                const result = observed.flavors[flavor] = { status: "running", execution: { status: "not-built" }, parity: "not-compared" };
+                const result = observed.flavors[flavor] = { status: "running", execution: { status: "not-executed", attempted: false }, parity: "not-compared" };
                 const build = join(work, spec.id + "-" + flavor); mkdirSync(build);
                 const binary = join(build, "program"), cache = join(build, "cache"); mkdirSync(cache);
                 const env = { SCRIPTC_CACHE_DIR: cache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: packRoot, ASAN_OPTIONS: "detect_leaks=0" };
@@ -278,21 +310,23 @@ jobs:
                     const llvm = join(artifacts, flavor + ".ll"); copyFileSync(join(build, "main.ll"), llvm); result.llvm = recordFile(llvm);
                   }
                   assert.ok(validateCompile(result.compile, entry, binary, island), "native compilation or diagnostics failed");
+                  result.execution = { status: "blocked-before-execution", attempted: false };
                   const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
                   assert.deepEqual(beside.manifest, pack.manifest);
                   const modules = join(beside.root, "modules");
                   result.moduleFiles = moduleFiles(modules);
                   assert.deepEqual(result.moduleFiles.map(file => file.path).sort(), ["helper.mjs", "island.mjs"]);
                   assert.equal(hash(join(modules, "island.mjs")), hash(island));
-                  assert.equal(readFileSync(join(modules, "helper.mjs"), "utf8"), providedModulePlaceholder("helper.mjs"));
+                  assert.deepEqual(readFileSync(join(modules, "helper.mjs")), Buffer.from(providedModulePlaceholder("helper.mjs")));
                   result.moduleOwners = { entry: "native", island: "embedded-node", helper: "native-provided-placeholder" };
                   result.binarySha256 = hash(binary);
                   const manifestCopy = join(artifacts, flavor + ".libnode-manifest.json");
                   copyFileSync(join(beside.root, "manifest.json"), manifestCopy); result.libnodeManifest = recordFile(manifestCopy);
                   result.execution = execute(spec.id + "-" + flavor + "-run", binary, [], 30, { ...env, SCRIPTC_LIBNODE: "" });
+                  result.execution.attempted = result.execution.status !== "tool-error";
                   result.execution.parityOutcome = parityOutcome(result.execution, flavor === "san");
-                  const expectedOutcome = observed.oracle.parityOutcome, actualOutcome = result.execution.parityOutcome;
-                  result.parity = observed.oracle.expectedMatched && result.execution.status === "completed" &&
+                  const expectedOutcome = observed.prior.oracle, actualOutcome = result.execution.parityOutcome;
+                  result.parity = expectedOutcome.expectedMatched && result.execution.status === "completed" &&
                     actualOutcome.code === expectedOutcome.code && actualOutcome.signal === expectedOutcome.signal &&
                     actualOutcome.stdoutSha256 === expectedOutcome.stdoutSha256 && actualOutcome.stderrSha256 === expectedOutcome.stderrSha256 ? "matched" : "mismatch";
                   assert.equal(hash(binary), result.binarySha256);
@@ -303,18 +337,17 @@ jobs:
                 } catch (error) { result.status = "failed"; result.error = scrub(error.stack ?? error); }
                 finally { save(); }
               }
-              observed.complete = true; save();
+              observed.complete = ["plain", "san"].every(flavor => observed.flavors[flavor].execution.attempted === true); save();
             }
+            report.executionAttempts = report.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
             report.diagnosticComplete = report.cases.length === specs.length && report.cases.every(item => item.complete);
-            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item => item.oracle.expectedMatched &&
-              item.ir.status === "completed" && item.ir.diagnosticsStatus === "passed" && item.ir.artifact &&
-              item.llvm.status === "completed" && item.llvm.diagnosticsStatus === "passed" && item.llvm.artifact &&
-              ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed"));
+            report.diagnosticComplete &&= report.executionAttempts === report.expectedExecutionAttempts;
+            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item => ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed"));
             report.status = report.qualificationComplete ? "passed" : "failed";
           } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
           finally {
             try { assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true; }
-            catch (error) { report.status = "failed"; report.qualificationComplete = false; report.sourceError = scrub(error.stack ?? error); }
+            catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.sourceError = scrub(error.stack ?? error); }
             report.finishedAt = new Date().toISOString(); save();
             writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
             console.log(JSON.stringify({ label: report.label, status: report.status, diagnosticComplete: report.diagnosticComplete, qualificationComplete: report.qualificationComplete }));
@@ -376,6 +409,10 @@ jobs:
           import { readFileSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
           const heads = { baseline: "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486", candidate: "923a57d63cc1a32324cd0a4d514935db3f2ad264" };
+          const priorArtifacts = {
+            baseline: { artifactId: "13043226117", archiveSha256: "efc20dfd0c2924334d9a497d3bea499999d5bdec723e9f433e800fbb941e78f3", summarySha256: "03f5b48156a4b5e4b0e461b2e1a0d636b7660fb19808b49e09456fc8077d9071" },
+            candidate: { artifactId: "13042742708", archiveSha256: "1ef248ab1743a84eb0c075506765bcb4284ff0ca3f4f693835fca3294f6cd336", summarySha256: "f30f1ee185d63ab761d82f747d60c520049137dbaa2bd84b4f5d3f11f5b48a1f" },
+          };
           const expected = ["scalar-only", "private-state-after-promise", "immediate-island-use", "native-helper-before-island", "native-helper-after-island"];
           const paired = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, diagnosticComplete: false, qualificationComplete: false, sources: {} };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -385,6 +422,13 @@ jobs:
               const bytes = readFileSync(join(dir, "summary.json")), summary = JSON.parse(bytes);
               assert.equal(digest(bytes), readFileSync(join(dir, "summary.sha256"), "utf8").trim());
               assert.equal(summary.head, head); assert.equal(summary.workflow, paired.workflow); assert.equal(summary.runId, paired.runId);
+              assert.equal(summary.scope, "native-execution-retry");
+              const prior = summary.priorEvidence;
+              assert.equal(prior.kind, "prior-run-only"); assert.equal(prior.repeated, false); assert.equal(prior.head, head);
+              assert.equal(prior.runId, "41201443584"); assert.equal(prior.workflow, "b9a91ec6f2afccd98378d703ccf77fe052989759");
+              for (const [key, value] of Object.entries(priorArtifacts[label])) assert.equal(prior[key], value);
+              assert.equal(prior.fixtureDigest, "2c82dfe86bf188fe12742f7d49b56f23c5ddcf828d9783962b0f217ec8919c48");
+              assert.equal(summary.fixtureDigest, prior.fixtureDigest);
               const cleanup = JSON.parse(readFileSync(join(dir, "cleanup.json"), "utf8"));
               assert.equal(cleanup.runId, paired.runId); assert.equal(cleanup.workflow, paired.workflow); assert.equal(cleanup.label, label);
               assert.equal(cleanup.error, undefined); assert.ok(["removed", "absent"].includes(cleanup.work)); assert.ok(["removed", "absent"].includes(cleanup.payload));
@@ -393,12 +437,27 @@ jobs:
               for (const step of summary.steps) for (const stream of ["stdout", "stderr"])
                 assert.equal(digest(readFileSync(join(dir, step[stream]))), step[stream + "Sha256"]);
               for (const item of summary.cases) {
-                const artifacts = [item.ir.artifact, item.llvm.artifact, ...Object.values(item.flavors).flatMap(flavor => [flavor.llvm, flavor.libnodeManifest])];
+                assert.equal(item.prior.kind, "prior-run-only"); assert.equal(item.prior.repeated, false);
+                assert.equal(item.prior.runId, prior.runId); assert.equal(item.prior.artifactId, prior.artifactId);
+                assert.equal(item.prior.summarySha256, prior.summarySha256); assert.equal(item.prior.summaryCase, item.id);
+                const expectedStdout = digest(readFileSync(join(dir, "fixtures", item.id, "expected.stdout.log")));
+                assert.equal(item.prior.oracle.stdoutSha256, expectedStdout); assert.equal(item.prior.oracle.stderrSha256, digest(""));
+                assert.equal(item.prior.oracle.code, 0); assert.equal(item.prior.oracle.signal, null);
+                const artifacts = Object.values(item.flavors).flatMap(flavor => [flavor.llvm, flavor.libnodeManifest]);
                 for (const file of artifacts.filter(Boolean)) assert.equal(digest(readFileSync(join(dir, file.path))), file.sha256);
-                const outcomes = [item.oracle.parityOutcome, ...Object.values(item.flavors).map(flavor => flavor.execution.parityOutcome)].filter(Boolean);
+                const outcomes = Object.values(item.flavors).map(flavor => flavor.execution.parityOutcome).filter(Boolean);
                 for (const outcome of outcomes) for (const stream of ["stdout", "stderr"])
                   assert.equal(digest(readFileSync(join(dir, outcome[stream]))), outcome[stream + "Sha256"]);
               }
+              const attempts = summary.cases.flatMap(item => ["plain", "san"].map(flavor => ({ item, flavor, execution: item.flavors[flavor].execution })))
+                .filter(({ execution }) => execution.attempted === true);
+              assert.equal(summary.executionAttempts, attempts.length);
+              for (const { item, flavor, execution } of attempts) {
+                const step = summary.steps.find(step => step.name === item.id + "-" + flavor + "-run");
+                assert.ok(step); assert.equal(step.command, "<temp>/shared-module-work/" + item.id + "-" + flavor + "/program");
+                assert.notEqual(step.status, "tool-error"); assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
+              }
+              if (summary.diagnosticComplete) assert.equal(attempts.length, 10);
               paired.sources[label] = summary;
             }
             assert.equal(paired.sources.baseline.fixtureDigest, paired.sources.candidate.fixtureDigest);
