@@ -1,4 +1,4 @@
-name: Retry shared module native execution
+name: Diagnose shared module cycles and live bindings
 
 on:
   push:
@@ -16,23 +16,15 @@ jobs:
   diagnose:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: baseline
-            source: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
-          - label: candidate
-            source: 923a57d63cc1a32324cd0a4d514935db3f2ad264
     env:
       NODE_OPTIONS: --max-old-space-size=4096
-      DIAGNOSTIC_SOURCE: ${{ matrix.source }}
-      DIAGNOSTIC_LABEL: ${{ matrix.label }}
+      DIAGNOSTIC_SOURCE: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+      DIAGNOSTIC_LABEL: baseline
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: ${{ matrix.source }}
+          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
           persist-credentials: false
       - name: Verify source before setup
         run: |
@@ -54,7 +46,7 @@ jobs:
       - run: pnpm build
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Retry native plain and SAN with verified prior Node and IR evidence
+      - name: Observe Node, IR, native plain and SAN for cycle and binding fixtures
         run: |
           cat > "$RUNNER_TEMP/shared-module-diagnostic.mjs" <<'PROOF'
           import assert from "node:assert/strict";
@@ -71,24 +63,17 @@ jobs:
           mkdirSync(out); mkdirSync(work);
           const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
           writeFileSync(join(work, ".diagnostic-owner.json"), JSON.stringify(owner), { flag: "wx" });
-          const priorArtifacts = {
-            baseline: { artifactId: "13043226117", archiveSha256: "efc20dfd0c2924334d9a497d3bea499999d5bdec723e9f433e800fbb941e78f3", summarySha256: "03f5b48156a4b5e4b0e461b2e1a0d636b7660fb19808b49e09456fc8077d9071", bridgeSha256: "2b3ecb681e949949cd8a8bd9cdba249aa8e9c5b2cc1d6e2f80300eac2ee8e674" },
-            candidate: { artifactId: "13042742708", archiveSha256: "1ef248ab1743a84eb0c075506765bcb4284ff0ca3f4f693835fca3294f6cd336", summarySha256: "f30f1ee185d63ab761d82f747d60c520049137dbaa2bd84b4f5d3f11f5b48a1f", bridgeSha256: "c1bb46279c5ec4f37256683425a4dd5dc1c77692f5c3d88dcd186044094996f6" },
+          // The earlier five cases are settled; these links are context, not reused proof.
+          const settledEvidence = {
+            repeated: false, usedForQualification: false, workflow: "25b6ada8b94856f532024ae681754f44df94f57c",
+            runs: ["https://github.com/vincentkoc/scriptc/actions/runs/41201443584", "https://github.com/vincentkoc/scriptc/actions/runs/41202386134"],
           };
-          const priorEvidence = {
-            kind: "prior-run-only", repeated: false, runId: "41201443584", workflow: "b9a91ec6f2afccd98378d703ccf77fe052989759", head,
-            runUrl: "https://github.com/vincentkoc/scriptc/actions/runs/41201443584",
-            fixtureDigest: "2c82dfe86bf188fe12742f7d49b56f23c5ddcf828d9783962b0f217ec8919c48",
-            scope: "five matched Node oracles and five passed IR and LLVM diagnostic envelopes, independently verified before retry",
-            ...priorArtifacts[process.env.DIAGNOSTIC_LABEL],
-          };
-          priorEvidence.artifactUrl = priorEvidence.runUrl + "/artifacts/" + priorEvidence.artifactId;
           const report = {
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             status: "running", diagnosticComplete: false, qualificationComplete: false,
-            completeSuite: false, scope: "native-execution-retry", priorEvidence,
-            expectedExecutionAttempts: 10, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
+            completeSuite: false, scope: "cycle-live-binding-baseline", settledEvidence,
+            expectedExecutionAttempts: 6, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
           const hash = path => digest(readFileSync(path));
@@ -124,7 +109,7 @@ jobs:
           };
           const requireSuccess = step => { assert.equal(step.status, "completed", step.name); return step; };
           const capture = (name, command, args) => text(requireSuccess(execute(name, command, args))).trim();
-          const validateCompile = (step, entry, artifact, island) => {
+          const validateCompile = (step, entry, artifact, markedIslands) => {
             try {
               requireSuccess(step);
               const diagnostics = JSON.parse(text(step));
@@ -134,7 +119,7 @@ jobs:
               assert.equal(diagnostics.success, true); assert.ok(Array.isArray(diagnostics.diagnostics));
               assert.equal(diagnostics.diagnostics.filter(item => item.severity === "error").length, 0);
               const islands = diagnostics.diagnostics.filter(item => item.code === "SC8001");
-              assert.equal(islands.length, 1); assert.equal(islands[0].file, island);
+              assert.deepEqual(islands.map(item => item.file).sort(), [...markedIslands].sort());
               step.diagnosticsStatus = "passed"; return true;
             } catch (error) {
               step.diagnosticsStatus = "failed"; step.diagnosticsError = scrub(error.stack ?? error); return false;
@@ -179,62 +164,59 @@ jobs:
             if (info.isDirectory()) return moduleFiles(path).map(file => ({ ...file, path: entry.name + "/" + file.path }));
             assert.ok(info.isFile()); return [{ path: entry.name, bytes: info.size, sha256: hash(path) }];
           });
-          const scalarHelper = [
-            'let count = 40;', 'let initialized = 0;', 'initialized += 1;',
-            'console.log("helper:init", initialized);',
-            'export function readScalar() { count += 1; return count; }',
-            'export function initializationCount() { return initialized; }', '',
-          ].join("\n");
-          const stateHelper = scalarHelper + [
-            'const expression = /^seed:[0-9]+$/;', 'const values = [7, 11];',
-            'const record = { value: 13 };', 'const lookup = new Map([["seed", 17]]);',
-            'export function readState() {',
-            '  const value = readScalar();',
-            '  console.log("helper:read", value, initializationCount());',
-            '  return value + ":" + initializationCount() + ":" + (expression.test("seed:7") ? 1 : 0) + ":" + values[1] + ":" + record.value + ":" + lookup.get("seed");',
-            '}', '',
-          ].join("\n");
-          const immediateIsland = [
-            'import { readState } from "./helper.mjs";',
-            'console.log("island:top", readState());',
-            'export function read() { return readState(); }', '',
-          ].join("\n");
-          const reads = 'console.log("main:read", read());\nconsole.log("main:read", read());\n';
-          const initial = "helper:init 1\n", state = n => n + ":1:1:11:13:17";
-          const stateRead = n => "helper:read " + n + " 1\nmain:read " + state(n) + "\n";
-          const immediateOutput = initial + "helper:read 41 1\nisland:top " + state(41) + "\n";
           const specs = [
             {
-              id: "scalar-only", helper: scalarHelper,
-              island: 'import { readScalar, initializationCount } from "./helper.mjs";\nconsole.log("island:init");\nexport function read() { return readScalar(); }\nexport function count() { return initializationCount(); }\n',
-              main: 'import { read, count } from "./island.mjs";\nconsole.log("main:read", read(), count());\nconsole.log("main:read", read(), count());\n',
-              expected: initial + "island:init\nmain:read 41 1\nmain:read 42 1\n",
+              "id": "shared-evaluation",
+              "origin": "tests/corpus/node-island-shared-evaluation",
+              "transform": "none",
+              "islands": [
+                "island.mjs",
+                "observer.mjs"
+              ],
+              "files": {
+                "helper.mjs": "// @ts-nocheck -- the exported function binding is deliberately reassigned.\nimport \"./observer.mjs\";\nimport { probe } from \"./island.mjs\";\n\nlet initializations = 0;\ninitializations++;\nexport let first = 41;\nprobe(\"between\", marker);\nexport let second = probe(\"second\", marker);\n\nexport function marker() {\n  return \"marker\";\n}\n\nexport function identity() {\n  return marker;\n}\n\nexport function count() {\n  return initializations;\n}\n\nexport function label() {\n  return \"original\";\n}\n\nexport function change() {\n  first++;\n  label = () => \"changed\";\n}\n",
+                "island.mjs": "import { first, second, marker, count, label, change } from \"./helper.mjs\";\n\nfunction read(get) {\n  try {\n    return String(get());\n  } catch (error) {\n    return error.name;\n  }\n}\n\nexport function probe(phase, supplied) {\n  console.log(\"probe\", phase, supplied === marker, marker(), read(() => first), read(() => second));\n  return 42;\n}\n\nexport function report() {\n  return `${first}:${second}:${count()}:${label()}`;\n}\n\nexport function update() {\n  change();\n}\n\nconsole.log(\"island\", report());\n",
+                "main.mjs": "// @requires-libnode\n// Node enters the cycle before the native shared module evaluates.\nimport { report, update } from \"./island.mjs\";\n\nconsole.log(\"main\", report());\nupdate();\nconsole.log(\"updated\", report());\n",
+                "observer.mjs": "import { first, second, marker, identity } from \"./helper.mjs\";\n\nfunction read(get) {\n  try {\n    return String(get());\n  } catch (error) {\n    return error.name;\n  }\n}\n\nconsole.log(\"hoisted\", marker(), identity() === marker, read(() => first), read(() => second));\n",
+                "package.json": "{ \"name\": \"node-island-shared-evaluation\", \"private\": true, \"type\": \"module\", \"scriptc\": { \"nodeIslands\": { \"auto\": false, \"modules\": [\"island.mjs\", \"observer.mjs\"] } } }\n"
+              },
+              "expected": "hoisted marker true ReferenceError ReferenceError\nprobe between true marker 41 ReferenceError\nprobe second true marker 41 ReferenceError\nisland 41:42:1:original\nmain 41:42:1:original\nupdated 42:42:1:changed\n"
             },
             {
-              id: "private-state-after-promise", helper: stateHelper,
-              island: 'import { readState } from "./helper.mjs";\nconsole.log("island:init");\nexport async function read() { await Promise.resolve(); return readState(); }\n',
-              main: 'import { read } from "./island.mjs";\nconsole.log("main:read", await read());\nconsole.log("main:read", await read());\n',
-              expected: initial + "island:init\n" + stateRead(41) + stateRead(42),
+              "id": "shared-declarator-island-first",
+              "origin": "tests/corpus/node-island-shared-declarator",
+              "transform": "none",
+              "islands": [
+                "island.mjs"
+              ],
+              "files": {
+                "helper.mjs": "// @ts-nocheck -- legal function reassignment is part of the live-binding test.\nimport { observe } from \"./island.mjs\";\n\nexport function f() {\n  return \"old\";\n}\n\nobserve(\"early\", f);\nexport let x = 1, marker = observe(\"mid\", f);\nexport let y = 2;\nf = () => \"new\";\nobserve(\"late\", f);\n",
+                "island.mjs": "import { f, x, y } from \"./helper.mjs\";\n\n// The callback can run before this module evaluates. Do not reset its saved function.\nvar first;\n\nfunction read(name) {\n  try {\n    return String(name === \"x\" ? x : y);\n  } catch (error) {\n    return error.name;\n  }\n}\n\nexport function observe(phase, supplied) {\n  if (first === undefined) first = supplied;\n  console.log(phase, supplied === f, supplied(), read(\"x\"), read(\"y\"));\n  return 0;\n}\n\nexport function report() {\n  return `${first()}/${f()}/${x}/${y}`;\n}\n",
+                "main.mjs": "// @requires-libnode\nimport { report } from \"./island.mjs\";\n\nconsole.log(\"main\", report());\n",
+                "package.json": "{ \"name\": \"node-island-shared-declarator\", \"private\": true, \"type\": \"module\", \"scriptc\": { \"nodeIslands\": { \"auto\": false, \"modules\": [\"island.mjs\"] } } }\n"
+              },
+              "expected": "early true old ReferenceError ReferenceError\nmid true old 1 ReferenceError\nlate true new 1 2\nmain old/new/1/2\n"
             },
             {
-              id: "immediate-island-use", helper: stateHelper, island: immediateIsland,
-              main: 'import { read } from "./island.mjs";\n' + reads,
-              expected: immediateOutput + stateRead(42) + stateRead(43),
-            },
-            ...["before", "after"].map(order => ({
-              id: "native-helper-" + order + "-island", helper: stateHelper, island: immediateIsland,
-              // Both controls read in island evaluation; main never warms the helper first.
-              main: (order === "before" ?
-                'import { initializationCount } from "./helper.mjs";\nimport { read } from "./island.mjs";\n' :
-                'import { read } from "./island.mjs";\nimport { initializationCount } from "./helper.mjs";\n') +
-                'console.log("main:direct-count", initializationCount());\n' + reads,
-              expected: immediateOutput + "main:direct-count 1\n" + stateRead(42) + stateRead(43),
-            })),
+              "id": "shared-declarator-native-first",
+              "origin": "tests/corpus/node-island-shared-declarator",
+              "transform": "prepend native helper import",
+              "islands": [
+                "island.mjs"
+              ],
+              "files": {
+                "helper.mjs": "// @ts-nocheck -- legal function reassignment is part of the live-binding test.\nimport { observe } from \"./island.mjs\";\n\nexport function f() {\n  return \"old\";\n}\n\nobserve(\"early\", f);\nexport let x = 1, marker = observe(\"mid\", f);\nexport let y = 2;\nf = () => \"new\";\nobserve(\"late\", f);\n",
+                "island.mjs": "import { f, x, y } from \"./helper.mjs\";\n\n// The callback can run before this module evaluates. Do not reset its saved function.\nvar first;\n\nfunction read(name) {\n  try {\n    return String(name === \"x\" ? x : y);\n  } catch (error) {\n    return error.name;\n  }\n}\n\nexport function observe(phase, supplied) {\n  if (first === undefined) first = supplied;\n  console.log(phase, supplied === f, supplied(), read(\"x\"), read(\"y\"));\n  return 0;\n}\n\nexport function report() {\n  return `${first()}/${f()}/${x}/${y}`;\n}\n",
+                "main.mjs": "import \"./helper.mjs\";\n// @requires-libnode\nimport { report } from \"./island.mjs\";\n\nconsole.log(\"main\", report());\n",
+                "package.json": "{ \"name\": \"node-island-shared-declarator\", \"private\": true, \"type\": \"module\", \"scriptc\": { \"nodeIslands\": { \"auto\": false, \"modules\": [\"island.mjs\"] } } }\n"
+              },
+              "expected": "early true old ReferenceError ReferenceError\nmid true old 1 ReferenceError\nlate true new 1 2\nmain old/new/1/2\n"
+            }
           ];
           const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
           for (const spec of specs) {
             const dir = join(fixtures, spec.id); mkdirSync(dir);
-            for (const [file, contents] of [["main.mjs", spec.main], ["island.mjs", spec.island], ["helper.mjs", spec.helper]])
+            for (const [file, contents] of Object.entries(spec.files))
               writeFileSync(join(dir, file), contents);
             writeFileSync(join(dir, "expected.stdout.log"), spec.expected);
           }
@@ -244,7 +226,7 @@ jobs:
           const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
           save();
           try {
-            assert.equal(report.fixtureDigest, priorEvidence.fixtureDigest, "retry fixtures differ from verified prior evidence");
+            assert.equal(report.fixtureDigest, "5782e4a87e65b414748a840f7420cbe5de0fbbf593c6f28de8782647d59e7c43", "authored fixture bytes changed");
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
             assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
             report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
@@ -268,9 +250,7 @@ jobs:
               image: { os: process.env.ImageOS, version: process.env.ImageVersion },
               buildRecipe: "packages/libnode-common/build-pack.mjs:66", source: "packages/libnode-common/bridge/scr_node_bridge.cc",
               sourceSha256: report.sourceInputs["packages/libnode-common/bridge/scr_node_bridge.cc"],
-              priorBridgeSha256: priorEvidence.bridgeSha256,
-              priorLibnodeSha256: "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838",
-              priorBridgeDifferenceCause: "not established; prior runs did not capture compiler and strip identities",
+              pinnedLibnodeSha256: "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838",
             };
             const packRoot = join(work, "libnode");
             requireSuccess(execute("fetch-libnode", process.execPath, ["packages/libnode-common/fetch-dev-pack.mjs", "--out", packRoot], 600));
@@ -282,21 +262,33 @@ jobs:
             report.libnode = { manifest: pack.manifest, manifestSha256: hash(join(packRoot, "manifest.json")) };
             report.bridgeBuild.currentBridgeSha256 = pack.manifest.files[pack.manifest.bridge].sha256;
             report.bridgeBuild.currentLibnodeSha256 = pack.manifest.files[pack.manifest.libnode].sha256;
-            assert.equal(report.bridgeBuild.currentLibnodeSha256, report.bridgeBuild.priorLibnodeSha256);
+            assert.equal(report.bridgeBuild.currentLibnodeSha256, report.bridgeBuild.pinnedLibnodeSha256);
             for (const spec of specs) {
-              const observed = { id: spec.id, expectedStdoutSha256: digest(spec.expected), flavors: {} };
+              const observed = { id: spec.id, origin: spec.origin, transform: spec.transform, markedIslands: spec.islands, expectedStdoutSha256: digest(spec.expected), flavors: {} };
               report.cases.push(observed);
-              const dir = join(fixtures, spec.id), entry = join(dir, "main.mjs"), island = join(dir, "island.mjs");
+              const dir = join(fixtures, spec.id), entry = join(dir, "main.mjs"), markedIslands = spec.islands.map(file => join(dir, file));
               const artifacts = join(out, spec.id); mkdirSync(artifacts);
               verifyFixtures();
-              observed.prior = {
-                kind: "prior-run-only", repeated: false, runId: priorEvidence.runId, artifactId: priorEvidence.artifactId,
-                summarySha256: priorEvidence.summarySha256, summaryCase: spec.id,
-                oracle: { expectedMatched: true, status: "completed", code: 0, signal: null, stdoutSha256: digest(spec.expected), stderrSha256: digest("") },
-                ir: { diagnosticsStatus: "passed", artifactPath: spec.id + "/program.ir.json" },
-                llvm: { diagnosticsStatus: "passed", artifactPath: spec.id + "/program.ll" },
-              };
-              const common = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics", "--node-islands=explicit", "--node-island=" + island];
+              try {
+                observed.oracle = execute(spec.id + "-node", process.execPath, [entry], 30, { SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.oracle.attempted = observed.oracle.status !== "tool-error";
+                observed.oracle.parityOutcome = parityOutcome(observed.oracle);
+                observed.oracle.expectedMatched = observed.oracle.status === "completed" &&
+                  observed.oracle.stdoutSha256 === digest(spec.expected) && observed.oracle.stderrBytes === 0;
+              } catch (error) { observed.oracleError = scrub(error.stack ?? error); }
+              const common = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics", "--node-islands=explicit", ...markedIslands.map(file => "--node-island=" + file)];
+              const irPath = join(artifacts, "program.ir.json"), irCache = join(work, spec.id + "-ir-cache"); mkdirSync(irCache);
+              observed.ir = { status: "running", attempted: false };
+              try {
+                observed.ir.compile = execute(spec.id + "-ir", process.execPath, [...common, "--emit=ir", "-o", irPath], 180,
+                  { SCRIPTC_CACHE_DIR: irCache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.ir.attempted = observed.ir.compile.status !== "tool-error";
+                if (existsSync(irPath)) observed.ir.artifact = recordFile(irPath);
+                assert.ok(validateCompile(observed.ir.compile, entry, irPath, markedIslands), "IR compilation or diagnostics failed");
+                assert.ok(observed.ir.artifact, "successful IR build did not produce its artifact");
+                observed.ir.status = "passed";
+              } catch (error) { observed.ir.status = "failed"; observed.ir.error = scrub(error.stack ?? error); }
+              finally { save(); }
               for (const flavor of ["plain", "san"]) {
                 const result = observed.flavors[flavor] = { status: "running", execution: { status: "not-executed", attempted: false }, parity: "not-compared" };
                 const build = join(work, spec.id + "-" + flavor); mkdirSync(build);
@@ -309,24 +301,24 @@ jobs:
                   if (existsSync(join(build, "main.ll"))) {
                     const llvm = join(artifacts, flavor + ".ll"); copyFileSync(join(build, "main.ll"), llvm); result.llvm = recordFile(llvm);
                   }
-                  assert.ok(validateCompile(result.compile, entry, binary, island), "native compilation or diagnostics failed");
+                  assert.ok(validateCompile(result.compile, entry, binary, markedIslands), "native compilation or diagnostics failed");
                   result.execution = { status: "blocked-before-execution", attempted: false };
                   const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
                   assert.deepEqual(beside.manifest, pack.manifest);
                   const modules = join(beside.root, "modules");
                   result.moduleFiles = moduleFiles(modules);
-                  assert.deepEqual(result.moduleFiles.map(file => file.path).sort(), ["helper.mjs", "island.mjs"]);
-                  assert.equal(hash(join(modules, "island.mjs")), hash(island));
+                  assert.deepEqual(result.moduleFiles.map(file => file.path).sort(), ["helper.mjs", "package.json", ...spec.islands].sort());
+                  for (const file of ["package.json", ...spec.islands]) assert.equal(hash(join(modules, file)), hash(join(dir, file)));
                   assert.deepEqual(readFileSync(join(modules, "helper.mjs")), Buffer.from(providedModulePlaceholder("helper.mjs")));
-                  result.moduleOwners = { entry: "native", island: "embedded-node", helper: "native-provided-placeholder" };
+                  result.moduleOwners = { entry: "native", islands: spec.islands, helper: "native-provided-placeholder" };
                   result.binarySha256 = hash(binary);
                   const manifestCopy = join(artifacts, flavor + ".libnode-manifest.json");
                   copyFileSync(join(beside.root, "manifest.json"), manifestCopy); result.libnodeManifest = recordFile(manifestCopy);
                   result.execution = execute(spec.id + "-" + flavor + "-run", binary, [], 30, { ...env, SCRIPTC_LIBNODE: "" });
                   result.execution.attempted = result.execution.status !== "tool-error";
                   result.execution.parityOutcome = parityOutcome(result.execution, flavor === "san");
-                  const expectedOutcome = observed.prior.oracle, actualOutcome = result.execution.parityOutcome;
-                  result.parity = expectedOutcome.expectedMatched && result.execution.status === "completed" &&
+                  const expectedOutcome = observed.oracle?.parityOutcome, actualOutcome = result.execution.parityOutcome;
+                  result.parity = observed.oracle?.expectedMatched && expectedOutcome && result.execution.status === "completed" &&
                     actualOutcome.code === expectedOutcome.code && actualOutcome.signal === expectedOutcome.signal &&
                     actualOutcome.stdoutSha256 === expectedOutcome.stdoutSha256 && actualOutcome.stderrSha256 === expectedOutcome.stderrSha256 ? "matched" : "mismatch";
                   assert.equal(hash(binary), result.binarySha256);
@@ -337,12 +329,13 @@ jobs:
                 } catch (error) { result.status = "failed"; result.error = scrub(error.stack ?? error); }
                 finally { save(); }
               }
-              observed.complete = ["plain", "san"].every(flavor => observed.flavors[flavor].execution.attempted === true); save();
+              observed.complete = observed.oracle?.attempted === true && observed.ir.attempted === true &&
+                ["plain", "san"].every(flavor => observed.flavors[flavor].execution.attempted === true); save();
             }
             report.executionAttempts = report.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
             report.diagnosticComplete = report.cases.length === specs.length && report.cases.every(item => item.complete);
             report.diagnosticComplete &&= report.executionAttempts === report.expectedExecutionAttempts;
-            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item => ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed"));
+            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item => item.oracle?.expectedMatched && item.ir.status === "passed" && ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed"));
             report.status = report.qualificationComplete ? "passed" : "failed";
           } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
           finally {
@@ -383,12 +376,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-module-${{ matrix.label }}
+          name: cycle-binding-baseline
           path: ${{ runner.temp }}/shared-module-proof
           if-no-files-found: error
           retention-days: 3
 
-  compare:
+  aggregate:
     needs: diagnose
     if: always()
     runs-on: ubuntu-24.04
@@ -399,79 +392,121 @@ jobs:
           node-version: 24.22.1
       - uses: actions/download-artifact@v4
         with:
-          pattern: shared-module-*
-          path: ${{ runner.temp }}/shared-module-results
-      - name: Verify paired evidence and strict parity
+          name: cycle-binding-baseline
+          path: ${{ runner.temp }}/cycle-binding-results
+      - name: Verify baseline evidence and strict parity
         run: |
           node --input-type=module <<'COMPARE'
           import assert from "node:assert/strict";
           import { createHash } from "node:crypto";
           import { readFileSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
-          const heads = { baseline: "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486", candidate: "923a57d63cc1a32324cd0a4d514935db3f2ad264" };
-          const priorArtifacts = {
-            baseline: { artifactId: "13043226117", archiveSha256: "efc20dfd0c2924334d9a497d3bea499999d5bdec723e9f433e800fbb941e78f3", summarySha256: "03f5b48156a4b5e4b0e461b2e1a0d636b7660fb19808b49e09456fc8077d9071" },
-            candidate: { artifactId: "13042742708", archiveSha256: "1ef248ab1743a84eb0c075506765bcb4284ff0ca3f4f693835fca3294f6cd336", summarySha256: "f30f1ee185d63ab761d82f747d60c520049137dbaa2bd84b4f5d3f11f5b48a1f" },
+          const head = "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486";
+          const expected = {
+            "shared-evaluation": ["island.mjs", "observer.mjs"],
+            "shared-declarator-island-first": ["island.mjs"],
+            "shared-declarator-native-first": ["island.mjs"],
           };
-          const expected = ["scalar-only", "private-state-after-promise", "immediate-island-use", "native-helper-before-island", "native-helper-after-island"];
-          const paired = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, diagnosticComplete: false, qualificationComplete: false, sources: {} };
+          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, scope: "cycle-live-binding-baseline", diagnosticComplete: false, qualificationComplete: false };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const dir = join(process.env.RUNNER_TEMP, "cycle-binding-results");
+          const verifyFile = file => {
+            const bytes = readFileSync(join(dir, file.path));
+            assert.equal(digest(bytes), file.sha256); assert.equal(bytes.length, file.bytes);
+          };
+          const ASAN_SWAP = /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext.*\n/gm;
+          const verifyOutcome = (execution, sanitize) => {
+            const outcome = execution.parityOutcome;
+            if (!outcome) return;
+            let removedLines = 0;
+            const raw = readFileSync(join(dir, execution.stderr), "utf8");
+            const normalized = sanitize ? raw.replace(ASAN_SWAP, () => { removedLines += 1; return ""; }) : raw;
+            assert.equal(readFileSync(join(dir, outcome.stderr), "utf8"), normalized);
+            assert.equal(outcome.stderrSha256, digest(normalized)); assert.equal(outcome.stdoutSha256, execution.stdoutSha256);
+            assert.equal(outcome.stdout, execution.stdout); assert.equal(outcome.status, execution.status);
+            assert.equal(outcome.code, execution.code); assert.equal(outcome.signal, execution.signal);
+            assert.deepEqual(outcome.normalization, { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
+              ruleSource: "tests/harness/node-island-order.test.ts:63", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags });
+          };
+          const verifyDiagnostics = (compile, id, suffix) => {
+            if (compile?.diagnosticsStatus !== "passed") return;
+            const value = JSON.parse(readFileSync(join(dir, compile.stdout), "utf8"));
+            const entrySuffix = "/shared-module-proof/fixtures/" + id + "/main.mjs";
+            assert.ok(value.entry.endsWith(entrySuffix));
+            const temp = value.entry.slice(0, -entrySuffix.length);
+            assert.equal(value.schema, "scriptc-diagnostics"); assert.equal(value.schemaVersion, 1);
+            assert.equal(value.command, "build"); assert.equal(value.phase, "complete"); assert.equal(value.success, true);
+            assert.equal(value.artifact, temp + suffix); assert.ok(Array.isArray(value.diagnostics));
+            assert.equal(value.diagnostics.filter(item => item.severity === "error").length, 0);
+            const marked = expected[id].map(file => temp + "/shared-module-proof/fixtures/" + id + "/" + file);
+            assert.deepEqual(value.diagnostics.filter(item => item.code === "SC8001").map(item => item.file).sort(), marked.sort());
+          };
           try {
-            for (const [label, head] of Object.entries(heads)) {
-              const dir = join(process.env.RUNNER_TEMP, "shared-module-results", "shared-module-" + label);
-              const bytes = readFileSync(join(dir, "summary.json")), summary = JSON.parse(bytes);
-              assert.equal(digest(bytes), readFileSync(join(dir, "summary.sha256"), "utf8").trim());
-              assert.equal(summary.head, head); assert.equal(summary.workflow, paired.workflow); assert.equal(summary.runId, paired.runId);
-              assert.equal(summary.scope, "native-execution-retry");
-              const prior = summary.priorEvidence;
-              assert.equal(prior.kind, "prior-run-only"); assert.equal(prior.repeated, false); assert.equal(prior.head, head);
-              assert.equal(prior.runId, "41201443584"); assert.equal(prior.workflow, "b9a91ec6f2afccd98378d703ccf77fe052989759");
-              for (const [key, value] of Object.entries(priorArtifacts[label])) assert.equal(prior[key], value);
-              assert.equal(prior.fixtureDigest, "2c82dfe86bf188fe12742f7d49b56f23c5ddcf828d9783962b0f217ec8919c48");
-              assert.equal(summary.fixtureDigest, prior.fixtureDigest);
-              const cleanup = JSON.parse(readFileSync(join(dir, "cleanup.json"), "utf8"));
-              assert.equal(cleanup.runId, paired.runId); assert.equal(cleanup.workflow, paired.workflow); assert.equal(cleanup.label, label);
-              assert.equal(cleanup.error, undefined); assert.ok(["removed", "absent"].includes(cleanup.work)); assert.ok(["removed", "absent"].includes(cleanup.payload));
-              assert.deepEqual(summary.cases.map(item => item.id), expected);
-              for (const file of summary.fixtureManifest) assert.equal(digest(readFileSync(join(dir, "fixtures", file.path))), file.sha256);
-              for (const step of summary.steps) for (const stream of ["stdout", "stderr"])
-                assert.equal(digest(readFileSync(join(dir, step[stream]))), step[stream + "Sha256"]);
-              for (const item of summary.cases) {
-                assert.equal(item.prior.kind, "prior-run-only"); assert.equal(item.prior.repeated, false);
-                assert.equal(item.prior.runId, prior.runId); assert.equal(item.prior.artifactId, prior.artifactId);
-                assert.equal(item.prior.summarySha256, prior.summarySha256); assert.equal(item.prior.summaryCase, item.id);
-                const expectedStdout = digest(readFileSync(join(dir, "fixtures", item.id, "expected.stdout.log")));
-                assert.equal(item.prior.oracle.stdoutSha256, expectedStdout); assert.equal(item.prior.oracle.stderrSha256, digest(""));
-                assert.equal(item.prior.oracle.code, 0); assert.equal(item.prior.oracle.signal, null);
-                const artifacts = Object.values(item.flavors).flatMap(flavor => [flavor.llvm, flavor.libnodeManifest]);
-                for (const file of artifacts.filter(Boolean)) assert.equal(digest(readFileSync(join(dir, file.path))), file.sha256);
-                const outcomes = Object.values(item.flavors).map(flavor => flavor.execution.parityOutcome).filter(Boolean);
-                for (const outcome of outcomes) for (const stream of ["stdout", "stderr"])
-                  assert.equal(digest(readFileSync(join(dir, outcome[stream]))), outcome[stream + "Sha256"]);
+            const bytes = readFileSync(join(dir, "summary.json")), summary = JSON.parse(bytes);
+            result.baseline = summary; result.summarySha256 = digest(bytes);
+            assert.equal(digest(bytes), readFileSync(join(dir, "summary.sha256"), "utf8").trim());
+            assert.equal(summary.head, head); assert.equal(summary.label, "baseline"); assert.equal(summary.scope, result.scope);
+            assert.equal(summary.workflow, result.workflow); assert.equal(summary.runId, result.runId); assert.equal(summary.attempt, result.attempt);
+            assert.equal(summary.settledEvidence.repeated, false); assert.equal(summary.settledEvidence.usedForQualification, false);
+            assert.equal(summary.fixtureDigest, "5782e4a87e65b414748a840f7420cbe5de0fbbf593c6f28de8782647d59e7c43");
+            assert.equal(digest(JSON.stringify(summary.fixtureManifest)), summary.fixtureDigest);
+            const cleanup = JSON.parse(readFileSync(join(dir, "cleanup.json"), "utf8"));
+            assert.equal(cleanup.runId, result.runId); assert.equal(cleanup.attempt, result.attempt);
+            assert.equal(cleanup.workflow, result.workflow); assert.equal(cleanup.label, "baseline");
+            assert.equal(cleanup.error, undefined); assert.equal(cleanup.work, "removed"); assert.equal(cleanup.payload, "removed");
+            result.cleanup = cleanup;
+            assert.deepEqual(summary.cases.map(item => item.id), Object.keys(expected));
+            for (const file of summary.fixtureManifest) verifyFile({ ...file, path: "fixtures/" + file.path });
+            for (const step of summary.steps) for (const stream of ["stdout", "stderr"])
+              verifyFile({ path: step[stream], sha256: step[stream + "Sha256"], bytes: step[stream + "Bytes"] });
+            for (const item of summary.cases) {
+              assert.deepEqual(item.markedIslands, expected[item.id]);
+              const expectedStdout = digest(readFileSync(join(dir, "fixtures", item.id, "expected.stdout.log")));
+              assert.equal(item.expectedStdoutSha256, expectedStdout);
+              if (item.oracle) {
+                verifyOutcome(item.oracle, false);
+                assert.equal(item.oracle.expectedMatched, item.oracle.status === "completed" &&
+                  item.oracle.stdoutSha256 === expectedStdout && item.oracle.stderrBytes === 0);
               }
-              const attempts = summary.cases.flatMap(item => ["plain", "san"].map(flavor => ({ item, flavor, execution: item.flavors[flavor].execution })))
-                .filter(({ execution }) => execution.attempted === true);
-              assert.equal(summary.executionAttempts, attempts.length);
-              for (const { item, flavor, execution } of attempts) {
-                const step = summary.steps.find(step => step.name === item.id + "-" + flavor + "-run");
-                assert.ok(step); assert.equal(step.command, "<temp>/shared-module-work/" + item.id + "-" + flavor + "/program");
-                assert.notEqual(step.status, "tool-error"); assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
+              if (item.ir.artifact) verifyFile(item.ir.artifact);
+              verifyDiagnostics(item.ir.compile, item.id, "/shared-module-proof/" + item.id + "/program.ir.json");
+              for (const flavor of ["plain", "san"]) {
+                const native = item.flavors[flavor], execution = native.execution;
+                for (const file of [native.llvm, native.libnodeManifest].filter(Boolean)) verifyFile(file);
+                verifyDiagnostics(native.compile, item.id, "/shared-module-work/" + item.id + "-" + flavor + "/program");
+                verifyOutcome(execution, flavor === "san");
+                if (execution.attempted) {
+                  const step = summary.steps.find(step => step.name === item.id + "-" + flavor + "-run");
+                  assert.ok(step); assert.equal(step.command, "<temp>/shared-module-work/" + item.id + "-" + flavor + "/program");
+                  assert.notEqual(step.status, "tool-error"); assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
+                  const actual = execution.parityOutcome, oracle = item.oracle?.parityOutcome;
+                  const matched = Boolean(item.oracle?.expectedMatched && actual && oracle && execution.status === "completed" &&
+                    actual.code === oracle.code && actual.signal === oracle.signal &&
+                    actual.stdoutSha256 === oracle.stdoutSha256 && actual.stderrSha256 === oracle.stderrSha256);
+                  assert.equal(native.parity, matched ? "matched" : "mismatch");
+                }
               }
-              if (summary.diagnosticComplete) assert.equal(attempts.length, 10);
-              paired.sources[label] = summary;
+              assert.equal(item.complete, item.oracle?.attempted === true && item.ir.attempted === true &&
+                ["plain", "san"].every(flavor => item.flavors[flavor].execution.attempted === true));
             }
-            assert.equal(paired.sources.baseline.fixtureDigest, paired.sources.candidate.fixtureDigest);
-            paired.diagnosticComplete = Object.values(paired.sources).every(item => item.diagnosticComplete && item.sourceVerifiedBefore && item.sourceVerifiedAfter && item.fixturesVerifiedAfter);
-            paired.qualificationComplete = paired.diagnosticComplete && Object.values(paired.sources).every(item => item.qualificationComplete && item.status === "passed");
-          } catch (error) { paired.error = String(error); }
-          writeFileSync(join(process.env.RUNNER_TEMP, "shared-module-comparison.json"), JSON.stringify(paired, null, 2) + "\n");
-          console.log(JSON.stringify({ diagnosticComplete: paired.diagnosticComplete, qualificationComplete: paired.qualificationComplete }));
-          if (!paired.qualificationComplete) { console.error("[shared-module-comparison] FAILED (exit 1)"); process.exitCode = 1; }
+            const attempts = summary.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
+            assert.equal(summary.expectedExecutionAttempts, 6); assert.equal(summary.executionAttempts, attempts);
+            result.diagnosticComplete = summary.cases.every(item => item.complete) && attempts === 6 &&
+              summary.sourceVerifiedBefore === true && summary.sourceVerifiedAfter === true && summary.fixturesVerifiedAfter === true;
+            assert.equal(summary.diagnosticComplete, result.diagnosticComplete);
+            result.qualificationComplete = result.diagnosticComplete && summary.cases.every(item =>
+              item.oracle.expectedMatched && item.ir.status === "passed" && ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed"));
+            assert.equal(summary.qualificationComplete, result.qualificationComplete);
+            assert.equal(summary.status, result.qualificationComplete ? "passed" : "failed");
+          } catch (error) { result.error = String(error); result.diagnosticComplete = false; result.qualificationComplete = false; }
+          writeFileSync(join(process.env.RUNNER_TEMP, "cycle-binding-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
+          console.log(JSON.stringify({ diagnosticComplete: result.diagnosticComplete, qualificationComplete: result.qualificationComplete }));
+          if (!result.qualificationComplete) { console.error("[shared-module-comparison] FAILED (exit 1)"); process.exitCode = 1; }
           COMPARE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: shared-module-comparison
-          path: ${{ runner.temp }}/shared-module-comparison.json
+          name: cycle-binding-aggregate
+          path: ${{ runner.temp }}/cycle-binding-aggregate.json
           if-no-files-found: error
           retention-days: 3
