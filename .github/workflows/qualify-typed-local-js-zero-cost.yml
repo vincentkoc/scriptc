@@ -1,4 +1,4 @@
-name: Qualify typed local JavaScript zero cost
+name: Qualify shared initialization zero cost
 
 on:
   push:
@@ -17,8 +17,8 @@ defaults:
     shell: /bin/bash --noprofile --norc -eo pipefail {0}
 
 env:
-  BASE_SHA: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
-  CAND_SHA: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+  BASE_SHA: 71a9441c824262150f35acd2b8359f156ed3289c
+  CAND_SHA: 022f251fc38b4c169333f133398ee5150172f2bc
   NODE_OPTIONS: --max-old-space-size=4096
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
           persist-credentials: false
       - name: Write the qualification runner
         run: |
@@ -48,8 +48,8 @@ jobs:
           import { basename, dirname, join, relative, resolve } from "node:path";
           import { fileURLToPath, pathToFileURL } from "node:url";
 
-          const BASE = "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486";
-          const CAND = "923a57d63cc1a32324cd0a4d514935db3f2ad264";
+          const BASE = "71a9441c824262150f35acd2b8359f156ed3289c";
+          const CAND = "022f251fc38b4c169333f133398ee5150172f2bc";
           const pins = {
             "scripts/zero-cost-gate.mjs": "8c46165ba1a95338b010efcb425a6c03971fa883b0a2a7a57a077726c1f4a8f0",
             "scripts/zero-cost-merge.mjs": "5ac0841a88b96575e62b8af12a195d654406096ac27eae4e5fbd3ca78c0eda08",
@@ -232,10 +232,13 @@ jobs:
           }
           function admit(createSwap) {
             const before = memory();
-            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
-            assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, "insufficient physical runner capacity");
             const minimum = task === "self" && before.total >= 40 * GiB ? 40 : 28;
             const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));
+            const capacity = { phase: mode, createSwap, before, minimumGiB: minimum,
+              missingSwapGiB: missing, requiredDiskBytes: (missing + 16) * GiB, admitted: false };
+            (report.capacity ??= []).push(capacity); save();
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
+            assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, "insufficient physical runner capacity");
             if (createSwap && missing > 0) {
               assert.ok(missing <= 24, "swap requirement exceeds the task budget");
               assert.ok(before.diskFree >= (missing + 16) * GiB, "insufficient disk for swap and builds");
@@ -248,10 +251,10 @@ jobs:
               capture("sudo", ["swapon", path]);
               report.swap.active = true; save();
             }
-            const after = memory();
+            const after = memory(); capacity.after = after; save();
             assert.ok(after.available + after.swapFree >= minimum * GiB, "compiler heaps lack RAM/swap headroom");
             assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, "insufficient remaining disk");
-            (report.capacity ??= []).push({ phase: mode, before, after }); save();
+            capacity.admitted = true; save();
           }
           function cleanupSwap() {
             if (!report.swap) return;
@@ -314,6 +317,7 @@ jobs:
             assert.equal(manifest.workflow, process.env.GITHUB_SHA);
             assert.equal(manifest.run, process.env.GITHUB_RUN_ID); assert.equal(manifest.attempt, process.env.GITHUB_RUN_ATTEMPT);
             assert.equal(manifest.runnerSha256, hash(fileURLToPath(import.meta.url)));
+            assert.equal(manifest.libnodePath, pack); assert.equal(pack, resolve(pack));
             assert.equal(hash(join(assets, "native.tar.gz")), manifest.nativeArchiveSha256);
             assert.equal(hash(join(assets, "libnode.tar.gz")), manifest.libnodeArchiveSha256);
             return manifest;
@@ -357,6 +361,7 @@ jobs:
             assert.equal(data.programsRoot, roots.baseline);
             assert.equal(data.host.platform, "linux"); assert.equal(data.host.arch, "x64"); assert.equal(data.host.node, "v24.22.0");
             assert.equal(data.allow, null); assert.equal(data.strict, false); assert.equal(data.baselineCache, null);
+            assert.equal(data.runtime, null, "shared native runtime differs");
             assert.ok(Array.isArray(data.failures) && Array.isArray(data.globalFailures));
             assert.ok(data.globalFailures.every(value => data.failures.includes(value)));
             assert.equal(data.verdict, data.failures.length ? "fail" : "pass");
@@ -438,7 +443,7 @@ jobs:
               const manifest = {
                 baseline: BASE, candidate: CAND, workflow: report.workflow, run: report.run, attempt: report.attempt,
                 runnerSha256: hash(fileURLToPath(import.meta.url)), nativeInputs: report.nativeInputs,
-                nativeInputSha256: report.nativeInputSha256, nativeFiles, libnode: nodePack,
+                nativeInputSha256: report.nativeInputSha256, nativeFiles, libnode: nodePack, libnodePath: pack,
                 nativeArchiveSha256: hash(join(assets, "native.tar.gz")), libnodeArchiveSha256: hash(join(assets, "libnode.tar.gz")),
                 source: report.sourceAfter.candidate, tools: report.tools,
               };
@@ -474,7 +479,7 @@ jobs:
               assert.deepEqual(listed, manifest.libnode.files.map(file => file.path).sort());
               await checked("unpack-libnode", "tar", ["-xzf", join(assets, "libnode.tar.gz")], pack, 10);
               assert.deepEqual(libnode(pack), manifest.libnode);
-              report.libnode = manifest.libnode;
+              report.libnode = manifest.libnode; report.libnodePath = pack;
               report.nativeIdentity = { helper: manifest.nativeFiles.find(file => file.path.endsWith("/scriptc-llvm-codegen")),
                 runtimeManifest: manifest.nativeFiles.find(file => file.path.endsWith("/runtime-pack.json")) };
               report.sourcePreGate = sources(); assert.deepEqual(report.sourcePreGate, report.sourceBefore);
@@ -499,7 +504,7 @@ jobs:
               assert.deepEqual(libnode(pack), manifest.libnode);
               report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
               report.complete = true; report.status = "complete"; report.gateVerdict = data.verdict;
-              report.counts = data.counts; report.globalFailures = data.globalFailures;
+              report.counts = data.counts; report.globalFailures = data.globalFailures; report.runtime = data.runtime;
               report.nonGlobalFailures = data.failures.filter(failure => !data.globalFailures.includes(failure));
               report.gateSha256 = hash(join(out, "gate.json"));
               // Canonical merge recomputes global timing over all shards.
@@ -509,6 +514,7 @@ jobs:
                 throw Error("gate has program failures");
               }
             } else if (mode === "merge") {
+              readAssetManifest();
               report.sourceBefore = sources();
               const inventory = await inventories(), expectedJobs = ["1", "2", "3", "4", "5", "6", "7", "8", "self"];
               const files = [], summaries = [];
@@ -528,7 +534,9 @@ jobs:
                 assert.equal(hash(join(dir, "inventory.json")), summary.inventorySha256);
                 assert.deepEqual(JSON.parse(readFileSync(join(dir, "inventory.json"), "utf8")), inventory);
                 assert.equal(hash(join(dir, "gate.json")), summary.gateSha256);
+                assert.equal(summary.libnodePath, pack); assert.equal(summary.runtime, null);
                 const identity = { tools: summary.tools, native: summary.nativeIdentity, libnode: summary.libnode,
+                  libnodePath: summary.libnodePath,
                   assets: summary.assetsSha256, nativeInputs: summary.nativeInputSha256 };
                 if (common === undefined) common = identity; else assert.deepEqual(identity, common);
                 const data = JSON.parse(readFileSync(join(dir, "gate.json"), "utf8"));
@@ -546,7 +554,7 @@ jobs:
               const { timingVerdict, timingGroups } = await import(pathToFileURL(join(candidate, "scripts/zero-cost-compare.mjs")).href);
               report.timing = Object.fromEntries(Object.entries(timingGroups(merged.timing.rows))
                 .map(([name, rows]) => [name, timingVerdict(name, rows, 0.02)]));
-              report.counts = merged.counts; report.verdict = merged.verdict; report.identity = common;
+              report.counts = merged.counts; report.verdict = merged.verdict; report.identity = common; report.runtime = merged.runtime;
               report.inventorySha256 = sha(JSON.stringify(inventory));
               report.programCount = inventory.full.length; report.shardCount = summaries.length;
               report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
@@ -641,13 +649,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          ref: 71a9441c824262150f35acd2b8359f156ed3289c
           path: baseline
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
           path: candidate
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -708,13 +716,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          ref: 71a9441c824262150f35acd2b8359f156ed3289c
           path: baseline
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
           path: candidate
           persist-credentials: false
       - uses: actions/setup-node@v4
