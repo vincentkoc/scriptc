@@ -18,13 +18,13 @@ jobs:
     timeout-minutes: 120
     env:
       NODE_OPTIONS: --max-old-space-size=4096
-      DIAGNOSTIC_SOURCE: b44ab50c7859d6a4609d273b7ae096c259319c2b
+      DIAGNOSTIC_SOURCE: 71b5377359700a06d3681c010265eadf20976bef
       DIAGNOSTIC_LABEL: late-queue-qualification
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: b44ab50c7859d6a4609d273b7ae096c259319c2b
+          ref: 71b5377359700a06d3681c010265eadf20976bef
           persist-credentials: false
       - name: Verify source before setup
         run: |
@@ -66,10 +66,11 @@ jobs:
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             status: "running", diagnosticComplete: false, qualificationComplete: false,
-            templateCommit: "11e3cf017c25e06fe2e9059f1c433ab6c8a0dcde",
+            templateCommit: "b33de3dc9bfaeb489b9bcd40dfbe968e9e1f0596",
             completeSuite: false, scope: "native-late-rejection-handling", priorProofReused: false,
             excludedCheckpointCases: ["native-next-tick", "hosted-next-tick", "hosted-macrotask-next-tick", "hosted-direct-catch"],
             priorDiagnostic: {"runId": "41224445896", "attempt": "1", "workflow": "1ef672cd4ad6ab66a0634691ccc7d3aee885008c", "source": "2f5c38e3715956a944b662eef7d339c7f9d7bc38", "artifactId": "13051395986", "archiveSha256": "42bbd7c359161410a43b69d6ae6c7804630145a5ed1bc60f3767d6c46d30a515", "summarySha256": "2ca5f37fccc23ab0da9017135c5ce358ea3ca5d4de6a95e7f82f5f91eb6a3707", "fixtureDigest": "b61e4f121f2b016deb1cf63009026cd2e2089fd90e133eb140f5c4bd6a312d0b", "url": "https://github.com/vincentkoc/scriptc/actions/runs/41224445896", "disposition": "verified historical mismatch; not rerun or substituted for candidate proof"},
+            priorPartialDiagnostic: {"runId":"41227250629","attempt":"1","workflow":"b33de3dc9bfaeb489b9bcd40dfbe968e9e1f0596","source":"b44ab50c7859d6a4609d273b7ae096c259319c2b","artifactId":"13052564563","archiveSha256":"720cb2db0a68bfdebca1ea561259f08264382cc1311f36388134ec7d88b82c18","summarySha256":"bf5354fa53b37c1043f2ece8929debbb47fb91850db38802b33bef4ef3778019","url":"https://github.com/vincentkoc/scriptc/actions/runs/41227250629","disposition":"partial historical evidence; four IR artifacts replayed for validator regression only; not candidate qualification"},
             expectedExecutionAttempts: 32, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [], gates: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -164,235 +165,332 @@ jobs:
             }
             return found;
           };
-          const typedIrEvidence = (program, spec, entry) => {
-            assert.equal(program.irVersion, 17); assert.ok(Array.isArray(program.functions));
-            assert.equal(typeof program.entry, "string"); assert.notEqual(program.commonJsEntry, true);
-            const functions = new Map(program.functions.map(fn => [fn.name, fn]));
-            const programEntry = functions.get(program.entry); assert.ok(programEntry);
-            const first = programEntry.body[0];
-            assert.ok(!(first?.kind === "throw" && first.value?.kind === "libCall" && first.value.fn === "error.new"), "IR contains a startup refusal");
-            assert.equal(functions.size, program.functions.length);
-            const own = fn => {
-              assert.ok(fn && fn.loc?.file === entry && Array.isArray(fn.body) && fn.body.length > 0,
-                "callback must have an authored native body");
-              return fn;
-            };
-            const nodes = program.functions.flatMap(fn => collect(fn.body, () => true));
-            const islandCall = node => node.kind === "libCall" && node.fn.startsWith("nodeIsland.");
-            const islands = nodes.filter(islandCall);
-            if (!spec.hosted) {
-              assert.equal(islands.length, 0, "native-only IR calls Node");
-              assert.equal(program.nodeIsland, undefined, "native-only IR records Node startup");
-            } else {
-              assert.ok(islands.some(node => ["nodeIsland.require", "nodeIsland.defer"].includes(node.fn)), "hosted import must load its package");
-              const tree = program.nodeIsland?.modules;
-              assert.ok(tree && Array.isArray(tree.files)); assert.deepEqual(tree.links, []);
-              const paths = Object.keys(spec.files).filter(file => file.startsWith("node_modules/checkpoint-host/")).sort();
-              assert.deepEqual(tree.files.map(file => file.path).sort(), paths);
-              for (const file of tree.files) {
-                assert.notEqual(file.placeholder, true); assert.equal(file.size, Buffer.byteLength(spec.files[file.path]));
-                assert.equal(file.sha256, digest(spec.files[file.path]));
-              }
-            }
-            const rejected = nodes.filter(node => node.kind === "intrinsic" && node.name === "promise.reject");
-            assert.equal(rejected.length, 1); assert.deepEqual(rejected[0].type, { kind: "promise", inner: { kind: "void" } });
-            const only = (values, why) => { assert.equal(values.length, 1, why); return values[0]; };
-            const callback = call => {
-              assert.equal(call.args.length, 1);
-              assert.equal(call.args[0].kind, "closure", "scheduler callback must be a native closure");
-              return own(functions.get(call.args[0].fnName));
-            };
-            const subscription = name => {
-              const call = only(nodes.filter(node => node.kind === "libCall" && node.fn === name), name);
-              assert.equal(call.args.length, 2);
-              assert.equal(call.args[0].kind, "dynFrom"); assert.equal(call.args[0].type.kind, "dyn");
-              assert.equal(call.args[0].value.kind, "closure", "listener must box a native closure");
-              assert.deepEqual(call.args[1].type, { kind: "bool" });
-              assert.equal(call.args[1].kind, "boolLit"); assert.equal(call.args[1].value, false);
-              const fn = own(functions.get(call.args[0].value.fnName));
-              assert.equal(fn.params.length, 0);
-              return { call, fn };
-            };
-            const unhandled = subscription("process.onUnhandledRejection");
-            const handled = subscription("process.onRejectionHandled");
-            const immediateCall = only(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.setImmediate"), "one native immediate");
-            assert.ok(collect(unhandled.fn.body, node => node === immediateCall).length === 1,
-              "unhandled listener must schedule the native immediate");
-            const immediate = callback(immediateCall);
-            const tickCall = only(nodes.filter(node => node.kind === "libCall" && node.fn === "process.nextTick"), "one native nextTick");
-            assert.ok(collect(immediate.body, node => node === tickCall).length === 1,
-              "immediate callback must schedule the native nextTick");
-            const tick = callback(tickCall);
-            assert.equal(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.queueMicrotask").length, 0);
-            const logs = fn => collect(fn.body, node => node.kind === "intrinsic" && node.name === "console.log")
-              .map(node => only(collect(node.args, arg => arg.kind === "strLit"), "one authored log string").value);
-            assert.deepEqual(logs(unhandled.fn), ["unhandled"]); assert.deepEqual(logs(handled.fn), ["handled"]);
-            assert.deepEqual(logs(immediate), ["attach", "after"]); assert.deepEqual(logs(tick), ["tick"]);
-            const chain = [unhandled.fn, handled.fn, immediate, tick];
-            const catchCall = only(collect(immediate.body, node => node.kind === "callValue" && node.callee?.kind === "closure"),
-              "immediate callback must invoke the native catch closure");
-            const ordered = collect(immediate.body, node => node === catchCall || node === tickCall ||
-              (node.kind === "intrinsic" && node.name === "console.log"));
-            assert.deepEqual(ordered.map(node => node === catchCall ? "catch" : node === tickCall ? "nextTick" :
-              only(collect(node.args, arg => arg.kind === "strLit"), "one authored log string").value),
-              ["attach", "catch", "after", "nextTick"]);
-            const caught = own(functions.get(catchCall.callee.fnName)); chain.push(caught);
-            assert.equal(caught.async, true); assert.equal(caught.params.length, 1);
-            const parameter = caught.params[0];
-            assert.deepEqual(parameter.type, { kind: "promise", inner: { kind: "void" } });
-            assert.equal(catchCall.args.length, 1); assert.deepEqual(catchCall.args[0].type, parameter.type);
-            assert.ok(catchCall.args[0].kind === "varRef", "catch receiver must remain an unboxed native promise");
-            const handler = only(caught.body.filter(node => node.kind === "tryCatch"), "catch closure try/catch");
-            const awaited = only(collect(handler.tryBody, node => node.kind === "awaitExpr"), "direct native await");
-            assert.equal(awaited.value.kind, "varRef"); assert.equal(awaited.value.localId, parameter.localId);
-            assert.deepEqual(awaited.value.type, parameter.type);
-            const log = only(collect(handler.catchBody, node => node.kind === "intrinsic" && node.name === "console.log"),
-              "caught log must stay inside catch body");
-            assert.ok(collect(log.args, node => node.kind === "strLit" && node.value === "caught").length === 1);
-            const registrationOwners = [unhandled.call, handled.call].map(call =>
-              own(only(program.functions.filter(fn => collect(fn.body, node => node === call).length), "native listener registration owner")));
-            const reachable = new Set(), roots = [programEntry];
-            while (roots.length) {
-              const fn = roots.pop(); if (reachable.has(fn.name)) continue; reachable.add(fn.name);
-              for (const node of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
-                const name = node.kind === "call" ? node.callee : node.fnName;
-                if (functions.has(name)) roots.push(functions.get(name));
-              }
-            }
-            for (const fn of [...registrationOwners, ...chain]) assert.ok(reachable.has(fn.name), "detached callback chain");
-            // Follow native helper and closure edges too: a nested delegate cannot hide a Node callback.
-            const visited = new Set(), pending = [...chain];
-            while (pending.length) {
-              const fn = pending.pop(); if (visited.has(fn.name)) continue; visited.add(fn.name);
-              assert.equal(collect(fn.body, islandCall).length, 0, "callback chain delegates to Node");
-              for (const node of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
-                const name = node.kind === "call" ? node.callee : node.fnName;
-                if (functions.has(name)) pending.push(functions.get(name));
-              }
-            }
-            return { status: "passed", startupRefusalAbsent: true, reachableFunctions: [...reachable].sort(), irVersion: program.irVersion, commonJsEntry: program.commonJsEntry ?? false,
-              rejectionType: rejected[0].type, registrationOwners: registrationOwners.map(fn => fn.name),
-              unhandledListener: unhandled.fn.name, handledListener: handled.fn.name, immediate: immediate.name,
-              nextTick: tick.name, catchClosure: caught.name, listenerBoxing: "dynFrom native closure",
-              awaitParameter: { localId: parameter.localId, type: parameter.type }, callbackFunctions: [...visited].sort(),
-              islandCalls: islands.map(node => node.fn), shippedFiles: program.nodeIsland?.modules?.files ?? [],
-              functions: program.functions.map(fn => ({ name: fn.name, sourceName: fn.sourceName ?? null,
-                file: fn.loc?.file ?? null, statements: fn.body.length })) };
-          };
-
           const irEvidence = (program, spec, entry) => {
-            if (["native-late-handling", "hosted-late-handling"].includes(spec.id))
-              return typedIrEvidence(program, spec, entry);
             assert.equal(program.irVersion, 17); assert.notEqual(program.commonJsEntry, true);
             assert.ok(Array.isArray(program.functions));
             const functions = new Map(program.functions.map(fn => [fn.name, fn]));
             assert.equal(functions.size, program.functions.length);
+            const sourceText = spec.files["main.ts"], only = (items, why) => { assert.equal(items.length, 1, why); return items[0]; };
             const own = fn => {
-              assert.ok(fn && fn.loc?.file === entry && Array.isArray(fn.body) && fn.body.length > 0,
-                "callback must have an authored native body"); return fn;
+              assert.ok(fn && fn.loc?.file === entry && Array.isArray(fn.body) && fn.body.length, "authored native function required");
+              return fn;
             };
-            const entryFn = functions.get(program.entry); assert.ok(entryFn);
-            const first = entryFn.body[0];
-            assert.ok(!(first?.kind === "throw" && first.value?.kind === "libCall" && first.value.fn === "error.new"),
-              "IR contains a startup refusal");
-            const nodes = program.functions.flatMap(fn => collect(fn.body, () => true));
-            const islandCall = node => node.kind === "libCall" && node.fn.startsWith("nodeIsland.");
-            const islands = nodes.filter(islandCall), sourceText = spec.files["main.ts"];
             const spelling = node => node.loc?.file === entry ? sourceText.slice(node.loc.start, node.loc.end) : "";
-            const only = (items, reason) => { assert.equal(items.length, 1, reason); return items[0]; };
-            const ownerOf = node => own(only(program.functions.filter(fn => collect(fn.body, item => item === node).length), "native operation owner"));
-            const assignments = new Map();
-            for (const node of nodes) if (["varDecl", "assign"].includes(node.kind)) {
-              const value = node.kind === "varDecl" ? node.init : node.value;
-              if (value) { const values = assignments.get(node.localId) ?? []; values.push(value); assignments.set(node.localId, values); }
-            }
-            // Resolve a named listener through its native binding, including captured globals.
-            // Never accept a dynamic value merely because its source contains an arrow.
-            const nativeClosure = (expr, seen = new Set()) => {
-              assert.ok(expr, "missing callback");
-              if (expr.kind === "dynFrom") return nativeClosure(expr.value, seen);
-              if (expr.kind === "closure") return own(functions.get(expr.fnName));
-              assert.equal(expr.kind, "varRef", "callback is not a native closure or binding");
-              assert.ok(!seen.has(expr.localId), "cyclic callback binding");
-              const next = new Set([...seen, expr.localId]);
-              const values = assignments.get(expr.localId) ?? [];
-              assert.ok(values.length > 0, "callback binding has no native initializer");
-              const resolved = values.map(value => nativeClosure(value, next));
-              assert.equal(new Set(resolved.map(fn => fn.name)).size, 1, "callback binding changes identity");
-              return resolved[0];
+            const span = node => {
+              assert.equal(node.loc?.file, entry); assert.ok(Number.isInteger(node.loc.start) && Number.isInteger(node.loc.end));
+              assert.ok(node.loc.start >= 0 && node.loc.end > node.loc.start && node.loc.end <= sourceText.length);
+              return node.loc.start + ":" + node.loc.end;
             };
-            const reachable = new Set(), todo = [entryFn];
-            while (todo.length) {
-              const fn = todo.pop(); if (reachable.has(fn.name)) continue; reachable.add(fn.name);
-              for (const node of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
-                const name = node.kind === "call" ? node.callee : node.fnName;
-                if (functions.has(name)) todo.push(functions.get(name));
+            const islandCall = node => node.kind === "libCall" && node.fn.startsWith("nodeIsland.");
+            const entryFn = own(functions.get(program.entry)), first = entryFn.body[0];
+            assert.ok(!(first?.kind === "throw" && first.value?.kind === "libCall" && first.value.fn === "error.new"), "startup refusal");
+            // Only explicit jsEntry edges join owner families. Names and shared spans do not.
+            const parent = new Map();
+            for (const fn of functions.values()) if (fn.jsEntry !== undefined) {
+              const child = own(functions.get(fn.jsEntry)); assert.notEqual(child.name, fn.name);
+              assert.ok(!parent.has(child.name), "shared jsEntry target"); parent.set(child.name, fn.name);
+              assert.deepEqual(child.loc, fn.loc); assert.ok(Array.isArray(fn.captures));
+              assert.deepEqual(child.captures, fn.captures);
+              assert.equal(fn.async, undefined); assert.equal(fn.generator, undefined); assert.equal(fn.classCaptures, undefined);
+              assert.equal(child.async, undefined); assert.equal(child.generator, undefined);
+              assert.ok(fn.params.length > 0 && fn.params.every(param => param.type.kind === "dyn"));
+              assert.ok(child.params.some(param => param.type.kind === "jsval"));
+              assert.ok(JSON.stringify(child.returnType) === JSON.stringify(fn.returnType) ||
+                (fn.returnType.kind === "dyn" && child.returnType.kind === "jsval"), "invalid jsEntry return conversion");
+              assert.equal(child.locals.length, fn.locals.length);
+              child.locals.forEach((local, i) => {
+                const { type, ...metadata } = local, { type: originalType, ...originalMetadata } = fn.locals[i];
+                assert.deepEqual(metadata, originalMetadata, "jsEntry local binding metadata");
+                assert.ok(JSON.stringify(type) === JSON.stringify(originalType) ||
+                  (originalType.kind === "dyn" && type.kind === "jsval"), "invalid jsEntry local conversion");
+              });
+              assert.equal(child.params.length, fn.params.length);
+              child.params.forEach((param, i) => {
+                assert.equal(param.localId, fn.params[i].localId); assert.equal(param.name, fn.params[i].name);
+                assert.ok(JSON.stringify(param.type) === JSON.stringify(fn.params[i].type) ||
+                  (fn.params[i].type.kind === "dyn" && param.type.kind === "jsval"), "invalid jsEntry parameter conversion");
+              });
+            }
+            const family = name => {
+              const seen = new Set();
+              while (parent.has(name)) { assert.ok(!seen.has(name), "cyclic jsEntry edge"); seen.add(name); name = parent.get(name); }
+              return name;
+            };
+            for (const name of functions.keys()) family(name);
+            const familyMembers = name => [...functions.values()].filter(fn => family(fn.name) === family(name));
+            const records = program.functions.flatMap(owner => collect(owner.body, node => typeof node.kind === "string").map(node => ({ owner, node })));
+            const recordsOf = fn => records.filter(row => row.owner === fn);
+            const edges = fn => [
+              ...(fn.jsEntry ? [fn.jsEntry] : []),
+              ...recordsOf(fn).filter(({ node }) => node.kind === "call" || node.kind === "closure")
+                .map(({ node }) => node.kind === "call" ? node.callee : node.fnName),
+            ];
+            const visit = roots => {
+              const seen = new Set(), todo = [...roots];
+              while (todo.length) {
+                const name = todo.pop(); if (seen.has(name)) continue;
+                const fn = functions.get(name); assert.ok(fn, "dangling native function edge"); seen.add(name);
+                for (const edge of edges(fn)) { assert.ok(functions.has(edge), "missing native callee"); todo.push(edge); }
+              }
+              return seen;
+            };
+            const reachable = visit([entryFn.name]);
+            const globals = new Map((program.globals ?? []).map(global => [global.id, global]));
+            const locals = new Map(program.functions.map(fn => [fn.name, new Map(fn.locals.map(local => [local.id, local]))]));
+            const bindingKey = (owner, id) => {
+              assert.ok(owner && typeof id === "string");
+              assert.ok(!(globals.has(id) && locals.get(owner.name).has(id)), "local/global binding collision");
+              if (globals.has(id)) return "global:" + id;
+              assert.ok(locals.get(owner.name).has(id), "binding is absent from concrete owner");
+              return owner.name + ":" + id;
+            };
+            const assignments = new Map(), captures = new Map();
+            for (const { owner, node } of records) if (["varDecl", "assign"].includes(node.kind)) {
+              const value = node.kind === "varDecl" ? node.init : node.value;
+              if (value) {
+                const key = bindingKey(owner, node.localId), list = assignments.get(key) ?? [];
+                list.push({ owner, value }); assignments.set(key, list);
               }
             }
-            const roots = [], registrations = [];
+            for (const { owner, node } of records) if (node.kind === "closure") {
+              const target = own(functions.get(node.fnName)), slots = target.captures ?? [];
+              assert.equal(node.captures.length, slots.length, "closure capture arity");
+              node.captures.forEach((id, i) => {
+                bindingKey(owner, id);
+                for (const member of familyMembers(target.name)) {
+                  const key = bindingKey(member, slots[i].localId), list = captures.get(key) ?? [];
+                  list.push({ owner, id }); captures.set(key, list);
+                }
+              });
+            }
+            const sources = (owner, id, seen = new Set()) => {
+              const key = bindingKey(owner, id); assert.ok(!seen.has(key), "cyclic binding"); const next = new Set([...seen, key]);
+              const result = [...(assignments.get(key) ?? [])];
+              if (owner.params.some(param => param.localId === id)) result.push({ owner, value: { kind: "parameter", localId: id } });
+              for (const capture of captures.get(key) ?? []) result.push(...sources(capture.owner, capture.id, next));
+              return result;
+            };
+            const nativeClosure = (expr, owner, seen = new Set()) => {
+              assert.ok(expr, "missing native callback");
+              if (expr.kind === "dynFrom") return nativeClosure(expr.value, owner, seen);
+              if (expr.kind === "closure") {
+                const target = own(functions.get(expr.fnName)); assert.deepEqual(expr.loc, target.loc, "callback provenance"); return target;
+              }
+              assert.equal(expr.kind, "varRef", "callback is not a native closure or binding");
+              const key = bindingKey(owner, expr.localId); assert.ok(!seen.has(key), "cyclic callback");
+              const binding = globals.get(expr.localId) ?? locals.get(owner.name).get(expr.localId);
+              assert.equal(spelling(expr), binding.name, "callback binding source name");
+              const values = sources(owner, expr.localId); assert.ok(values.length, "callback has no scoped initializer");
+              const resolved = values.map(value => nativeClosure(value.value, value.owner, new Set([...seen, key])));
+              assert.equal(new Set(resolved.map(fn => family(fn.name))).size, 1, "callback binding changes identity");
+              return resolved[0];
+            };
+            // Validate each concrete occurrence before grouping its authored operation.
+            const groups = (predicate, label, expected) => {
+              const found = new Map(), concrete = new Set();
+              for (const row of records.filter(({ node }) => predicate(node))) {
+                own(row.owner); assert.ok(reachable.has(row.owner.name), "detached " + label);
+                if (row.owner.loc.end > row.owner.loc.start) assert.ok(row.node.loc?.start >= row.owner.loc.start && row.node.loc?.end <= row.owner.loc.end, "operation outside authored owner");
+                const key = family(row.owner.name) + ":" + span(row.node);
+                const rawKey = row.owner.name + ":" + span(row.node);
+                assert.ok(!concrete.has(rawKey), "duplicate " + label + " in one owner"); concrete.add(rawKey);
+                const list = found.get(key) ?? []; list.push(row); found.set(key, list);
+              }
+              if (expected !== undefined) assert.equal(found.size, expected, label + " authored inventory");
+              for (const rows of found.values()) {
+                assert.deepEqual(rows.map(row => row.owner.name).sort(), familyMembers(rows[0].owner.name).map(fn => fn.name).sort(),
+                  label + " missing from a jsEntry family member");
+              }
+              return [...found.values()];
+            };
+            const authoredCount = regex => [...sourceText.matchAll(regex)].length;
+            const callbackRoots = new Set(), registrations = [], schedules = [], catchEvidence = [];
+            const addRoot = fn => { callbackRoots.add(fn.name); return fn; };
             const eventNames = { unhandledRejection: "UnhandledRejection", rejectionHandled: "RejectionHandled", uncaughtException: "UncaughtException" };
             for (const [event, suffix] of Object.entries(eventNames)) {
-              const authored = [...sourceText.matchAll(new RegExp('process\\.(on|once|off)\\("' + event + '"', "g"))];
-              const calls = nodes.filter(node => node.kind === "libCall" &&
-                [ "process.on" + suffix, "process.off" + suffix ].includes(node.fn));
-              assert.equal(calls.length, authored.length, "event operation inventory: " + event);
-              for (const call of calls) {
-                ownerOf(call);
-                const form = /^process\.(on|once|off)\(/.exec(spelling(call))?.[1];
-                assert.ok(form, "event operation lost source provenance");
-                assert.equal(call.fn, "process." + (form === "off" ? "off" : "on") + suffix);
-                const listener = nativeClosure(call.args[0]); roots.push(listener);
-                assert.equal(call.args.length, (form === "off" ? 1 : 2) + (event === "uncaughtException" ? 1 : 0));
-                if (form !== "off") assert.deepEqual(call.args[1], { kind: "boolLit", value: form === "once", type: { kind: "bool" }, loc: call.args[1].loc });
-                if (event === "uncaughtException") assert.equal(call.args.at(-1).value, false);
-                registrations.push({ event, form, listener: listener.name, owner: ownerOf(call).name, span: call.loc });
+              const expected = authoredCount(new RegExp('process\\.(on|once|off)\\("' + event + '"', "g"));
+              for (const rows of groups(node => node.kind === "libCall" && ["process.on" + suffix, "process.off" + suffix].includes(node.fn), event, expected)) {
+                const evidence = [];
+                for (const { node: call, owner } of rows) {
+                  const form = /^process\.(on|once|off)\(/.exec(spelling(call))?.[1]; assert.ok(form);
+                  assert.ok(spelling(call).startsWith('process.' + form + '("' + event + '"'));
+                  assert.equal(call.fn, "process." + (form === "off" ? "off" : "on") + suffix);
+                  assert.equal(call.args.length, (form === "off" ? 1 : 2) + (event === "uncaughtException" ? 1 : 0));
+                  const listener = addRoot(nativeClosure(call.args[0], owner));
+                  if (form !== "off") {
+                    assert.equal(call.args[1].kind, "boolLit"); assert.equal(call.args[1].type.kind, "bool");
+                    assert.equal(call.args[1].value, form === "once");
+                  }
+                  if (event === "uncaughtException") {
+                    assert.equal(call.args.at(-1).kind, "boolLit"); assert.equal(call.args.at(-1).type.kind, "bool");
+                    assert.equal(call.args.at(-1).value, false);
+                  }
+                  evidence.push({ event, form, listener: listener.name, owner: owner.name, family: family(owner.name), span: call.loc });
+                }
+                assert.equal(new Set(evidence.map(row => family(row.listener))).size, 1, "clone callback changed");
+                registrations.push(...evidence);
               }
             }
             assert.ok(registrations.some(row => row.event === "unhandledRejection" && row.form === "on"));
             assert.ok(registrations.some(row => row.event === "rejectionHandled" && row.form !== "off"));
-            const schedules = [];
-            for (const [pattern, name] of [
-              ["setImmediate\\(", "timers.setImmediate"], ["process\\.nextTick\\(", "process.nextTick"],
-              ["queueMicrotask\\(", "timers.queueMicrotask"],
-            ]) {
-              const expected = [...sourceText.matchAll(new RegExp(pattern, "g"))].length;
-              const calls = nodes.filter(node => node.kind === "libCall" && node.fn === name);
-              assert.equal(calls.length, expected, "scheduler operation inventory: " + name);
-              for (const call of calls) {
-                assert.equal(call.args.length, 1);
-                const callback = nativeClosure(call.args[0]); roots.push(callback);
-                schedules.push({ operation: name, owner: ownerOf(call).name, callback: callback.name, span: call.loc });
+            for (const [pattern, name] of [["setImmediate\\(", "timers.setImmediate"], ["process\\.nextTick\\(", "process.nextTick"], ["queueMicrotask\\(", "timers.queueMicrotask"]]) {
+              for (const rows of groups(node => node.kind === "libCall" && node.fn === name, name, authoredCount(new RegExp(pattern, "g")))) {
+                const callbacks = [];
+                for (const { node: call, owner } of rows) {
+                  assert.ok(new RegExp("^" + pattern).test(spelling(call)), "scheduler source span");
+                  assert.equal(call.args.length, 1);
+                  const callback = addRoot(nativeClosure(call.args[0], owner)); callbacks.push(family(callback.name));
+                  schedules.push({ operation: name, owner: owner.name, family: family(owner.name), callback: callback.name, span: call.loc });
+                }
+                assert.equal(new Set(callbacks).size, 1, "clone scheduler callback changed");
               }
             }
-            const rejected = nodes.filter(node => node.kind === "intrinsic" && node.name === "promise.reject");
-            assert.equal(rejected.length, [...sourceText.matchAll(/Promise\.reject\(/g)].length);
+            const rejected = groups(node => node.kind === "intrinsic" && node.name === "promise.reject", "promise rejection", authoredCount(/Promise\.reject(?:<[^>]+>)?\(/g));
             assert.ok(rejected.length > 0);
-            for (const node of rejected) { assert.equal(node.type.kind, "promise"); ownerOf(node); }
-            // The new listeners receive checked-dynamic native promises. Their .catch uses
-            // lowerDynDispatchMethodCall -> dynInvoke, not the typed async catch helper.
-            const catches = nodes.filter(node => node.kind === "dynInvoke" && node.method === "catch");
-            assert.equal(catches.length, [...sourceText.matchAll(/\.catch\(/g)].length);
-            assert.ok(catches.length > 0);
-            const catchEvidence = catches.map(call => {
-              assert.equal(call.args.length, 1); assert.equal(call.recv.type.kind, "dyn");
-              assert.ok(/\.catch\(/.test(spelling(call)), "catch lost source provenance");
-              assert.equal(collect(call.recv, islandCall).length, 0, "catch receiver is a Node value");
-              const callback = nativeClosure(call.args[0]); roots.push(callback);
-              assert.ok(collect(callback.body, node => node.kind === "intrinsic" && node.name === "console.log").length);
-              return { owner: ownerOf(call).name, callback: callback.name, receiver: call.recv, span: call.loc };
-            });
-            const ioCalls = nodes.filter(node => node.kind === "libCall" && node.fn === "fs.callbackCall");
-            assert.equal(ioCalls.length, spec.id === "handled-listener-starts-host-with-io" ? 1 : 0);
-            for (const call of ioCalls) {
-              assert.equal(call.args[0].value, "stat"); assert.equal(call.args[1].kind, "dynArrLit");
-              assert.equal(call.args[1].elems.length, 2);
-              roots.push(nativeClosure(call.args[1].elems[1])); ownerOf(call);
+            for (const rows of rejected) for (const { node } of rows) {
+              assert.equal(node.type.kind, "promise"); assert.ok(/^Promise\.reject(?:<[^>]+>)?\(/.test(spelling(node)));
             }
-            const throws = nodes.filter(node => node.kind === "throw" && /^throw new Error\(/.test(spelling(node)));
-            assert.equal(throws.length, [...sourceText.matchAll(/throw new Error\(/g)].length);
-            if (!spec.hosted) {
-              assert.equal(islands.length, 0); assert.equal(program.nodeIsland, undefined);
-            } else {
+            const parameterTrusted = (owner, id) => registrations.some(row => row.event === "unhandledRejection" &&
+              family(row.listener) === family(owner.name) && owner.params[1]?.localId === id);
+            const trustedPromise = (expr, owner, seen = new Set()) => {
+              if (expr.kind === "dynFrom" || expr.kind === "dynCheck") return trustedPromise(expr.value, owner, seen);
+              if (expr.kind === "libCall" && ["js.toDyn", "js.fromDyn"].includes(expr.fn)) {
+                assert.equal(expr.args.length, 1); return trustedPromise(expr.args[0], owner, seen);
+              }
+              if (expr.kind === "intrinsic" && expr.name === "promise.reject") return true;
+              if (expr.kind === "parameter") { assert.ok(parameterTrusted(owner, expr.localId), "foreign promise parameter"); return true; }
+              if (expr.kind === "varRef") {
+                const key = bindingKey(owner, expr.localId); assert.ok(!seen.has(key), "cyclic promise binding");
+                assert.equal(spelling(expr), (globals.get(expr.localId) ?? locals.get(owner.name).get(expr.localId)).name, "promise binding source name");
+                if (parameterTrusted(owner, expr.localId)) return true;
+                const rows = sources(owner, expr.localId); assert.ok(rows.length, "promise binding has no native origin");
+                return rows.every(row => trustedPromise(row.value, row.owner, new Set([...seen, key])));
+              }
+              assert.fail("promise receiver has no native origin");
+            };
+            const storageKeys = (owner, id, seen = new Set()) => {
+              const key = bindingKey(owner, id); assert.ok(!seen.has(key), "cyclic storage capture");
+              const links = captures.get(key) ?? [];
+              return links.length ? links.flatMap(link => storageKeys(link.owner, link.id, new Set([...seen, key]))) : [key];
+            };
+            const trustedArray = (expr, owner) => {
+              assert.equal(expr.kind, "varRef"); const key = bindingKey(owner, expr.localId);
+              assert.equal(spelling(expr), (globals.get(expr.localId) ?? locals.get(owner.name).get(expr.localId)).name, "array binding source name");
+              const values = sources(owner, expr.localId); assert.ok(values.length, "array binding has no initializer");
+              for (const row of values) {
+                assert.equal(row.value.kind, "dynArrLit");
+                for (const item of row.value.elems) assert.ok(trustedPromise(item, row.owner));
+              }
+              const storage = new Set(storageKeys(owner, expr.localId));
+              const aliases = (value, writer) => value?.kind === "varRef" && storageKeys(writer, value.localId).some(key => storage.has(key));
+              const writes = records.filter(({ node, owner: writer }) => node.kind === "dynInvoke" && aliases(node.recv, writer));
+              assert.ok(writes.every(({ node }) => node.method === "push"), "unexpected array mutation");
+              for (const { node, owner: writer } of records) if (node.kind === "libCall" &&
+                ["dyn.keySet", "dyn.set", "dyn.arrSet", "dyn.arrPush"].includes(node.fn))
+                assert.ok(!aliases(node.args[0], writer), "unreviewed captured-array write");
+
+              if (values.every(row => row.value.elems.length === 0)) assert.ok(writes.length, "empty array has no native promise producer");
+              for (const { node, owner: writer } of writes) {
+                assert.equal(node.args.length, 1); assert.ok(trustedPromise(node.args[0], writer));
+                assert.ok(/^pending\.push\(promise\)$/.test(spelling(node)), "array producer source");
+                assert.ok(registrations.some(row => row.event === "unhandledRejection" && family(row.listener) === family(writer.name)), "array producer owner");
+              }
+            };
+            const receiver = (expr, owner, expected) => {
+              assert.equal(spelling(expr), expected, "catch receiver span changed");
+              let value = expr;
+              while (value.kind === "libCall" && ["js.toDyn", "js.fromDyn"].includes(value.fn)) { assert.equal(value.args.length, 1); value = value.args[0]; }
+              const indexed = /^([A-Za-z_$][\w$]*)\[(\d+)\]$/.exec(expected);
+              if (indexed) {
+                assert.equal(value.kind, "call"); assert.ok(functions.has(value.callee));
+                assert.equal(value.args.length, 2); assert.equal(value.args[1].kind, "numLit"); assert.equal(value.args[1].value, Number(indexed[2]));
+                assert.equal(spelling(value.args[0]), indexed[1]); trustedArray(value.args[0], owner);
+                const helper = functions.get(value.callee);
+                assert.equal(helper.params.length, 2); assert.equal(helper.params[0].type.kind, "dyn"); assert.equal(helper.params[1].type.kind, "f64");
+                const param = (node, i) => { assert.equal(node.kind, "varRef"); assert.equal(node.localId, helper.params[i].localId); assert.deepEqual(node.type, helper.params[i].type); };
+                assert.equal(collect(helper.body, node => ["assign", "varDecl"].includes(node.kind) && helper.params.some(p => p.localId === node.localId)).length, 0);
+                const integer = helper.body[0]; assert.equal(integer.kind, "if"); assert.equal(integer.cond.kind, "libCall");
+                assert.equal(integer.cond.fn, "number.isInteger"); assert.equal(integer.cond.args.length, 1); param(integer.cond.args[0], 1);
+                const lower = only(integer.then, "array lower bound"); assert.equal(lower.kind, "if"); assert.equal(lower.cond.kind, "bin");
+                assert.equal(lower.cond.op, ">="); param(lower.cond.left, 1); assert.equal(lower.cond.right.kind, "numLit"); assert.equal(lower.cond.right.value, 0);
+                const upper = only(lower.then, "array upper bound"); assert.equal(upper.kind, "if"); assert.equal(upper.cond.kind, "bin");
+                assert.equal(upper.cond.op, "<"); param(upper.cond.left, 1); assert.equal(upper.cond.right.kind, "libCall");
+                assert.equal(upper.cond.right.fn, "dyn.arrLen"); assert.equal(upper.cond.right.args.length, 1); param(upper.cond.right.args[0], 0);
+                const returned = only(upper.then, "array element return"); assert.equal(returned.kind, "return");
+                let read = returned.value;
+                if (read.kind === "libCall" && read.fn === "js.fromDyn") { assert.equal(read.args.length, 1); read = read.args[0]; }
+                assert.equal(read.kind, "libCall"); assert.equal(read.fn, "dyn.arrAt"); assert.equal(read.args.length, 2);
+                param(read.args[0], 0); param(read.args[1], 1);
+                assert.equal(collect(helper.body, node => node.kind === "libCall" && node.fn === "dyn.arrAt").length, 1);
+
+              } else { assert.ok(/^[A-Za-z_$][\w$]*$/.test(expected)); assert.ok(trustedPromise(value, owner)); }
+            };
+            const catchGroups = groups(node => (node.kind === "dynInvoke" && node.method === "catch") ||
+              (node.kind === "callValue" && /\.catch\(/.test(spelling(node))), "catch", authoredCount(/\.catch\(/g));
+            assert.ok(catchGroups.length);
+            for (const rows of catchGroups) {
+              const signatures = [];
+              for (const { node: call, owner } of rows) {
+                const match = /^([A-Za-z_$][\w$]*(?:\[\d+\])?)\.catch\(/.exec(spelling(call)); assert.ok(match, "catch source span");
+                assert.equal(call.args.length, 1);
+                let callback, form, handlerBody;
+                if (call.kind === "dynInvoke") {
+                  form = "dynamic"; assert.equal(call.recv.type.kind, "dyn"); receiver(call.recv, owner, match[1]);
+                  callback = addRoot(nativeClosure(call.args[0], owner)); handlerBody = callback.body;
+                  assert.ok(callback.loc.start > call.loc.start && callback.loc.end < call.loc.end, "dynamic handler source span");
+                } else {
+                  form = "typed"; assert.equal(call.callee.kind, "closure"); callback = addRoot(nativeClosure(call.callee, owner));
+                  assert.equal(callback.async, true); assert.equal(callback.params.length, 1);
+                  const parameter = callback.params[0]; assert.equal(parameter.type.kind, "promise");
+                  assert.deepEqual(call.args[0].type, parameter.type); receiver(call.args[0], owner, match[1]);
+                  assert.deepEqual(callback.loc, call.loc);
+                  const handler = only(callback.body.filter(node => node.kind === "tryCatch"), "typed catch body");
+                  const awaited = only(collect(handler.tryBody, node => node.kind === "awaitExpr"), "typed catch await");
+                  assert.equal(awaited.value.kind, "varRef"); assert.equal(awaited.value.localId, parameter.localId);
+                  assert.deepEqual(awaited.value.type, parameter.type); handlerBody = handler.catchBody;
+                  assert.equal(collect(callback.body, node => node.kind === "awaitExpr").length, 1);
+                }
+                const log = only(collect(handlerBody, node => node.kind === "intrinsic" && node.name === "console.log"), "authored catch log");
+                assert.ok(log.loc.file === entry && log.loc.start > call.loc.start && log.loc.end < call.loc.end);
+                assert.ok(/^console\.log\("caught(?: first| second)?"\)$/.test(spelling(log)), "catch handler lost authored body");
+                signatures.push(form + ":" + family(callback.name));
+                catchEvidence.push({ form, owner: owner.name, family: family(owner.name), callback: callback.name, span: call.loc });
+              }
+              assert.equal(new Set(signatures).size, 1, "clone catch changed");
+            }
+            if (spec.deferredHost || spec.id.endsWith("late-listeners-and-work"))
+              assert.ok(catchEvidence.every(row => row.form === "dynamic"), "control requires observation at attachment");
+            if (["native-late-handling", "hosted-late-handling"].includes(spec.id)) {
+              assert.equal(rejected.length, 1); assert.deepEqual(rejected[0][0].node.type, { kind: "promise", inner: { kind: "void" } });
+              const unhandled = only(registrations.filter(row => row.event === "unhandledRejection"), "original unhandled listener");
+              const handled = only(registrations.filter(row => row.event === "rejectionHandled"), "original handled listener");
+              assert.equal(functions.get(unhandled.listener).params.length, 0); assert.equal(functions.get(handled.listener).params.length, 0);
+              const immediate = only(schedules.filter(row => row.operation === "timers.setImmediate"), "original native immediate");
+              const tick = only(schedules.filter(row => row.operation === "process.nextTick"), "original native tick");
+              assert.equal(immediate.owner, unhandled.listener); assert.equal(tick.owner, immediate.callback);
+              assert.equal(schedules.length, 2); assert.equal(catchEvidence.length, 1);
+              assert.equal(catchEvidence[0].form, "typed"); assert.equal(catchEvidence[0].owner, immediate.callback);
+              const calls = collect(functions.get(immediate.callback).body, node => node.kind === "callValue" ||
+                (node.kind === "libCall" && node.fn === "process.nextTick") || (node.kind === "intrinsic" && node.name === "console.log"));
+              assert.deepEqual(calls.map(node => node.kind === "callValue" ? "catch" : node.kind === "libCall" ? "tick" : spelling(node)),
+                ['console.log("attach")', "catch", 'console.log("after")', "tick"]);
+            }
+            const ioGroups = groups(node => node.kind === "libCall" && node.fn === "fs.callbackCall", "native stat callback", spec.id === "handled-listener-starts-host-with-io" ? 1 : 0);
+            for (const rows of ioGroups) for (const { node: call, owner } of rows) {
+              assert.equal(spelling(call), 'stat(".", (error) => console.log("io", error === null))');
+              assert.equal(call.args.length, 2); assert.equal(call.args[0].kind, "strLit"); assert.equal(call.args[0].value, "stat");
+              assert.equal(call.args[1].kind, "dynArrLit"); assert.equal(call.args[1].elems.length, 2);
+              const [path, cb] = call.args[1].elems; const rawPath = path.kind === "dynFrom" ? path.value : path;
+              assert.equal(rawPath.kind, "strLit"); assert.equal(rawPath.value, ".");
+              const callback = addRoot(nativeClosure(cb, owner));
+              assert.ok(callback.loc.start > call.loc.start && callback.loc.end < call.loc.end, "stat callback provenance");
+              const logs = collect(callback.body, node => node.kind === "intrinsic" && node.name === "console.log");
+              assert.equal(logs.length, 1); assert.equal(spelling(logs[0]), 'console.log("io", error === null)');
+            }
+            const throws = groups(node => node.kind === "throw" && /^throw new Error\(/.test(spelling(node)), "authored throw", authoredCount(/throw new Error\(/g));
+            const islands = records.filter(({ node }) => islandCall(node));
+            if (!spec.hosted) { assert.equal(islands.length, 0); assert.equal(program.nodeIsland, undefined); }
+            else {
               const tree = program.nodeIsland?.modules; assert.ok(tree); assert.deepEqual(tree.links, []);
               const paths = Object.keys(spec.files).filter(file => file.startsWith("node_modules/checkpoint-host/")).sort();
               assert.deepEqual(tree.files.map(file => file.path).sort(), paths);
@@ -400,67 +498,63 @@ jobs:
                 assert.notEqual(file.placeholder, true); assert.equal(file.size, Buffer.byteLength(spec.files[file.path]));
                 assert.equal(file.sha256, digest(spec.files[file.path]));
               }
-              assert.ok(islands.some(node => ["nodeIsland.require", "nodeIsland.defer"].includes(node.fn)));
+              assert.ok(islands.some(({ node }) => ["nodeIsland.require", "nodeIsland.defer"].includes(node.fn)));
             }
-            const visited = new Set(), pending = [...roots];
-            while (pending.length) {
-              const fn = pending.pop(); if (visited.has(fn.name)) continue; visited.add(fn.name);
-              assert.ok(reachable.has(fn.name), "callback is detached from native entry");
-              for (const call of collect(fn.body, islandCall)) {
-                // Only the two authored call-local host starts can cross this boundary.
+            const visited = visit([...callbackRoots]);
+            for (const name of visited) {
+              assert.ok(reachable.has(name), "detached callback chain");
+              for (const { node: call } of recordsOf(functions.get(name)).filter(({ node }) => islandCall(node))) {
                 assert.ok(spec.deferredHost, "callback delegates to Node");
-                assert.ok(["nodeIsland.require", "nodeIsland.invoke"].includes(call.fn), "unexpected Node callback operation");
+                assert.ok(["nodeIsland.require", "nodeIsland.invoke"].includes(call.fn));
                 assert.ok(/^requireModule\("checkpoint-host"\)(?:\.start\(\))?$/.test(spelling(call)));
-                assert.equal(collect(call.args, node => node.kind === "closure").length, 0, "callback passed to Node");
+                assert.equal(collect(call.args, node => node.kind === "closure").length, 0);
                 if (call.fn === "nodeIsland.invoke") {
-                  assert.equal(call.args[1].value, "start"); assert.equal(call.args[2].kind, "dynArrLit");
-                  assert.equal(call.args[2].elems.length, 0);
+                  assert.equal(call.args[1].value, "start"); assert.equal(call.args[2].kind, "dynArrLit"); assert.equal(call.args[2].elems.length, 0);
                 }
-              }
-              for (const node of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
-                const name = node.kind === "call" ? node.callee : node.fnName;
-                if (functions.has(name)) pending.push(functions.get(name));
               }
             }
             if (spec.deferredHost) {
-              const load = only(islands.filter(node => node.fn === "nodeIsland.require"), "one explicit host load");
-              assert.equal(spelling(load), 'requireModule("checkpoint-host")');
-              assert.ok(visited.has(ownerOf(load).name), "host load must be in a native event callback");
-              assert.equal(islands.filter(node => node.fn === "nodeIsland.defer").length, 0);
-              const loadOwner = ownerOf(load);
-              if (spec.id === "host-starts-with-late-event") {
-                const unhandled = only(registrations.filter(row => row.event === "unhandledRejection"), "unhandled registration");
-                assert.ok(schedules.some(row => row.operation === "timers.setImmediate" && row.owner === unhandled.listener && row.callback === loadOwner.name));
-              } else {
-                assert.ok(registrations.some(row => row.event === "rejectionHandled" && row.listener === loadOwner.name));
-              }
-              const operations = collect(loadOwner.body, node => node === load ||
-                (node.kind === "dynInvoke" && node.method === "catch") ||
-                (node.kind === "libCall" && node.fn === "process.nextTick"));
-              assert.equal(operations.filter(node => node === load).length, 1);
-              const catchIndex = operations.findIndex(node => node.kind === "dynInvoke"), loadIndex = operations.indexOf(load);
-              const tickIndex = operations.findIndex(node => node.kind === "libCall" && node.fn === "process.nextTick");
-              assert.ok(catchIndex >= 0 && catchIndex < loadIndex,
-                "native catch attachment must precede the explicit host load");
-              assert.ok(tickIndex >= 0 && tickIndex > loadIndex,
-                "native nextTick must follow the explicit host load");
-              const starts = nodes.filter(node => node.kind === "dynInvoke" && node.method === "start");
-              const invokes = islands.filter(node => node.fn === "nodeIsland.invoke");
-              assert.equal(starts.length + invokes.length, 1, "one call-local host start");
-              for (const call of starts) {
-                assert.equal(call.args.length, 0); assert.ok(collect(call.recv, node => node === load).length === 1);
-                assert.equal(ownerOf(call).name, ownerOf(load).name);
+              const loads = groups(node => node.kind === "libCall" && node.fn === "nodeIsland.require", "explicit host load", 1)[0];
+              assert.equal(islands.filter(({ node }) => node.fn === "nodeIsland.defer").length, 0);
+              const starts = groups(node => (node.kind === "dynInvoke" && node.method === "start") ||
+                (node.kind === "libCall" && node.fn === "nodeIsland.invoke"), "explicit host start", 1)[0];
+              for (const { node: load, owner } of loads) {
+                assert.equal(spelling(load), 'requireModule("checkpoint-host")'); assert.ok(visited.has(owner.name));
+                if (spec.id === "host-starts-with-late-event") {
+                  const listeners = registrations.filter(row => row.event === "unhandledRejection");
+                  assert.ok(schedules.some(row => row.operation === "timers.setImmediate" && family(row.callback) === family(owner.name) &&
+                    listeners.some(listener => family(listener.listener) === family(row.owner))));
+                } else assert.ok(registrations.some(row => row.event === "rejectionHandled" && family(row.listener) === family(owner.name)));
+                // The same statement list must own catch -> stat (when present) -> host -> tick.
+                const statementOwner = new Map();
+                const walkStatements = (value, list) => {
+                  if (!value || typeof value !== "object") return;
+                  if (typeof value.kind === "string") statementOwner.set(value, list);
+                  for (const [key, child] of Object.entries(value)) {
+                    const nested = Array.isArray(child) && ["body", "then", "else_", "tryBody", "catchBody", "finallyBody"].includes(key);
+                    if (Array.isArray(child)) child.forEach(item => walkStatements(item, nested ? child : list));
+                    else walkStatements(child, list);
+                  }
+                };
+                owner.body.forEach(statement => walkStatements(statement, owner.body));
+                const list = statementOwner.get(load); assert.ok(Array.isArray(list), "native host statement list");
+                const sequence = collect(list, node => statementOwner.get(node) === list && (node === load ||
+                  (node.kind === "dynInvoke" && node.method === "catch") || (node.kind === "callValue" && /\.catch\(/.test(spelling(node))) ||
+                  (node.kind === "libCall" && ["fs.callbackCall", "process.nextTick"].includes(node.fn))));
+                assert.deepEqual(sequence.map(node => node === load ? "host" : node.kind === "libCall" ? node.fn : "catch"),
+                  spec.id === "handled-listener-starts-host-with-io" ? ["catch", "fs.callbackCall", "host", "process.nextTick"] : ["catch", "host", "process.nextTick"]);
+                const start = only(starts.filter(row => row.owner === owner), "host start owner").node;
+                assert.equal(spelling(start), 'requireModule("checkpoint-host").start()');
+                if (start.kind === "dynInvoke") { assert.equal(start.args.length, 0); assert.equal(collect(start.recv, node => node === load).length, 1); }
               }
             }
-            for (const row of registrations) assert.ok(reachable.has(row.owner));
             return { status: "passed", startupRefusalAbsent: true, commonJsEntry: program.commonJsEntry ?? false,
-              mode: "native-dynamic-lifecycle", registrations, schedules, catches: catchEvidence,
-              rejections: rejected.map(node => ({ type: node.type, span: node.loc })), authoredThrows: throws.length,
-              nativeIoCallbacks: ioCalls.length, callbackFunctions: [...visited].sort(), reachableFunctions: [...reachable].sort(),
-              explicitHostTransition: spec.deferredHost, islandCalls: islands.map(node => node.fn),
+              mode: "native-lifecycle", ownerFamilies: program.functions.map(fn => ({ name: fn.name, family: family(fn.name), jsEntry: fn.jsEntry ?? null })),
+              registrations, schedules, catches: catchEvidence, rejections: rejected.map(rows => ({ type: rows[0].node.type, span: rows[0].node.loc, occurrences: rows.length })),
+              authoredThrows: throws.length, nativeIoCallbacks: ioGroups.length, callbackFunctions: [...visited].sort(), reachableFunctions: [...reachable].sort(),
+              explicitHostTransition: spec.deferredHost, islandCalls: islands.map(row => ({ owner: row.owner.name, operation: row.node.fn })),
               shippedFiles: program.nodeIsland?.modules?.files ?? [],
-              functions: program.functions.map(fn => ({ name: fn.name, sourceName: fn.sourceName ?? null,
-                file: fn.loc?.file ?? null, statements: fn.body.length })) };
+              functions: program.functions.map(fn => ({ name: fn.name, sourceName: fn.sourceName ?? null, file: fn.loc?.file ?? null, statements: fn.body.length })) };
           };
 
           const verifyGateData = (spec, data, collection) => {
@@ -500,6 +594,8 @@ jobs:
                 assert.equal(data.numTotalTests, spec.tests.length);
               }
             }
+            if (spec.expectedByFile) for (const file of spec.files)
+              assert.deepEqual(selected.filter(row => row.file === file).map(row => row.name).sort(), [...spec.expectedByFile[file]].sort(), "exact focused unit inventory");
             assert.ok(selected.every(row => row.status === "passed"), "test did not pass");
             assert.equal(data.success, true); assert.equal(data.numFailedTests, 0); assert.equal(data.numFailedTestSuites, 0);
             assert.equal(data.numPassedTests, selected.length);
@@ -508,7 +604,7 @@ jobs:
             return { tests: selected, executedCount: executed.length,
               fileCounts: Object.fromEntries(spec.files.map(file => [file, selected.filter(row => row.file === file).length])) };
           };
-          const sourcePins = {"packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/diagnostics/diagnostic.ts":"443c06fffaf5038c8248fabf975814f39fbc2335a129ee1e77e00c441e8c2cd1","packages/compiler/src/executable/prepare.ts":"299c8b71c40db653f10a8aef2dfef3e7c274309144bb6df577a7e2673de3a85d","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/frontend/lowering/lowerer.ts":"22f6e48b532f60b9338966353fb7737ca43dd6c49f69209fe9812decd4a403d6","packages/compiler/src/frontend/lowering/lower-calls.ts":"d9bfd0449fb5a473ea4adc64af96be1c361185d32d9b2329409cc5ef78684c3f","packages/compiler/src/frontend/lowering/lower-exprs.ts":"a92993dc990fe5c1e0245119d3642f640519bce8f85a467ac5834d981961f9a2","packages/compiler/src/frontend/lowering/lower-timers.ts":"f3b558a68329ea677401475db71ecc9e8adaca970a897f2416c41e2a42fb19ec","packages/compiler/src/frontend/lowering/builtins/process.ts":"92db7d1019dadcb07bb2710f11e4238c47c89e9a05b2f77cdbb8099c1df8f40e","packages/compiler/src/frontend/lowering/builtins/async-context.ts":"9d078abd4a635e71b3792bc26a974fb23bb96486500cfdb4120173568badc1d2","packages/compiler/src/frontend/lowering/lower-node-island.ts":"e24b6e158ccd48a54ca959fea8caaf6f5acf8694d6a58f9c2218190790a8651f","packages/compiler/src/frontend/lowering/lower-modules.ts":"ec0975303498fbb8af096b97f3899175d94d5ec9c02a53b9c6396641979f7ae2","packages/compiler/src/ir/ir.ts":"b7107ae9ee9ac4d390ee74352ce1ff617b705f08871e41a0215491b5aa7536d2","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/llvm/emit-module.ts":"a66ccedd078cb09c1bb90b5531d254b0d0aed6815d6a912e1671a423122b8402","packages/compiler/src/backend/llvm/lib-shared.ts":"08f0bf7adbe7edb1d66843ab577aa348f3c517e440afb27cd434ba0df34302d7","packages/compiler/src/backend/llvm/lib-dispatch.ts":"b7a41843af487802b7b1d72a26340175bb266c5193a835e7413b5cac1ac8e25c","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/policy.ts":"e651aac43783cb63c37654d0d4e678db79569d22eb096ed91cfb061e9d338dcc","packages/compiler/src/node-islands/snapshot.ts":"a84a9a5ca422f65f2d87dceceb3e96aaa7e17e1b451a9aa5294cc95ca80a9a94","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/runtime/src/scr_async.c":"3e1de6c2bb1e1d6e285cdefbe08adb3e2af58ca17e08257a05fc5948fc0b5e17","packages/runtime/src/scr_async.h":"9eae8ff88f78823f9d61ff39f7e596e4f326d7ddc431394b6fea41a253455e9b","packages/runtime/src/scr_async_dyn.c":"df78f14ac9ce4536c8354a3fe2cf80fcdfd3e91a6464027d1b6acda25bcecaa8","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island_boot.c":"9d819bff68f0df27bf7b7a7ca8a6fa5e7520a1dfe2a75a2406845a8051b2922d","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","native/llvm-codegen/src/target.h":"6e814839b13df133fbd8b19898862334dac7f5e96b47501333e62738d68a7bac","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e","packages/compiler/src/backend/native-codegen-core.ts":"dab5c5a2de6a4ac34a191eaaf82412f504641148b14d2b39634944dfb8d92a54","tests/harness/node-island-order.test.ts":"d65d90ae809161d8cd88ccd6eebc08933c11d51d657703433dbb8de61b25268d","tests/harness/node-island-rejection-checkpoint.test.ts":"e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/lowering/builtins/filesystem-calls.ts":"88d2e3b54a631af751db64a59672841fb7ab28ec66ccc29bc22b7998169fba9c","packages/compiler/src/frontend/lowering/builtins/module-calls.ts":"ee354ecd973579c449e3d8d14d61386624135c2013c8c505a47e63f29f5dbd5c","packages/compiler/src/node-islands/report.ts":"66409a08df5cfb9b9943665f39a17234e69df2aff7acf8a1c8c4edbc18a2ed50","packages/compiler/src/ir/builtin-signatures.ts":"788fbb8d94dcc684ed4ff487f887ab29a995b434f0531fb0e59ff8b0d9391780","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/runtime/src/scr_async.test.ts":"2a8f27a39d08a92beb6e4333a62ac8ebffe99674b0000522f0bfbbdc54e5c275","packages/runtime/src/scr_async.test.c":"5d3747715bcad651cdada822607344d75f299f416505421ea877f3fe4589f85b","packages/runtime/src/scr_console.c":"2f76b45128cd44f6871b72dc68790f2b23687569fdb00217a49f075a2ccddd90","packages/runtime/src/scr_dyn_invoke.c":"486167d2fcca5a74b48767f70ccd9ce9bc9f1f273f992a08efc202408bf97178","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/corpus/2558-rejection-events.cjs":"0e6e72d3b8cf786db0eb44ce5e5ac2dc7f4ed3702a42831f1df9b95185ec05ea","tests/corpus/2212-unhandled-rejection-listener.cjs":"14ebfec6d740bfea283712e2b8d51825f1f15e7317c3e8c066af7e01cdf4cca5","tests/corpus/5996-rejections-between-macrotasks.cjs":"b619c7f3e1d2088c8d38e2a6cf3e26780206f644569d4acb16c26e34117a993a","tests/corpus/process-uncaught-rejection.cjs":"89b94dbf9c3b9bb220218f1f4583ff8e4692d901e219583f13121343d238d606","tests/corpus/2654-top-level-await-unrelated-rejection.ts":"1250bc4d1ecd7edff7544339c128fa2a75159ae1feb9832404c3738412b137df","tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts":"e7b6f366715e28b4404805773c5d4556d8eb817ac9df28dc934a0462a1312a07","tests/corpus/5808-worker-unhandled-rejections.ts":"b7693e7a8648fb787f3c461ec28544a9c1826f3eb29a262c7c01523dead0697b","packages/compiler/src/node-islands/scan.ts":"bf21c89e782d390169af3f270f5353a8839f3e6e68aab71c2b7a64624097f9aa","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"36f909bd941b5f068ee9329bbfaed99a1f2d78ba9c227987cd2729e5a47e870b"};
+          const sourcePins = {"packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/diagnostics/diagnostic.ts":"443c06fffaf5038c8248fabf975814f39fbc2335a129ee1e77e00c441e8c2cd1","packages/compiler/src/executable/prepare.ts":"299c8b71c40db653f10a8aef2dfef3e7c274309144bb6df577a7e2673de3a85d","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/frontend/lowering/lowerer.ts":"22f6e48b532f60b9338966353fb7737ca43dd6c49f69209fe9812decd4a403d6","packages/compiler/src/frontend/lowering/lower-calls.ts":"d9bfd0449fb5a473ea4adc64af96be1c361185d32d9b2329409cc5ef78684c3f","packages/compiler/src/frontend/lowering/lower-exprs.ts":"a92993dc990fe5c1e0245119d3642f640519bce8f85a467ac5834d981961f9a2","packages/compiler/src/frontend/lowering/lower-timers.ts":"f3b558a68329ea677401475db71ecc9e8adaca970a897f2416c41e2a42fb19ec","packages/compiler/src/frontend/lowering/builtins/process.ts":"34482c9f7650c8f85299b939794eda1fc9521508ea69f2e86bd0109ed57e26c1","packages/compiler/src/frontend/lowering/builtins/async-context.ts":"9d078abd4a635e71b3792bc26a974fb23bb96486500cfdb4120173568badc1d2","packages/compiler/src/frontend/lowering/lower-node-island.ts":"e24b6e158ccd48a54ca959fea8caaf6f5acf8694d6a58f9c2218190790a8651f","packages/compiler/src/frontend/lowering/lower-modules.ts":"ec0975303498fbb8af096b97f3899175d94d5ec9c02a53b9c6396641979f7ae2","packages/compiler/src/ir/ir.ts":"b7107ae9ee9ac4d390ee74352ce1ff617b705f08871e41a0215491b5aa7536d2","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/llvm/emit-module.ts":"a66ccedd078cb09c1bb90b5531d254b0d0aed6815d6a912e1671a423122b8402","packages/compiler/src/backend/llvm/lib-shared.ts":"08f0bf7adbe7edb1d66843ab577aa348f3c517e440afb27cd434ba0df34302d7","packages/compiler/src/backend/llvm/lib-dispatch.ts":"b7a41843af487802b7b1d72a26340175bb266c5193a835e7413b5cac1ac8e25c","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/policy.ts":"e651aac43783cb63c37654d0d4e678db79569d22eb096ed91cfb061e9d338dcc","packages/compiler/src/node-islands/snapshot.ts":"a84a9a5ca422f65f2d87dceceb3e96aaa7e17e1b451a9aa5294cc95ca80a9a94","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/runtime/src/scr_async.c":"3e1de6c2bb1e1d6e285cdefbe08adb3e2af58ca17e08257a05fc5948fc0b5e17","packages/runtime/src/scr_async.h":"9eae8ff88f78823f9d61ff39f7e596e4f326d7ddc431394b6fea41a253455e9b","packages/runtime/src/scr_async_dyn.c":"6ac85021f56001d5453b99aa145cedb75da11b3faf4d5bb0a4ee327992fad31e","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island_boot.c":"9d819bff68f0df27bf7b7a7ca8a6fa5e7520a1dfe2a75a2406845a8051b2922d","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","native/llvm-codegen/src/target.h":"6e814839b13df133fbd8b19898862334dac7f5e96b47501333e62738d68a7bac","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e","packages/compiler/src/backend/native-codegen-core.ts":"dab5c5a2de6a4ac34a191eaaf82412f504641148b14d2b39634944dfb8d92a54","tests/harness/node-island-order.test.ts":"d65d90ae809161d8cd88ccd6eebc08933c11d51d657703433dbb8de61b25268d","tests/harness/node-island-rejection-checkpoint.test.ts":"ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/lowering/builtins/filesystem-calls.ts":"88d2e3b54a631af751db64a59672841fb7ab28ec66ccc29bc22b7998169fba9c","packages/compiler/src/frontend/lowering/builtins/module-calls.ts":"ee354ecd973579c449e3d8d14d61386624135c2013c8c505a47e63f29f5dbd5c","packages/compiler/src/node-islands/report.ts":"66409a08df5cfb9b9943665f39a17234e69df2aff7acf8a1c8c4edbc18a2ed50","packages/compiler/src/ir/builtin-signatures.ts":"da9cd2a4ea230c9b287cdf39ddf9d99d68ce9da34670b71d1a376dc774749398","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/runtime/src/scr_async.test.ts":"2a8f27a39d08a92beb6e4333a62ac8ebffe99674b0000522f0bfbbdc54e5c275","packages/runtime/src/scr_async.test.c":"5d3747715bcad651cdada822607344d75f299f416505421ea877f3fe4589f85b","packages/runtime/src/scr_console.c":"2f76b45128cd44f6871b72dc68790f2b23687569fdb00217a49f075a2ccddd90","packages/runtime/src/scr_dyn_invoke.c":"486167d2fcca5a74b48767f70ccd9ce9bc9f1f273f992a08efc202408bf97178","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/corpus/2558-rejection-events.cjs":"0e6e72d3b8cf786db0eb44ce5e5ac2dc7f4ed3702a42831f1df9b95185ec05ea","tests/corpus/2212-unhandled-rejection-listener.cjs":"14ebfec6d740bfea283712e2b8d51825f1f15e7317c3e8c066af7e01cdf4cca5","tests/corpus/5996-rejections-between-macrotasks.cjs":"b619c7f3e1d2088c8d38e2a6cf3e26780206f644569d4acb16c26e34117a993a","tests/corpus/process-uncaught-rejection.cjs":"89b94dbf9c3b9bb220218f1f4583ff8e4692d901e219583f13121343d238d606","tests/corpus/2654-top-level-await-unrelated-rejection.ts":"1250bc4d1ecd7edff7544339c128fa2a75159ae1feb9832404c3738412b137df","tests/corpus/2665-top-level-await-unhandled-listener-liveness.ts":"e7b6f366715e28b4404805773c5d4556d8eb817ac9df28dc934a0462a1312a07","tests/corpus/5808-worker-unhandled-rejections.ts":"b7693e7a8648fb787f3c461ec28544a9c1826f3eb29a262c7c01523dead0697b","packages/compiler/src/node-islands/scan.ts":"bf21c89e782d390169af3f270f5353a8839f3e6e68aab71c2b7a64624097f9aa","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"36f909bd941b5f068ee9329bbfaed99a1f2d78ba9c227987cd2729e5a47e870b","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/frontend/type-mapper.ts":"fcdbe47ee9252866ca0f818e5f4bddce43c610b01d44bb4c721812455c118c3a","packages/compiler/src/frontend/program.ts":"650b1930e34f06de8c2adb512b5751672eb9aca56f456b0634833b6267fee438","packages/compiler/ambient/scriptc-node-fallback.d.ts":"79ed691d22b3014535358a178e839b22cf4500108e281b515da6bdf447ae1bb7","packages/compiler/ambient/node-fallback/fs.d.ts":"49e8fe8c619c5b18634c387620016792d803a85a10a1984ef925f11726f193db","packages/compiler/test/node-fallback-callbacks.test.ts":"ae4368b7c57fa8cad81431de6840bc108ab12b66dd130b20bd311d17fc8cdf51","packages/compiler/test/process-listener-int32-emission.test.ts":"4e44281fa18276ea7e7ef153cb771596f2c329e047a75600005f1dfc7574b8b4","packages/runtime/src/scr_bytes_io.c":"9383b53d7a03154d5f2c01054d4cfaa1b0242814046e84b8280d60d19053efaa","packages/compiler/src/frontend/lowering/class-dynamic-dispatch.ts":"b9329695faa67ea5fe4d8559e2a5e716cd2b8694b01c5560622cdee513dcf385"};
           const sourceFiles = Object.keys(sourcePins);
           const source = () => {
             assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
@@ -549,9 +645,9 @@ jobs:
               },
               "expected": "unhandled\nattach\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -570,9 +666,9 @@ jobs:
               },
               "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -584,13 +680,13 @@ jobs:
               "deferredHost": false,
               "files": {
                 "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false}}}",
-                "main.ts": "const removed = () => console.log(\"removed\");\nprocess.on(\"rejectionHandled\", removed);\nprocess.on(\"unhandledRejection\", (_reason, pending) => {\n  console.log(\"unhandled\");\n  setImmediate(() => {\n    console.log(\"attach\");\n    process.off(\"rejectionHandled\", removed);\n    pending.catch(() => console.log(\"caught first\"));\n    pending.catch(() => console.log(\"caught second\"));\n    process.on(\"rejectionHandled\", removed);\n    process.once(\"rejectionHandled\", () => {\n      console.log(\"handled\");\n      process.nextTick(() => console.log(\"handled tick\"));\n      queueMicrotask(() => console.log(\"handled microtask\"));\n      setImmediate(() => console.log(\"handled immediate\"));\n    });\n    process.off(\"rejectionHandled\", removed);\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nPromise.reject(\"sentinel\");\n"
+                "main.ts": "const removed = () => console.log(\"removed\");\nprocess.on(\"rejectionHandled\", removed);\nprocess.on(\"unhandledRejection\", (_reason, pending) => {\n  console.log(\"unhandled\");\n  // Dynamic catch observes at attachment; the typed helper observes at await.\n  // Keep attachment between removing and restoring handled listeners.\n  const deferred: any[] = [pending];\n  setImmediate(() => {\n    console.log(\"attach\");\n    process.off(\"rejectionHandled\", removed);\n    deferred[0].catch(() => console.log(\"caught first\"));\n    deferred[0].catch(() => console.log(\"caught second\"));\n    process.on(\"rejectionHandled\", removed);\n    process.once(\"rejectionHandled\", () => {\n      console.log(\"handled\");\n      process.nextTick(() => console.log(\"handled tick\"));\n      queueMicrotask(() => console.log(\"handled microtask\"));\n      setImmediate(() => console.log(\"handled immediate\"));\n    });\n    process.off(\"rejectionHandled\", removed);\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nPromise.reject(\"sentinel\");\n"
               },
               "expected": "unhandled\nattach\nafter\ntick\ncaught first\ncaught second\nhandled\nhandled tick\nhandled microtask\nhandled immediate\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -606,9 +702,9 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ntick\ncaught\ncaught\nonce\non\non\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -624,9 +720,9 @@ jobs:
               },
               "expected": "unhandled\nunhandled\nattach\ncaught first\nhandled first\nhandled second\ncaught second\nhandled microtask\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -642,9 +738,9 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nhandled 2\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -660,9 +756,9 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nuncaught tick\nuncaught microtask\nhandled 2\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -678,9 +774,9 @@ jobs:
               },
               "expected": "unhandled\nattach\nafter\ntick\ncaught\nhandled\nuncaught listener failure\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -692,16 +788,16 @@ jobs:
               "deferredHost": false,
               "files": {
                 "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
-                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst removed = () => console.log(\"removed\");\nprocess.on(\"rejectionHandled\", removed);\nprocess.on(\"unhandledRejection\", (_reason, pending) => {\n  console.log(\"unhandled\");\n  setImmediate(() => {\n    console.log(\"attach\");\n    process.off(\"rejectionHandled\", removed);\n    pending.catch(() => console.log(\"caught first\"));\n    pending.catch(() => console.log(\"caught second\"));\n    process.on(\"rejectionHandled\", removed);\n    process.once(\"rejectionHandled\", () => {\n      console.log(\"handled\");\n      process.nextTick(() => console.log(\"handled tick\"));\n      queueMicrotask(() => console.log(\"handled microtask\"));\n      setImmediate(() => console.log(\"handled immediate\"));\n    });\n    process.off(\"rejectionHandled\", removed);\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nPromise.reject(\"sentinel\");\n",
+                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst removed = () => console.log(\"removed\");\nprocess.on(\"rejectionHandled\", removed);\nprocess.on(\"unhandledRejection\", (_reason, pending) => {\n  console.log(\"unhandled\");\n  // Dynamic catch observes at attachment; the typed helper observes at await.\n  // Keep attachment between removing and restoring handled listeners.\n  const deferred: any[] = [pending];\n  setImmediate(() => {\n    console.log(\"attach\");\n    process.off(\"rejectionHandled\", removed);\n    deferred[0].catch(() => console.log(\"caught first\"));\n    deferred[0].catch(() => console.log(\"caught second\"));\n    process.on(\"rejectionHandled\", removed);\n    process.once(\"rejectionHandled\", () => {\n      console.log(\"handled\");\n      process.nextTick(() => console.log(\"handled tick\"));\n      queueMicrotask(() => console.log(\"handled microtask\"));\n      setImmediate(() => console.log(\"handled immediate\"));\n    });\n    process.off(\"rejectionHandled\", removed);\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nPromise.reject(\"sentinel\");\n",
                 "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
                 "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
                 "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
               },
               "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught first\ncaught second\nhandled\nhandled tick\nhandled microtask\nhandled immediate\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -720,9 +816,9 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\ntick\ncaught\ncaught\nonce\non\non\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -741,9 +837,9 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\nattach\ncaught first\nhandled first\nhandled second\ncaught second\nhandled microtask\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -762,9 +858,9 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nhandled 2\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -783,9 +879,9 @@ jobs:
               },
               "expected": "island ready\nunhandled\nunhandled\ncaught\ncaught\nhandled 1\nuncaught\nuncaught tick\nuncaught microtask\nhandled 2\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
@@ -804,23 +900,23 @@ jobs:
               },
               "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught\nhandled\nuncaught listener failure\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
               "id": "host-starts-with-late-event",
               "hosted": true,
+              "deferredHost": true,
               "macrotask": false,
               "directCatch": false,
               "lateHandling": true,
-              "deferredHost": true,
               "files": {
                 "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
-                "main.ts": "import { requireModule } from \"@scriptc/node\";\nprocess.on(\"rejectionHandled\", () => console.log(\"handled\"));\nprocess.on(\"unhandledRejection\", (_reason, pending) => {\n  console.log(\"unhandled\");\n  setImmediate(() => {\n    console.log(\"attach\");\n    pending.catch(() => console.log(\"caught\"));\n    requireModule(\"checkpoint-host\").start();\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nPromise.reject(\"sentinel\");\n",
+                "main.ts": "import { requireModule } from \"@scriptc/node\";\nprocess.on(\"rejectionHandled\", () => console.log(\"handled\"));\nprocess.on(\"unhandledRejection\", (_reason, pending) => {\n  console.log(\"unhandled\");\n  // Dynamic catch observes before host startup; the typed await observes later.\n  const deferred: any[] = [pending];\n  setImmediate(() => {\n    console.log(\"attach\");\n    deferred[0].catch(() => console.log(\"caught\"));\n    requireModule(\"checkpoint-host\").start();\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nPromise.reject(\"sentinel\");\n",
                 "node_modules/@scriptc/node/package.json": "{\n  \"name\": \"@scriptc/node\",\n  \"version\": \"0.4.7\",\n  \"description\": \"Call into Node.js from scriptc programs: run an export of a JavaScript module in a Node.js helper process and copy JSON data both ways. Under Node.js the calls run in-process.\",\n  \"license\": \"Apache-2.0\",\n  \"homepage\": \"https://scriptc.dev\",\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/vercel-labs/scriptc.git\",\n    \"directory\": \"packages/node\"\n  },\n  \"type\": \"module\",\n  \"main\": \"index.js\",\n  \"types\": \"index.d.ts\",\n  \"exports\": {\n    \".\": {\n      \"types\": \"./index.d.ts\",\n      \"default\": \"./index.js\"\n    }\n  },\n  \"files\": [\n    \"index.js\",\n    \"index.d.ts\",\n    \"README.md\"\n  ],\n  \"engines\": {\n    \"node\": \">=24.13.1\"\n  }\n}\n",
-                "node_modules/@scriptc/node/index.js": "// @scriptc/node \u2014 the Node.js implementation.\n//\n// scriptc builds lower call() and callSync() to calls into Node.js loaded\n// into the program (packages/runtime/src/scr_node_island.c and its\n// bootstrap, scr_node_island_host.cjs). Under Node.js they run directly,\n// with the same copies at the boundary, so a program prints the same\n// either way. Keep the two in step: every message and copy rule here has\n// its twin in the bootstrap.\n\nimport { createRequire } from \"node:module\";\nimport { fileURLToPath } from \"node:url\";\n\n// Error classes that cross as copies, at the host's kind index.\nconst ERROR_CLASSES = [\n  Error,\n  TypeError,\n  RangeError,\n  SyntaxError,\n  undefined,\n  ReferenceError,\n  EvalError,\n  URIError,\n];\nconst ERROR_KINDS = [\n  [TypeError, 1],\n  [RangeError, 2],\n  [SyntaxError, 3],\n  [ReferenceError, 5],\n  [EvalError, 6],\n  [URIError, 7],\n];\n\n/** The file of the code that called `api`. */\nfunction callerFile(api) {\n  const savedPrepare = Error.prepareStackTrace;\n  const savedLimit = Error.stackTraceLimit;\n  let sites;\n  try {\n    Error.stackTraceLimit = 1;\n    Error.prepareStackTrace = (_error, callSites) => callSites;\n    const holder = {};\n    Error.captureStackTrace(holder, api);\n    sites = holder.stack;\n  } finally {\n    Error.prepareStackTrace = savedPrepare;\n    Error.stackTraceLimit = savedLimit;\n  }\n  const name = Array.isArray(sites) && sites.length > 0 ? sites[0].getFileName() : undefined;\n  if (typeof name !== \"string\")\n    throw new Error(\"@scriptc/node: cannot determine the calling module\");\n  return name.startsWith(\"file:\") ? fileURLToPath(name) : name;\n}\n\nconst requires = new Map();\n\nfunction exportedFunction(file, specifier, name) {\n  let load = requires.get(file);\n  if (load === undefined) {\n    load = createRequire(file);\n    requires.set(file, load);\n  }\n  const namespace = load(specifier);\n  const fn = namespace === null || namespace === undefined ? undefined : namespace[name];\n  if (typeof fn !== \"function\")\n    throw new TypeError(`'${name}' exported by '${specifier}' is not a function`);\n  return { fn, namespace };\n}\n\nfunction isThenable(value) {\n  return (\n    value !== null &&\n    (typeof value === \"object\" || typeof value === \"function\") &&\n    typeof value.then === \"function\"\n  );\n}\n\nfunction errorKind(error) {\n  for (const [constructor, kind] of ERROR_KINDS) if (error instanceof constructor) return kind;\n  return 0;\n}\n\n/** The copy of a thrown value that the caller sees. */\nfunction copyThrown(error) {\n  if (error instanceof Error) {\n    const copy = new ERROR_CLASSES[errorKind(error)](String(error.message));\n    if (typeof error.code === \"string\") copy.code = error.code;\n    return copy;\n  }\n  let text;\n  try {\n    text = JSON.stringify(error);\n  } catch {\n    text = undefined;\n  }\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\n/** The JSON copy of a result; throws what JSON.stringify throws. */\nfunction copyResult(value) {\n  const text = JSON.stringify(value);\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\nfunction copyArgs(args) {\n  return JSON.parse(JSON.stringify(args));\n}\n\nexport function callSync(specifier, name, ...args) {\n  const file = callerFile(callSync);\n  const copied = copyArgs(args);\n  let result;\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    result = Reflect.apply(fn, namespace, copied);\n    if (isThenable(result)) {\n      // The promise is dropped: its rejection must not end the process.\n      Promise.resolve(result).catch(() => {});\n      throw new TypeError(\n        `callSync: '${name}' exported by '${specifier}' returned a promise; use call() for asynchronous functions`,\n      );\n    }\n    return copyResult(result);\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\nexport async function call(specifier, name, ...args) {\n  const file = callerFile(call);\n  const copied = copyArgs(args);\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    return copyResult(await Reflect.apply(fn, namespace, copied));\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\n/** requireModule(specifier): the module's exports, by reference. */\nexport function requireModule(specifier) {\n  return createRequire(callerFile(requireModule))(specifier);\n}\n",
+                "node_modules/@scriptc/node/index.js": "// @scriptc/node — the Node.js implementation.\n//\n// scriptc builds lower call() and callSync() to calls into Node.js loaded\n// into the program (packages/runtime/src/scr_node_island.c and its\n// bootstrap, scr_node_island_host.cjs). Under Node.js they run directly,\n// with the same copies at the boundary, so a program prints the same\n// either way. Keep the two in step: every message and copy rule here has\n// its twin in the bootstrap.\n\nimport { createRequire } from \"node:module\";\nimport { fileURLToPath } from \"node:url\";\n\n// Error classes that cross as copies, at the host's kind index.\nconst ERROR_CLASSES = [\n  Error,\n  TypeError,\n  RangeError,\n  SyntaxError,\n  undefined,\n  ReferenceError,\n  EvalError,\n  URIError,\n];\nconst ERROR_KINDS = [\n  [TypeError, 1],\n  [RangeError, 2],\n  [SyntaxError, 3],\n  [ReferenceError, 5],\n  [EvalError, 6],\n  [URIError, 7],\n];\n\n/** The file of the code that called `api`. */\nfunction callerFile(api) {\n  const savedPrepare = Error.prepareStackTrace;\n  const savedLimit = Error.stackTraceLimit;\n  let sites;\n  try {\n    Error.stackTraceLimit = 1;\n    Error.prepareStackTrace = (_error, callSites) => callSites;\n    const holder = {};\n    Error.captureStackTrace(holder, api);\n    sites = holder.stack;\n  } finally {\n    Error.prepareStackTrace = savedPrepare;\n    Error.stackTraceLimit = savedLimit;\n  }\n  const name = Array.isArray(sites) && sites.length > 0 ? sites[0].getFileName() : undefined;\n  if (typeof name !== \"string\")\n    throw new Error(\"@scriptc/node: cannot determine the calling module\");\n  return name.startsWith(\"file:\") ? fileURLToPath(name) : name;\n}\n\nconst requires = new Map();\n\nfunction exportedFunction(file, specifier, name) {\n  let load = requires.get(file);\n  if (load === undefined) {\n    load = createRequire(file);\n    requires.set(file, load);\n  }\n  const namespace = load(specifier);\n  const fn = namespace === null || namespace === undefined ? undefined : namespace[name];\n  if (typeof fn !== \"function\")\n    throw new TypeError(`'${name}' exported by '${specifier}' is not a function`);\n  return { fn, namespace };\n}\n\nfunction isThenable(value) {\n  return (\n    value !== null &&\n    (typeof value === \"object\" || typeof value === \"function\") &&\n    typeof value.then === \"function\"\n  );\n}\n\nfunction errorKind(error) {\n  for (const [constructor, kind] of ERROR_KINDS) if (error instanceof constructor) return kind;\n  return 0;\n}\n\n/** The copy of a thrown value that the caller sees. */\nfunction copyThrown(error) {\n  if (error instanceof Error) {\n    const copy = new ERROR_CLASSES[errorKind(error)](String(error.message));\n    if (typeof error.code === \"string\") copy.code = error.code;\n    return copy;\n  }\n  let text;\n  try {\n    text = JSON.stringify(error);\n  } catch {\n    text = undefined;\n  }\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\n/** The JSON copy of a result; throws what JSON.stringify throws. */\nfunction copyResult(value) {\n  const text = JSON.stringify(value);\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\nfunction copyArgs(args) {\n  return JSON.parse(JSON.stringify(args));\n}\n\nexport function callSync(specifier, name, ...args) {\n  const file = callerFile(callSync);\n  const copied = copyArgs(args);\n  let result;\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    result = Reflect.apply(fn, namespace, copied);\n    if (isThenable(result)) {\n      // The promise is dropped: its rejection must not end the process.\n      Promise.resolve(result).catch(() => {});\n      throw new TypeError(\n        `callSync: '${name}' exported by '${specifier}' returned a promise; use call() for asynchronous functions`,\n      );\n    }\n    return copyResult(result);\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\nexport async function call(specifier, name, ...args) {\n  const file = callerFile(call);\n  const copied = copyArgs(args);\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    return copyResult(await Reflect.apply(fn, namespace, copied));\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\n/** requireModule(specifier): the module's exports, by reference. */\nexport function requireModule(specifier) {\n  return createRequire(callerFile(requireModule))(specifier);\n}\n",
                 "node_modules/@scriptc/node/index.d.ts": "/** Calls the function `name` exported by the module `specifier` and returns\n * its result.\n *\n * In scriptc builds the call runs in Node.js loaded into the program on\n * the first call (the libnode pack recorded at build time, or\n * SCRIPTC_LIBNODE). Under Node.js it runs in the same process too. Either\n * way:\n *\n * - the module loads with require() from the calling module, so a relative\n *   specifier resolves from the caller's directory and a bare one from its\n *   node_modules (ES modules load through require(esm));\n * - in scriptc builds `specifier` is a string literal: the build ships the\n *   module, and what it loads, inside the executable;\n * - the arguments cross as a copy, `JSON.parse(JSON.stringify(args))`, and\n *   the function runs with the module namespace as `this`;\n * - the result crosses as its JSON copy (undefined stays undefined), and\n *   scriptc checks it against `T` like `JSON.parse(text) as T`;\n * - a thrown Error crosses as a new error of its nearest intrinsic class\n *   (Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError,\n *   URIError) with its message and string `code`; other thrown values cross\n *   as JSON copies.\n *\n * A function that returns a promise cannot be called synchronously: the\n * call throws a TypeError. Use {@link call}. */\nexport declare function callSync<T = unknown>(\n  specifier: string,\n  name: string,\n  ...args: unknown[]\n): T;\n\n/** Like {@link callSync}, asynchronously: the function may return a\n * promise, whose result is copied when it settles. The returned promise\n * rejects instead of throwing, also when the arguments cannot be copied. */\nexport declare function call<T = unknown>(\n  specifier: string,\n  name: string,\n  ...args: unknown[]\n): Promise<T>;\n\n/** Loads the module `specifier` with require() from the calling module and\n * returns its exports **by reference** (scope-B Node islands, NI-4).\n *\n * In scriptc builds the module runs in Node.js loaded into the program on\n * first use; the specifier must be a string literal, resolved at build time\n * as `require.resolve` resolves it from the caller. The exports and every\n * object reached through them stay Node objects: the program holds handles\n * to them, so identity, aliasing and mutation are shared with Node.\n * Primitives, strings and BigInt are copied; promises become promises;\n * Buffers and typed arrays share their memory. Under Node.js this is\n * `createRequire(callerFile)(specifier)`. */\nexport declare function requireModule<T = any>(specifier: string): T;\n",
                 "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
                 "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
@@ -828,23 +924,23 @@ jobs:
               },
               "expected": "unhandled\nattach\nisland ready\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             },
             {
               "id": "handled-listener-starts-host-with-io",
               "hosted": true,
+              "deferredHost": true,
               "macrotask": false,
               "directCatch": false,
               "lateHandling": true,
-              "deferredHost": true,
               "files": {
                 "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
                 "main.ts": "import { requireModule } from \"@scriptc/node\";\nimport { stat } from \"node:fs\";\nconst pending: any[] = [];\nprocess.on(\"unhandledRejection\", (_reason, promise) => {\n  console.log(\"unhandled\");\n  pending.push(promise);\n  if (pending.length === 2) setImmediate(() => {\n    pending[0].catch(() => console.log(\"caught first\"));\n  });\n});\nprocess.on(\"rejectionHandled\", (promise) => {\n  if (promise === pending[0]) {\n    console.log(\"handled first\");\n    pending[1].catch(() => console.log(\"caught second\"));\n    stat(\".\", (error) => console.log(\"io\", error === null));\n    requireModule(\"checkpoint-host\").start();\n    process.nextTick(() => console.log(\"tick\"));\n    queueMicrotask(() => console.log(\"microtask\"));\n  } else {\n    console.log(\"handled second\");\n  }\n});\nPromise.reject(\"first\");\nPromise.reject(\"second\");\n",
                 "node_modules/@scriptc/node/package.json": "{\n  \"name\": \"@scriptc/node\",\n  \"version\": \"0.4.7\",\n  \"description\": \"Call into Node.js from scriptc programs: run an export of a JavaScript module in a Node.js helper process and copy JSON data both ways. Under Node.js the calls run in-process.\",\n  \"license\": \"Apache-2.0\",\n  \"homepage\": \"https://scriptc.dev\",\n  \"repository\": {\n    \"type\": \"git\",\n    \"url\": \"git+https://github.com/vercel-labs/scriptc.git\",\n    \"directory\": \"packages/node\"\n  },\n  \"type\": \"module\",\n  \"main\": \"index.js\",\n  \"types\": \"index.d.ts\",\n  \"exports\": {\n    \".\": {\n      \"types\": \"./index.d.ts\",\n      \"default\": \"./index.js\"\n    }\n  },\n  \"files\": [\n    \"index.js\",\n    \"index.d.ts\",\n    \"README.md\"\n  ],\n  \"engines\": {\n    \"node\": \">=24.13.1\"\n  }\n}\n",
-                "node_modules/@scriptc/node/index.js": "// @scriptc/node \u2014 the Node.js implementation.\n//\n// scriptc builds lower call() and callSync() to calls into Node.js loaded\n// into the program (packages/runtime/src/scr_node_island.c and its\n// bootstrap, scr_node_island_host.cjs). Under Node.js they run directly,\n// with the same copies at the boundary, so a program prints the same\n// either way. Keep the two in step: every message and copy rule here has\n// its twin in the bootstrap.\n\nimport { createRequire } from \"node:module\";\nimport { fileURLToPath } from \"node:url\";\n\n// Error classes that cross as copies, at the host's kind index.\nconst ERROR_CLASSES = [\n  Error,\n  TypeError,\n  RangeError,\n  SyntaxError,\n  undefined,\n  ReferenceError,\n  EvalError,\n  URIError,\n];\nconst ERROR_KINDS = [\n  [TypeError, 1],\n  [RangeError, 2],\n  [SyntaxError, 3],\n  [ReferenceError, 5],\n  [EvalError, 6],\n  [URIError, 7],\n];\n\n/** The file of the code that called `api`. */\nfunction callerFile(api) {\n  const savedPrepare = Error.prepareStackTrace;\n  const savedLimit = Error.stackTraceLimit;\n  let sites;\n  try {\n    Error.stackTraceLimit = 1;\n    Error.prepareStackTrace = (_error, callSites) => callSites;\n    const holder = {};\n    Error.captureStackTrace(holder, api);\n    sites = holder.stack;\n  } finally {\n    Error.prepareStackTrace = savedPrepare;\n    Error.stackTraceLimit = savedLimit;\n  }\n  const name = Array.isArray(sites) && sites.length > 0 ? sites[0].getFileName() : undefined;\n  if (typeof name !== \"string\")\n    throw new Error(\"@scriptc/node: cannot determine the calling module\");\n  return name.startsWith(\"file:\") ? fileURLToPath(name) : name;\n}\n\nconst requires = new Map();\n\nfunction exportedFunction(file, specifier, name) {\n  let load = requires.get(file);\n  if (load === undefined) {\n    load = createRequire(file);\n    requires.set(file, load);\n  }\n  const namespace = load(specifier);\n  const fn = namespace === null || namespace === undefined ? undefined : namespace[name];\n  if (typeof fn !== \"function\")\n    throw new TypeError(`'${name}' exported by '${specifier}' is not a function`);\n  return { fn, namespace };\n}\n\nfunction isThenable(value) {\n  return (\n    value !== null &&\n    (typeof value === \"object\" || typeof value === \"function\") &&\n    typeof value.then === \"function\"\n  );\n}\n\nfunction errorKind(error) {\n  for (const [constructor, kind] of ERROR_KINDS) if (error instanceof constructor) return kind;\n  return 0;\n}\n\n/** The copy of a thrown value that the caller sees. */\nfunction copyThrown(error) {\n  if (error instanceof Error) {\n    const copy = new ERROR_CLASSES[errorKind(error)](String(error.message));\n    if (typeof error.code === \"string\") copy.code = error.code;\n    return copy;\n  }\n  let text;\n  try {\n    text = JSON.stringify(error);\n  } catch {\n    text = undefined;\n  }\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\n/** The JSON copy of a result; throws what JSON.stringify throws. */\nfunction copyResult(value) {\n  const text = JSON.stringify(value);\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\nfunction copyArgs(args) {\n  return JSON.parse(JSON.stringify(args));\n}\n\nexport function callSync(specifier, name, ...args) {\n  const file = callerFile(callSync);\n  const copied = copyArgs(args);\n  let result;\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    result = Reflect.apply(fn, namespace, copied);\n    if (isThenable(result)) {\n      // The promise is dropped: its rejection must not end the process.\n      Promise.resolve(result).catch(() => {});\n      throw new TypeError(\n        `callSync: '${name}' exported by '${specifier}' returned a promise; use call() for asynchronous functions`,\n      );\n    }\n    return copyResult(result);\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\nexport async function call(specifier, name, ...args) {\n  const file = callerFile(call);\n  const copied = copyArgs(args);\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    return copyResult(await Reflect.apply(fn, namespace, copied));\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\n/** requireModule(specifier): the module's exports, by reference. */\nexport function requireModule(specifier) {\n  return createRequire(callerFile(requireModule))(specifier);\n}\n",
+                "node_modules/@scriptc/node/index.js": "// @scriptc/node — the Node.js implementation.\n//\n// scriptc builds lower call() and callSync() to calls into Node.js loaded\n// into the program (packages/runtime/src/scr_node_island.c and its\n// bootstrap, scr_node_island_host.cjs). Under Node.js they run directly,\n// with the same copies at the boundary, so a program prints the same\n// either way. Keep the two in step: every message and copy rule here has\n// its twin in the bootstrap.\n\nimport { createRequire } from \"node:module\";\nimport { fileURLToPath } from \"node:url\";\n\n// Error classes that cross as copies, at the host's kind index.\nconst ERROR_CLASSES = [\n  Error,\n  TypeError,\n  RangeError,\n  SyntaxError,\n  undefined,\n  ReferenceError,\n  EvalError,\n  URIError,\n];\nconst ERROR_KINDS = [\n  [TypeError, 1],\n  [RangeError, 2],\n  [SyntaxError, 3],\n  [ReferenceError, 5],\n  [EvalError, 6],\n  [URIError, 7],\n];\n\n/** The file of the code that called `api`. */\nfunction callerFile(api) {\n  const savedPrepare = Error.prepareStackTrace;\n  const savedLimit = Error.stackTraceLimit;\n  let sites;\n  try {\n    Error.stackTraceLimit = 1;\n    Error.prepareStackTrace = (_error, callSites) => callSites;\n    const holder = {};\n    Error.captureStackTrace(holder, api);\n    sites = holder.stack;\n  } finally {\n    Error.prepareStackTrace = savedPrepare;\n    Error.stackTraceLimit = savedLimit;\n  }\n  const name = Array.isArray(sites) && sites.length > 0 ? sites[0].getFileName() : undefined;\n  if (typeof name !== \"string\")\n    throw new Error(\"@scriptc/node: cannot determine the calling module\");\n  return name.startsWith(\"file:\") ? fileURLToPath(name) : name;\n}\n\nconst requires = new Map();\n\nfunction exportedFunction(file, specifier, name) {\n  let load = requires.get(file);\n  if (load === undefined) {\n    load = createRequire(file);\n    requires.set(file, load);\n  }\n  const namespace = load(specifier);\n  const fn = namespace === null || namespace === undefined ? undefined : namespace[name];\n  if (typeof fn !== \"function\")\n    throw new TypeError(`'${name}' exported by '${specifier}' is not a function`);\n  return { fn, namespace };\n}\n\nfunction isThenable(value) {\n  return (\n    value !== null &&\n    (typeof value === \"object\" || typeof value === \"function\") &&\n    typeof value.then === \"function\"\n  );\n}\n\nfunction errorKind(error) {\n  for (const [constructor, kind] of ERROR_KINDS) if (error instanceof constructor) return kind;\n  return 0;\n}\n\n/** The copy of a thrown value that the caller sees. */\nfunction copyThrown(error) {\n  if (error instanceof Error) {\n    const copy = new ERROR_CLASSES[errorKind(error)](String(error.message));\n    if (typeof error.code === \"string\") copy.code = error.code;\n    return copy;\n  }\n  let text;\n  try {\n    text = JSON.stringify(error);\n  } catch {\n    text = undefined;\n  }\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\n/** The JSON copy of a result; throws what JSON.stringify throws. */\nfunction copyResult(value) {\n  const text = JSON.stringify(value);\n  return text === undefined ? undefined : JSON.parse(text);\n}\n\nfunction copyArgs(args) {\n  return JSON.parse(JSON.stringify(args));\n}\n\nexport function callSync(specifier, name, ...args) {\n  const file = callerFile(callSync);\n  const copied = copyArgs(args);\n  let result;\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    result = Reflect.apply(fn, namespace, copied);\n    if (isThenable(result)) {\n      // The promise is dropped: its rejection must not end the process.\n      Promise.resolve(result).catch(() => {});\n      throw new TypeError(\n        `callSync: '${name}' exported by '${specifier}' returned a promise; use call() for asynchronous functions`,\n      );\n    }\n    return copyResult(result);\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\nexport async function call(specifier, name, ...args) {\n  const file = callerFile(call);\n  const copied = copyArgs(args);\n  try {\n    const { fn, namespace } = exportedFunction(file, specifier, name);\n    return copyResult(await Reflect.apply(fn, namespace, copied));\n  } catch (error) {\n    throw copyThrown(error);\n  }\n}\n\n/** requireModule(specifier): the module's exports, by reference. */\nexport function requireModule(specifier) {\n  return createRequire(callerFile(requireModule))(specifier);\n}\n",
                 "node_modules/@scriptc/node/index.d.ts": "/** Calls the function `name` exported by the module `specifier` and returns\n * its result.\n *\n * In scriptc builds the call runs in Node.js loaded into the program on\n * the first call (the libnode pack recorded at build time, or\n * SCRIPTC_LIBNODE). Under Node.js it runs in the same process too. Either\n * way:\n *\n * - the module loads with require() from the calling module, so a relative\n *   specifier resolves from the caller's directory and a bare one from its\n *   node_modules (ES modules load through require(esm));\n * - in scriptc builds `specifier` is a string literal: the build ships the\n *   module, and what it loads, inside the executable;\n * - the arguments cross as a copy, `JSON.parse(JSON.stringify(args))`, and\n *   the function runs with the module namespace as `this`;\n * - the result crosses as its JSON copy (undefined stays undefined), and\n *   scriptc checks it against `T` like `JSON.parse(text) as T`;\n * - a thrown Error crosses as a new error of its nearest intrinsic class\n *   (Error, TypeError, RangeError, SyntaxError, ReferenceError, EvalError,\n *   URIError) with its message and string `code`; other thrown values cross\n *   as JSON copies.\n *\n * A function that returns a promise cannot be called synchronously: the\n * call throws a TypeError. Use {@link call}. */\nexport declare function callSync<T = unknown>(\n  specifier: string,\n  name: string,\n  ...args: unknown[]\n): T;\n\n/** Like {@link callSync}, asynchronously: the function may return a\n * promise, whose result is copied when it settles. The returned promise\n * rejects instead of throwing, also when the arguments cannot be copied. */\nexport declare function call<T = unknown>(\n  specifier: string,\n  name: string,\n  ...args: unknown[]\n): Promise<T>;\n\n/** Loads the module `specifier` with require() from the calling module and\n * returns its exports **by reference** (scope-B Node islands, NI-4).\n *\n * In scriptc builds the module runs in Node.js loaded into the program on\n * first use; the specifier must be a string literal, resolved at build time\n * as `require.resolve` resolves it from the caller. The exports and every\n * object reached through them stay Node objects: the program holds handles\n * to them, so identity, aliasing and mutation are shared with Node.\n * Primitives, strings and BigInt are copied; promises become promises;\n * Buffers and typed arrays share their memory. Under Node.js this is\n * `createRequire(callerFile)(specifier)`. */\nexport declare function requireModule<T = any>(specifier: string): T;\n",
                 "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
                 "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
@@ -852,13 +948,13 @@ jobs:
               },
               "expected": "unhandled\nunhandled\ncaught first\nhandled first\nisland ready\nhandled second\ntick\ncaught second\nmicrotask\nio true\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "b44ab50c7859d6a4609d273b7ae096c259319c2b",
-              "fixtureSourceSha256": "e70031ee0f859cfda0ad49b423cf143ec9d4e2be18ca9e98248bcfa48358f866",
-              "fixtureDefinitionSha256": "d91ab1fec28b24c86dbde784d6269ebbe2d6477d37f74d70251af031c3c84511",
+              "fixtureSource": "71b5377359700a06d3681c010265eadf20976bef",
+              "fixtureSourceSha256": "ba64389a3650df3a8e29ddb8f4335e65de0cf373d30d6fd5fed12d2186a8a837",
+              "fixtureDefinitionSha256": "db91ffcc306cfff26ced4a99290dd69649d4ccea5687be248b46fab64ce15d98",
               "transform": "exact committed late-case construction; public @scriptc/node files copied unchanged for explicit host transitions"
             }
           ];
-          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"ownership-plain","args":["exec","vitest","run","packages/runtime/src/scr_async.test.ts"],"files":["packages/runtime/src/scr_async.test.ts"],"collect":true,"tests":["promise events retain their roots and fiber stacks preserve suspended frames"],"sanitize":false,"seconds":300},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"ownership-san","args":["exec","vitest","run","packages/runtime/src/scr_async.test.ts"],"files":["packages/runtime/src/scr_async.test.ts"],"collect":true,"tests":["promise events retain their roots and fiber stacks preserve suspended frames"],"sanitize":true,"seconds":300},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
+          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"fallback-units","args":["exec","vitest","run","packages/compiler/test/node-fallback-callbacks.test.ts","packages/compiler/test/process-listener-int32-emission.test.ts"],"files":["packages/compiler/test/node-fallback-callbacks.test.ts","packages/compiler/test/process-listener-int32-emission.test.ts"],"collect":true,"expectedByFile":{"packages/compiler/test/node-fallback-callbacks.test.ts":["fallback global rejection listeners infer promises and unknown reasons","fallback global exception listeners infer errors and origins","fallback global rejection reasons still require narrowing","fallback process rejection listeners infer promises and unknown reasons","fallback process exception listeners infer errors and origins","fallback process rejection reasons still require narrowing","fallback node:process rejection listeners infer promises and unknown reasons","fallback node:process exception listeners infer errors and origins","fallback node:process rejection reasons still require narrowing","fallback fs stat callbacks infer option-selected snapshots","fallback fs stat callbacks reject the wrong numeric representation","fallback node:fs stat callbacks infer option-selected snapshots","fallback node:fs stat callbacks reject the wrong numeric representation","fallback global callback parameters lower through native process listeners","fallback process callback parameters lower through native process listeners","fallback node:process callback parameters lower through native process listeners","fallback fs error-only stat callbacks lower through native filesystem calls","fallback node:fs error-only stat callbacks lower through native filesystem calls"],"packages/compiler/test/process-listener-int32-emission.test.ts":["signals listeners keep int32 fields of classes that reach dynamic code","unhandledRejection listeners keep int32 fields of classes that reach dynamic code","rejectionHandled listeners keep int32 fields of classes that reach dynamic code","warning listeners keep int32 fields of classes that reach dynamic code"]},"seconds":600},{"id":"ownership-plain","args":["exec","vitest","run","packages/runtime/src/scr_async.test.ts"],"files":["packages/runtime/src/scr_async.test.ts"],"collect":true,"tests":["promise events retain their roots and fiber stacks preserve suspended frames"],"sanitize":false,"seconds":300},{"id":"differential-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":false,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-plain","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":false,"llvmModes":["release","dev"],"seconds":1200},{"id":"ownership-san","args":["exec","vitest","run","packages/runtime/src/scr_async.test.ts"],"files":["packages/runtime/src/scr_async.test.ts"],"collect":true,"tests":["promise events retain their roots and fiber stacks preserve suspended frames"],"sanitize":true,"seconds":300},{"id":"differential-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":true,"llvmModes":null,"seconds":1200},{"id":"llvm-differential-san","args":["exec","vitest","run","tests/harness/llvm-differential.test.ts","-t","(?:2558\\-rejection\\-events\\.cjs|2212\\-unhandled\\-rejection\\-listener\\.cjs|5996\\-rejections\\-between\\-macrotasks\\.cjs|process\\-uncaught\\-rejection\\.cjs|2654\\-top\\-level\\-await\\-unrelated\\-rejection\\.ts|2665\\-top\\-level\\-await\\-unhandled\\-listener\\-liveness\\.ts|5808\\-worker\\-unhandled\\-rejections\\.ts)$"],"files":["tests/harness/llvm-differential.test.ts"],"tests":["2558-rejection-events.cjs","2212-unhandled-rejection-listener.cjs","5996-rejections-between-macrotasks.cjs","process-uncaught-rejection.cjs","2654-top-level-await-unrelated-rejection.ts","2665-top-level-await-unhandled-listener-liveness.ts","5808-worker-unhandled-rejections.ts"],"sanitize":true,"llvmModes":["release","dev"],"seconds":1200}];
           const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
           for (const spec of specs) {
             const dir = join(fixtures, spec.id); mkdirSync(dir);
@@ -874,11 +970,11 @@ jobs:
           let verifyNativeInputs = null;
           save();
           try {
-            assert.equal(report.fixtureDigest, "8ade25f492a4ce8a6305f06110e3ca707c609bdeb7ebf1e5cd45ccfe557d5113", "authored fixture bytes changed");
+            assert.equal(report.fixtureDigest, "2c671286fc9dc4aaa7da863507c5209f37707e71c8c927bdd6779211c97631c0", "authored fixture bytes changed");
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
             report.runner = { sha256: hash(new URL(import.meta.url)), bytes: lstatSync(new URL(import.meta.url)).size };
             report.nativeInputs = nativeInputs(); report.nativeInputSha256 = digest(report.nativeInputs.join("\n"));
-            assert.equal(report.nativeInputs.length, 1049); assert.equal(report.nativeInputSha256, "a1798a7c6a76f97c24312a702eae7c9af9f56abb6eaa446aa69352443cc637ad");
+            assert.equal(report.nativeInputs.length, 1049); assert.equal(report.nativeInputSha256, "b5f5dc257384d36d09ece8995a6a803e51f0d752e0c86fe216c3a8e10d29501f");
             report.priorNativeAssetReuse = false; report.nativeBuildRoute = "source-keyed native-packages action; changed runtime C is rebuilt or restored only under its exact new input key";
             for (const spec of specs) {
               assert.equal(spec.fixtureSource, head);
@@ -1036,7 +1132,7 @@ jobs:
               symlinkSync(harnessOutput, harnessLink, "dir");
               const gateArtifacts = join(out, "gates"); mkdirSync(gateArtifacts);
               for (const spec of gateSpecs) {
-                const gate = { id: spec.id, status: "running", expectedTests: spec.tests ?? [], llvmModes: spec.llvmModes ?? null };
+                const gate = { id: spec.id, status: "running", expectedTests: spec.tests ?? Object.values(spec.expectedByFile ?? {}).flat(), llvmModes: spec.llvmModes ?? null };
                 report.gates.push(gate);
                 const scratch = join(work, "gate-" + spec.id); mkdirSync(scratch, { mode: 0o700 });
                 const cache = join(scratch, "cache"), temp = join(scratch, "tmp"); mkdirSync(cache, { mode: 0o700 }); mkdirSync(temp);
