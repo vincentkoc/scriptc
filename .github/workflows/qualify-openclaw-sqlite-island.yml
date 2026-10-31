@@ -52,7 +52,7 @@ jobs:
           import assert from "node:assert/strict";
           import { spawnSync } from "node:child_process";
           import { createHash } from "node:crypto";
-          import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+          import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
           import { pathToFileURL } from "node:url";
 
@@ -66,7 +66,9 @@ jobs:
             source: head, openclawSource: openclawHead,
             workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
             attempt: process.env.GITHUB_RUN_ATTEMPT, status: "running",
-            scope: "compiled SQLite admission using embedded Node",
+            scope: "native entry calling SQLite admission in embedded Node",
+            entryExecution: "native", probeExecution: "embedded-node", nativeProbeCompilation: false,
+            libnodePlacement: "beside", modulePlacement: "beside",
             pureNativeSqlite: false, completeGateway: false, completeSuite: false,
             startedAt: new Date().toISOString(), steps: [], results: {}, artifacts: {},
           };
@@ -167,11 +169,11 @@ jobs:
             const entry = join(fixture, "main.mts");
             writeFileSync(entry, [
               'import { requireModule } from "@scriptc/node";',
-              'import { probeSqlite, isSqliteWalResetSafeVersion } from "./node-sqlite-capabilities.mjs";',
+              'const admission = requireModule("./node-sqlite-capabilities.mjs");',
               'const DatabaseSync = requireModule("node:sqlite").DatabaseSync;',
               'const node = requireModule("node:process").versions.node;',
-              'const sqlite = probeSqlite(DatabaseSync);',
-              'const walSafe = isSqliteWalResetSafeVersion(sqlite.version ?? "");',
+              'const sqlite = admission.probeSqlite(DatabaseSync);',
+              'const walSafe = admission.isSqliteWalResetSafeVersion(sqlite.version ?? "");',
               'console.log(JSON.stringify({ node, sqlite, walSafe }));',
               '',
             ].join("\n"));
@@ -190,7 +192,30 @@ jobs:
               const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
               assert.deepEqual(beside.manifest, pack.manifest);
               report.artifacts[flavor] = { binarySha256: hash(binary), libnodeManifestSha256: hash(join(beside.root, "manifest.json")) };
-              const actual = JSON.parse(execute("native-" + flavor, binary, [], 60, { ...env, SCRIPTC_LIBNODE: "" }));
+              const modules = join(beside.root, "modules");
+              const shipped = readdirSync(modules, { recursive: true, encoding: "utf8" })
+                .filter(file => file.endsWith("node-sqlite-capabilities.mjs"));
+              assert.equal(shipped.length, 1);
+              const shippedHash = hash(join(modules, shipped[0]));
+              assert.equal(shippedHash, openclawInputs["node-sqlite-capabilities.mjs"]);
+              report.artifacts[flavor].moduleSha256 = shippedHash;
+              // The beside module tree must work without either build-time source file.
+              const moved = [];
+              let actual;
+              try {
+                for (const file of Object.keys(openclawInputs)) {
+                  const original = join(fixture, file), held = original + ".proof-source";
+                  assert.equal(existsSync(held), false);
+                  renameSync(original, held);
+                  moved.push([original, held]);
+                  assert.equal(existsSync(original), false);
+                }
+                actual = JSON.parse(execute("native-" + flavor, binary, [], 60, { ...env, SCRIPTC_LIBNODE: "" }));
+                report.artifacts[flavor].sourceAbsentDuringExecution = true;
+              } finally {
+                for (const [original, held] of moved.reverse()) renameSync(held, original);
+              }
+              for (const [file, expected] of Object.entries(openclawInputs)) assert.equal(hash(join(fixture, file)), expected, file);
               report.results[flavor] = actual;
               validate(actual);
               assert.deepEqual(actual, oracle, flavor + " differs from the Node oracle");
@@ -229,7 +254,9 @@ jobs:
               workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
               attempt: process.env.GITHUB_RUN_ATTEMPT, status: "failed",
               error: "setup failed before the proof runner produced a receipt",
-              scope: "compiled SQLite admission using embedded Node",
+              scope: "native entry calling SQLite admission in embedded Node",
+              entryExecution: "native", probeExecution: "embedded-node", nativeProbeCompilation: false,
+              libnodePlacement: "beside", modulePlacement: "beside",
               pureNativeSqlite: false, completeGateway: false, completeSuite: false,
               sourceVerifiedAfter: head.status === 0 && status.status === 0 && head.stdout.trim() === "16e10a269eabd82fe42f22d314e87a33ffc16969" && status.stdout.trim() === "",
               finishedAt: new Date().toISOString(),
