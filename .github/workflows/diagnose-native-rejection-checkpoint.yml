@@ -1,4 +1,4 @@
-name: Diagnose native rejection checkpoint
+name: Diagnose late rejection handling
 
 on:
   push:
@@ -18,13 +18,13 @@ jobs:
     timeout-minutes: 60
     env:
       NODE_OPTIONS: --max-old-space-size=4096
-      DIAGNOSTIC_SOURCE: 022f251fc38b4c169333f133398ee5150172f2bc
-      DIAGNOSTIC_LABEL: integrated
+      DIAGNOSTIC_SOURCE: 2f5c38e3715956a944b662eef7d339c7f9d7bc38
+      DIAGNOSTIC_LABEL: late-handling
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 022f251fc38b4c169333f133398ee5150172f2bc
+          ref: 2f5c38e3715956a944b662eef7d339c7f9d7bc38
           persist-credentials: false
       - name: Verify source before setup
         run: |
@@ -45,7 +45,7 @@ jobs:
           target: linux-x64-gnu
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Observe native rejection checkpoints
+      - name: Observe late rejection handling
         run: |
           cat > "$RUNNER_TEMP/native-rejection-checkpoint-diagnostic.mjs" <<'PROOF'
           import assert from "node:assert/strict";
@@ -66,9 +66,9 @@ jobs:
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             status: "running", diagnosticComplete: false, qualificationComplete: false,
-            templateCommit: "5b3681054778fc53ded8f1a9838bcfcc86761037",
-            completeSuite: false, scope: "native-rejection-checkpoint", priorProofReused: false,
-            expectedExecutionAttempts: 8, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
+            templateCommit: "e445923fcf576827ee92000465e9499c9b6834bf",
+            completeSuite: false, scope: "native-late-rejection-handling", priorProofReused: false,
+            expectedExecutionAttempts: 4, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
           const hash = path => digest(readFileSync(path));
@@ -199,14 +199,40 @@ jobs:
               assert.equal(call.args[0].kind, "closure", "scheduler callback must be a native closure");
               return own(functions.get(call.args[0].fnName));
             };
-            const queue = only(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.queueMicrotask"), "one native microtask");
-            const micro = callback(queue), chain = [micro];
-            const ticks = collect(micro.body, node => node.kind === "libCall" && node.fn === "process.nextTick");
-            assert.equal(ticks.length, spec.directCatch ? 0 : 1);
-            const catchOwner = spec.directCatch ? micro : callback(ticks[0]);
-            if (!spec.directCatch) chain.push(catchOwner);
-            const catchCall = only(collect(catchOwner.body, node => node.kind === "callValue" && node.callee?.kind === "closure"),
-              "queued callback must invoke the native catch closure");
+            const subscription = name => {
+              const call = only(nodes.filter(node => node.kind === "libCall" && node.fn === name), name);
+              assert.equal(call.args.length, 2);
+              assert.equal(call.args[0].kind, "dynFrom"); assert.equal(call.args[0].type.kind, "dyn");
+              assert.equal(call.args[0].value.kind, "closure", "listener must box a native closure");
+              assert.deepEqual(call.args[1].type, { kind: "bool" });
+              assert.equal(call.args[1].kind, "boolLit"); assert.equal(call.args[1].value, false);
+              const fn = own(functions.get(call.args[0].value.fnName));
+              assert.equal(fn.params.length, 0);
+              return { call, fn };
+            };
+            const unhandled = subscription("process.onUnhandledRejection");
+            const handled = subscription("process.onRejectionHandled");
+            const immediateCall = only(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.setImmediate"), "one native immediate");
+            assert.ok(collect(unhandled.fn.body, node => node === immediateCall).length === 1,
+              "unhandled listener must schedule the native immediate");
+            const immediate = callback(immediateCall);
+            const tickCall = only(nodes.filter(node => node.kind === "libCall" && node.fn === "process.nextTick"), "one native nextTick");
+            assert.ok(collect(immediate.body, node => node === tickCall).length === 1,
+              "immediate callback must schedule the native nextTick");
+            const tick = callback(tickCall);
+            assert.equal(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.queueMicrotask").length, 0);
+            const logs = fn => collect(fn.body, node => node.kind === "intrinsic" && node.name === "console.log")
+              .map(node => only(collect(node.args, arg => arg.kind === "strLit"), "one authored log string").value);
+            assert.deepEqual(logs(unhandled.fn), ["unhandled"]); assert.deepEqual(logs(handled.fn), ["handled"]);
+            assert.deepEqual(logs(immediate), ["attach", "after"]); assert.deepEqual(logs(tick), ["tick"]);
+            const chain = [unhandled.fn, handled.fn, immediate, tick];
+            const catchCall = only(collect(immediate.body, node => node.kind === "callValue" && node.callee?.kind === "closure"),
+              "immediate callback must invoke the native catch closure");
+            const ordered = collect(immediate.body, node => node === catchCall || node === tickCall ||
+              (node.kind === "intrinsic" && node.name === "console.log"));
+            assert.deepEqual(ordered.map(node => node === catchCall ? "catch" : node === tickCall ? "nextTick" :
+              only(collect(node.args, arg => arg.kind === "strLit"), "one authored log string").value),
+              ["attach", "catch", "after", "nextTick"]);
             const caught = own(functions.get(catchCall.callee.fnName)); chain.push(caught);
             assert.equal(caught.async, true); assert.equal(caught.params.length, 1);
             const parameter = caught.params[0];
@@ -220,13 +246,8 @@ jobs:
             const log = only(collect(handler.catchBody, node => node.kind === "intrinsic" && node.name === "console.log"),
               "caught log must stay inside catch body");
             assert.ok(collect(log.args, node => node.kind === "strLit" && node.value === "caught").length === 1);
-            const queueOwners = program.functions.filter(fn => collect(fn.body, node => node === queue).length);
-            const queueOwner = own(only(queueOwners, "native microtask owner"));
-            if (spec.macrotask) {
-              const outer = only(nodes.filter(node => node.kind === "libCall" && node.fn === "timers.setImmediate" &&
-                node.args[0]?.kind === "closure" && node.args[0].fnName === queueOwner.name), "outer native macrotask");
-              assert.equal(callback(outer), queueOwner); chain.unshift(queueOwner);
-            }
+            const registrationOwners = [unhandled.call, handled.call].map(call =>
+              own(only(program.functions.filter(fn => collect(fn.body, node => node === call).length), "native listener registration owner")));
             const reachable = new Set(), roots = [programEntry];
             while (roots.length) {
               const fn = roots.pop(); if (reachable.has(fn.name)) continue; reachable.add(fn.name);
@@ -235,7 +256,7 @@ jobs:
                 if (functions.has(name)) roots.push(functions.get(name));
               }
             }
-            for (const fn of [queueOwner, ...chain]) assert.ok(reachable.has(fn.name), "detached callback chain");
+            for (const fn of [...registrationOwners, ...chain]) assert.ok(reachable.has(fn.name), "detached callback chain");
             // Follow native helper and closure edges too: a nested delegate cannot hide a Node callback.
             const visited = new Set(), pending = [...chain];
             while (pending.length) {
@@ -247,8 +268,9 @@ jobs:
               }
             }
             return { status: "passed", startupRefusalAbsent: true, reachableFunctions: [...reachable].sort(), irVersion: program.irVersion, commonJsEntry: program.commonJsEntry ?? false,
-              rejectionType: rejected[0].type, queueOwner: queueOwner.name, microtask: micro.name,
-              nextTick: spec.directCatch ? null : catchOwner.name, catchClosure: caught.name,
+              rejectionType: rejected[0].type, registrationOwners: registrationOwners.map(fn => fn.name),
+              unhandledListener: unhandled.fn.name, handledListener: handled.fn.name, immediate: immediate.name,
+              nextTick: tick.name, catchClosure: caught.name, listenerBoxing: "dynFrom native closure",
               awaitParameter: { localId: parameter.localId, type: parameter.type }, callbackFunctions: [...visited].sort(),
               islandCalls: islands.map(node => node.fn), shippedFiles: program.nodeIsland?.modules?.files ?? [],
               functions: program.functions.map(fn => ({ name: fn.name, sourceName: fn.sourceName ?? null,
@@ -265,6 +287,7 @@ jobs:
             "packages/compiler/src/frontend/lowering/lower-exprs.ts",
             "packages/compiler/src/frontend/lowering/lower-timers.ts",
             "packages/compiler/src/frontend/lowering/builtins/process.ts",
+            "packages/compiler/src/frontend/lowering/builtins/async-context.ts",
             "packages/compiler/src/frontend/lowering/lower-node-island.ts",
             "packages/compiler/src/frontend/lowering/lower-modules.ts",
             "packages/compiler/src/ir/ir.ts",
@@ -291,6 +314,7 @@ jobs:
             "native/llvm-codegen/src/main.cpp",
             "packages/compiler/src/backend/native-codegen-core.ts",
             "tests/harness/node-island-order.test.ts",
+            "tests/harness/node-island-rejection-checkpoint.test.ts",
             "pnpm-lock.yaml"
           ];
           const source = () => {
@@ -309,77 +333,41 @@ jobs:
           // The fixture manifest below binds each expanded file and expected output separately.
           const specs = [
             {
-              "id": "native-next-tick",
+              "id": "native-late-handling",
               "hosted": false,
               "macrotask": false,
               "directCatch": false,
+              "lateHandling": true,
               "files": {
                 "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false}}}",
-                "main.ts": "const pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  process.nextTick(() => {\n    console.log(\"tick\");\n    pending.catch(() => console.log(\"caught\"));\n  });\n});\nsetImmediate(() => console.log(\"done\"));\n"
+                "main.ts": "const pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nprocess.on(\"unhandledRejection\", () => {\n  console.log(\"unhandled\");\n  setImmediate(() => {\n    console.log(\"attach\");\n    pending.catch(() => console.log(\"caught\"));\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nprocess.on(\"rejectionHandled\", () => console.log(\"handled\"));\n"
               },
-              "expected": "microtask\ntick\ncaught\ndone\n",
+              "expected": "unhandled\nattach\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "authored-uncommitted",
-              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
-              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
-              "transform": "exact authored case construction; no fixture source rewrite"
+              "fixtureSource": "2f5c38e3715956a944b662eef7d339c7f9d7bc38",
+              "fixtureSourceSha256": "0775b20f39cc0751a94073824c8c7e115fddc8c67aa53a92f91ccda2fbf6235c",
+              "fixtureDefinitionSha256": "97f8463112186429c6d82db5612943297b3df0168dbde0601373624ff5f47710",
+              "transform": "exact committed late-handling case construction; no fixture source rewrite"
             },
             {
-              "id": "hosted-next-tick",
+              "id": "hosted-late-handling",
               "hosted": true,
               "macrotask": false,
               "directCatch": false,
+              "lateHandling": true,
               "files": {
                 "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
-                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  process.nextTick(() => {\n    console.log(\"tick\");\n    pending.catch(() => console.log(\"caught\"));\n  });\n});\nsetImmediate(() => console.log(\"done\"));\n",
+                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nprocess.on(\"unhandledRejection\", () => {\n  console.log(\"unhandled\");\n  setImmediate(() => {\n    console.log(\"attach\");\n    pending.catch(() => console.log(\"caught\"));\n    console.log(\"after\");\n    process.nextTick(() => console.log(\"tick\"));\n  });\n});\nprocess.on(\"rejectionHandled\", () => console.log(\"handled\"));\n",
                 "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
                 "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
                 "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
               },
-              "expected": "island ready\nmicrotask\ntick\ncaught\ndone\n",
+              "expected": "island ready\nunhandled\nattach\nafter\ntick\ncaught\nhandled\n",
               "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "authored-uncommitted",
-              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
-              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
-              "transform": "exact authored case construction; no fixture source rewrite"
-            },
-            {
-              "id": "hosted-macrotask-next-tick",
-              "hosted": true,
-              "macrotask": true,
-              "directCatch": false,
-              "files": {
-                "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
-                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nsetImmediate(() => {\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  process.nextTick(() => {\n    console.log(\"tick\");\n    pending.catch(() => console.log(\"caught\"));\n  });\n});\nsetImmediate(() => console.log(\"done\"));\n});\n",
-                "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
-                "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
-                "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
-              },
-              "expected": "island ready\nmicrotask\ntick\ncaught\ndone\n",
-              "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "authored-uncommitted",
-              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
-              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
-              "transform": "exact authored case construction; no fixture source rewrite"
-            },
-            {
-              "id": "hosted-direct-catch",
-              "hosted": true,
-              "macrotask": false,
-              "directCatch": true,
-              "files": {
-                "package.json": "{\"private\":true,\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false},\"packages\":{\"checkpoint-host\":\"node\"}}}",
-                "main.ts": "import { start } from \"checkpoint-host\";\nstart();\nconst pending: Promise<void> = Promise.reject(new RangeError(\"sentinel\"));\nqueueMicrotask(() => {\n  console.log(\"microtask\");\n  pending.catch(() => console.log(\"caught\"));\n});\nsetImmediate(() => console.log(\"done\"));\n",
-                "node_modules/checkpoint-host/package.json": "{\"name\":\"checkpoint-host\",\"version\":\"1.0.0\",\"main\":\"index.js\",\"types\":\"index.d.ts\"}",
-                "node_modules/checkpoint-host/index.js": "exports.start = function start() { console.log(\"island ready\"); };\n",
-                "node_modules/checkpoint-host/index.d.ts": "export declare function start(): void;\n"
-              },
-              "expected": "island ready\nmicrotask\ncaught\ndone\n",
-              "origin": "tests/harness/node-island-rejection-checkpoint.test.ts",
-              "fixtureSource": "authored-uncommitted",
-              "fixtureSourceSha256": "eac5533493ae71223daa32adfd59bd2320f90189eaaf7e33c8b56079876004fc",
-              "fixtureDefinitionSha256": "17e2fd4f7092bcfe1499a054054222611d030ce91aded876eab3b730d034a6ac",
-              "transform": "exact authored case construction; no fixture source rewrite"
+              "fixtureSource": "2f5c38e3715956a944b662eef7d339c7f9d7bc38",
+              "fixtureSourceSha256": "0775b20f39cc0751a94073824c8c7e115fddc8c67aa53a92f91ccda2fbf6235c",
+              "fixtureDefinitionSha256": "97f8463112186429c6d82db5612943297b3df0168dbde0601373624ff5f47710",
+              "transform": "exact committed late-handling case construction; no fixture source rewrite"
             }
           ];
           const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
@@ -397,8 +385,12 @@ jobs:
           let verifyNativeInputs = null;
           save();
           try {
-            assert.equal(report.fixtureDigest, "56ef3aa79d352b345c681499710c79e145ad93a31daa3ae7b03fcd2686229a65", "authored fixture bytes changed");
+            assert.equal(report.fixtureDigest, "b61e4f121f2b016deb1cf63009026cd2e2089fd90e133eb140f5c4bd6a312d0b", "authored fixture bytes changed");
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
+            for (const spec of specs) {
+              assert.equal(spec.fixtureSource, head);
+              assert.equal(report.sourceInputs[spec.origin], spec.fixtureSourceSha256);
+            }
             assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
             report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
             assert.deepEqual(report.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
@@ -449,7 +441,7 @@ jobs:
               report.nativeInputsVerifiedAfter = true;
             };
             for (const spec of specs) {
-              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, hosted: spec.hosted, macrotask: spec.macrotask, directCatch: spec.directCatch, fixtureSourceSha256: spec.fixtureSourceSha256, expectedStdoutSha256: digest(spec.expected), flavors: {} };
+              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, hosted: spec.hosted, lateHandling: spec.lateHandling, fixtureSourceSha256: spec.fixtureSourceSha256, expectedStdoutSha256: digest(spec.expected), flavors: {} };
               report.cases.push(observed);
               const dir = join(fixtures, spec.id), entry = join(dir, "main.ts");
               const artifacts = join(out, spec.id); mkdirSync(artifacts);
@@ -582,7 +574,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-rejection-checkpoint-integrated
+          name: native-rejection-checkpoint-late-handling
           path: ${{ runner.temp }}/native-rejection-checkpoint-proof
           if-no-files-found: error
           retention-days: 1
