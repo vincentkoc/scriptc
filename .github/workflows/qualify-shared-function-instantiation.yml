@@ -1,0 +1,900 @@
+name: Qualify shared function instantiation
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-shared-function-instantiation.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-shared-function-instantiation
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            source: 71a9441c824262150f35acd2b8359f156ed3289c
+          - label: candidate
+            source: ffed371753d0124f8482b69540f58a37d43bb903
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      DIAGNOSTIC_SOURCE: ${{ matrix.source }}
+      DIAGNOSTIC_LABEL: ${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = "$DIAGNOSTIC_SOURCE"
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Compare function instantiation and run candidate gates
+        run: |
+          cat > "$RUNNER_TEMP/shared-module-diagnostic.mjs" <<'PROOF'
+          import assert from "node:assert/strict";
+          import { spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+          import { dirname, join, relative } from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const root = process.cwd(), head = process.env.DIAGNOSTIC_SOURCE;
+          delete process.env.FORCE_COLOR; delete process.env.NO_COLOR;
+          const out = join(process.env.RUNNER_TEMP, "shared-module-proof");
+          const work = join(process.env.RUNNER_TEMP, "shared-module-work");
+          mkdirSync(out); mkdirSync(work);
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          writeFileSync(join(work, ".diagnostic-owner.json"), JSON.stringify(owner), { flag: "wx" });
+          // Earlier initialization and cycle cases are settled; these links are not reused proof.
+          const settledEvidence = {
+            repeated: false, usedForQualification: false,
+            runs: ["https://github.com/vincentkoc/scriptc/actions/runs/41205114836"],
+            cases: ["shared-declaration-publication"],
+          };
+          const report = {
+            label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
+            runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", diagnosticComplete: false, qualificationComplete: false, baselineComplete: false, regressionObserved: false,
+            templateCommit: "d8c8545d73adfe364db6666d1b90ed4b587aa1a1",
+            completeSuite: false, scope: "shared-function-instantiation", settledEvidence,
+            expectedExecutionAttempts: 2, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [], gates: [],
+          };
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const scrub = value => String(value).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
+          const save = () => writeFileSync(join(out, "summary.json"), scrub(JSON.stringify(report, null, 2)) + "\n");
+          let sequence = 0;
+          const execute = (name, command, args, seconds = 60, env = {}) => {
+            const stem = String(++sequence).padStart(2, "0") + "-" + name;
+            const stdout = join(out, stem + ".stdout.log"), stderr = join(out, stem + ".stderr.log");
+            const fds = [openSync(stdout, "wx"), openSync(stderr, "wx")], started = Date.now();
+            let result;
+            try {
+              // GNU timeout owns the command group, including compiler descendants.
+              result = spawnSync("timeout", ["--signal=TERM", "--kill-after=5s", seconds + "s", command, ...args], {
+                cwd: root, env: { ...process.env, ...env }, stdio: ["ignore", ...fds],
+              });
+            } finally { fds.forEach(closeSync); }
+            const observed = {
+              name, command, args, seconds: (Date.now() - started) / 1000, limitSeconds: seconds,
+              code: result.status, signal: result.signal, error: result.error?.message,
+              stdout: relative(out, stdout), stderr: relative(out, stderr),
+              stdoutSha256: hash(stdout), stderrSha256: hash(stderr),
+              stdoutBytes: lstatSync(stdout).size, stderrBytes: lstatSync(stderr).size,
+            };
+            observed.status = observed.error ? "tool-error" : observed.signal ? "signal" :
+              observed.code === 124 ? "timeout" : observed.code === 137 ? "killed" :
+              observed.code === 0 ? "completed" : "nonzero-exit";
+            report.steps.push(observed); save(); return observed;
+          };
+          const text = step => {
+            assert.ok(step.stdoutBytes <= 16 * 1024 ** 2, "bounded text reader exceeded; raw log retained");
+            return readFileSync(join(out, step.stdout), "utf8");
+          };
+          const requireSuccess = step => { assert.equal(step.status, "completed", step.name); return step; };
+          const capture = (name, command, args) => text(requireSuccess(execute(name, command, args))).trim();
+          const validateCompile = (step, entry, artifact, markedIslands) => {
+            try {
+              requireSuccess(step);
+              const diagnostics = JSON.parse(text(step));
+              assert.equal(diagnostics.schema, "scriptc-diagnostics"); assert.equal(diagnostics.schemaVersion, 1);
+              assert.equal(diagnostics.command, "build"); assert.equal(diagnostics.entry, entry);
+              assert.equal(diagnostics.artifact, artifact); assert.equal(diagnostics.phase, "complete");
+              assert.equal(diagnostics.success, true); assert.ok(Array.isArray(diagnostics.diagnostics));
+              assert.equal(diagnostics.diagnostics.filter(item => item.severity === "error").length, 0);
+              const islands = diagnostics.diagnostics.filter(item => item.code === "SC8001");
+              assert.deepEqual(islands.map(item => item.file).sort(), [...markedIslands].sort());
+              step.diagnosticsStatus = "passed"; return true;
+            } catch (error) {
+              step.diagnosticsStatus = "failed"; step.diagnosticsError = scrub(error.stack ?? error); return false;
+            } finally { save(); }
+          };
+          // Exact harness exception: keep every other sanitizer message and all raw bytes.
+          const ASAN_SWAP = /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext.*\n/gm;
+          const parityOutcome = (step, sanitize = false) => {
+            assert.ok(step.stderrBytes <= 16 * 1024 ** 2, "bounded normalization reader exceeded; raw log retained");
+            const raw = readFileSync(join(out, step.stderr), "utf8");
+            let removedLines = 0;
+            const normalized = sanitize ? raw.replace(ASAN_SWAP, () => { removedLines += 1; return ""; }) : raw;
+            const stderr = step.stderr + ".normalized.log"; writeFileSync(join(out, stderr), normalized);
+            return {
+              status: step.status, code: step.code, signal: step.signal, error: step.error,
+              stdout: step.stdout, stdoutSha256: step.stdoutSha256, stderr, stderrSha256: digest(normalized),
+              normalization: { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
+                ruleSource: "tests/harness/node-island-order.test.ts:63", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags },
+            };
+          };
+          const crashKind = (execution, flavor, stderr) => {
+            if (execution?.attempted !== true || execution.error ||
+                ["timeout", "killed", "tool-error", "not-executed", "blocked-before-execution"].includes(execution.status)) return null;
+            if ((execution.status === "signal" && execution.signal === "SIGSEGV" && execution.code === null) ||
+                (execution.status === "nonzero-exit" && execution.code === 139 && execution.signal === null)) return "SIGSEGV";
+            if (flavor === "san" && execution.status === "nonzero-exit" && execution.code === 1 && execution.signal === null &&
+                /^==\d+==ERROR: AddressSanitizer: SEGV\b/m.test(stderr) &&
+                /^SUMMARY: AddressSanitizer: SEGV\b/m.test(stderr)) return "ASan-SEGV";
+            return null;
+          };
+          const crashRegression = (item, readStderr) => item.oracle?.expectedMatched === true && ["plain", "san"].every(flavor => {
+            const native = item.flavors[flavor], execution = native.execution;
+            return native.parity === "mismatch" && execution.attempted === true &&
+              execution.stderrBytes <= 16 * 1024 ** 2 && crashKind(execution, flavor, readStderr(execution)) !== null;
+          });
+          const loweringFiles = ["results.json", "main.mjs/audit.json", "main.mjs/base.ir.json", "main.mjs/base.state.json",
+            ...[1, 2, 3].flatMap(seed => ["main.mjs/seed" + seed + ".ir.json", "main.mjs/seed" + seed + ".state.json"])];
+          const verifyLowering = (files, read) => {
+            assert.deepEqual(files.map(file => file.name).sort(), [...loweringFiles].sort(), "lowering-order evidence incomplete");
+            const data = JSON.parse(read("results.json"));
+            assert.equal(data.length, 1); assert.equal(data[0].program, "main.mjs");
+            assert.equal(data[0].status, "order-independent"); assert.deepEqual(data[0].diffs, {});
+            for (const name of loweringFiles.filter(name => name.endsWith(".ir.json"))) {
+              const ir = JSON.parse(read(name)); assert.ok(Array.isArray(ir.functions) && ir.functions.length > 0);
+              assert.equal(typeof ir.entry, "string");
+            }
+            for (const name of loweringFiles.filter(name => name.endsWith(".state.json"))) {
+              const state = JSON.parse(read(name));
+              assert.ok(state && !Array.isArray(state) && typeof state === "object" && Object.keys(state).length > 0);
+            }
+            const audit = JSON.parse(read("main.mjs/audit.json")); assert.ok(audit && typeof audit === "object" && !Array.isArray(audit));
+            return data[0];
+          };
+          const sourceFiles = [
+            "packages/compiler/src/frontend/lowering/rebindable-functions.ts",
+            "packages/compiler/src/frontend/lowering/class-dynamic-dispatch.ts",
+            "packages/compiler/src/frontend/lowering/unit-journal.ts",
+            "scripts/lowering-order.mjs",
+            "packages/compiler/src/frontend/lowering/deferred-module-initializers.test.ts",
+            "tests/harness/node-island-shared-sources.test.ts",
+            "packages/compiler/src/frontend/lowering/lower-modules.test.ts",
+            "packages/compiler/src/frontend/lowering/class-dynamic-dispatch.test.ts",
+            "packages/compiler/src/frontend/lowering/unit-journal.test.ts",
+            "packages/node/package.json",
+            "packages/node/index.js",
+            "packages/node/index.d.ts",
+            "packages/compiler/src/frontend/lowering/lower-shared-modules.ts",
+            "packages/compiler/src/frontend/lowering/lower-stmts.ts", "tests/harness/node-island.test.ts", "CHANGELOG.md",
+            "packages/compiler/src/frontend/pipeline.ts", "packages/compiler/src/frontend/lowering/lower-modules.ts",
+            "packages/compiler/src/frontend/lowering/lowerer.ts", "packages/compiler/src/backend/runtime-abi.ts",
+            "packages/compiler/src/frontend/program-node.ts", "packages/compiler/src/cli/command.ts",
+            "packages/compiler/src/node-islands/modules.ts", "packages/compiler/src/node-islands/libnode-pack.ts",
+            "packages/runtime/src/scr_node_island_hooks.cjs", "packages/libnode-common/dev-pack.json", "pnpm-lock.yaml",
+            "packages/runtime/src/scr_node_island_export.c", "packages/runtime/src/scr_regex.c", "packages/runtime/src/scr_regex.h",
+            "native/llvm-codegen/src/target.h", "native/llvm-codegen/src/main.cpp", "packages/compiler/src/backend/native-codegen-core.ts",
+            "packages/libnode-common/fetch-dev-pack.mjs", "packages/libnode-common/build-pack.mjs",
+            "packages/libnode-common/bridge/scr_node_bridge.cc", "packages/runtime/src/scr_node_bridge.h",
+          ];
+          const source = () => {
+            assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("source-status", "git", ["status", "--porcelain"]), "");
+            requireSuccess(execute("source-diff", "git", ["diff", "--exit-code", "HEAD"]));
+            return Object.fromEntries(sourceFiles.map(file => [file, hash(file)]));
+          };
+          const moduleFiles = base => readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(entry => {
+            const path = join(base, entry.name), info = lstatSync(path);
+            assert.ok(!info.isSymbolicLink());
+            if (info.isDirectory()) return moduleFiles(path).map(file => ({ ...file, path: entry.name + "/" + file.path }));
+            assert.ok(info.isFile()); return [{ path: entry.name, bytes: info.size, sha256: hash(path) }];
+          });
+          const specs = [
+            {
+              "id": "shared-function-instantiation",
+              "origin": "tests/harness/node-island.test.ts",
+              "fixtureSource": "ffed371753d0124f8482b69540f58a37d43bb903",
+              "transform": "instantiate test.each row order=island-first root=main; no source rewrite",
+              "islands": [
+                "island.mjs"
+              ],
+              "files": {
+                "package.json": "{\"type\":\"module\",\"scriptc\":{\"nodeIslands\":{\"auto\":false,\"modules\":[\"island.mjs\"]}}}",
+                "main.mjs": "import { checkSaved } from \"./island.mjs\";\nimport { choose, choosePrivate, make } from \"./helper.mjs\";\nimport { read } from \"./observer.mjs\";\nconsole.log(\"native\", choose(), choosePrivate());\ncheckSaved();\nconsole.log(\"diamond\", read());\nconsole.log(\"class\", make().read(), make());\n\n",
+                "helper.mjs": "export function choose() {\n  choose = () => \"replacement\";\n  return \"original\";\n}\nfunction hidden() {\n  hidden = () => \"private-replacement\";\n  return \"private-original\";\n}\nexport function choosePrivate() { return hidden(); }\nclass Box { read() { return 7; } }\nexport function make() {\n  make = () => null;\n  return new Box();\n}\n",
+                "island.mjs": "import { choose, choosePrivate } from \"./helper.mjs\";\nconst original = choose;\nconsole.log(\"island\", original === choose, original(), choose(), original === choose);\nconsole.log(\"private\", choosePrivate(), choosePrivate());\nexport function checkSaved() {\n  console.log(\"saved\", original === choose, original(), choose());\n}\n",
+                "observer.mjs": "import { choose } from \"./helper.mjs\";\nexport function read() { return choose(); }\n"
+              },
+              "expected": "island true original replacement false\nprivate private-original private-replacement\nnative replacement private-replacement\nsaved false original replacement\ndiamond replacement\nclass 7 null\n",
+              "fixtureDefinitionSha256": "68ecca08b7c3d82c9ad104d52e4d8d546171ac5f5befd9d58fc0b69e61974aaf"
+            }
+          ];
+          const gateSpecs = [
+            {
+              "id": "lint",
+              "args": [
+                "lint"
+              ],
+              "seconds": 300
+            },
+            {
+              "id": "format",
+              "args": [
+                "format:check"
+              ],
+              "seconds": 300
+            },
+            {
+              "id": "units",
+              "args": [
+                "exec",
+                "vitest",
+                "run",
+                "packages/compiler/src/frontend/lowering/deferred-module-initializers.test.ts",
+                "tests/harness/node-island-shared-sources.test.ts",
+                "packages/compiler/src/frontend/lowering/lower-modules.test.ts",
+                "packages/compiler/src/frontend/lowering/class-dynamic-dispatch.test.ts",
+                "packages/compiler/src/frontend/lowering/unit-journal.test.ts"
+              ],
+              "seconds": 300,
+              "tests": [
+                "materializes many demanded registries without a whole-program scan per action",
+                "finds replaced blocks and references appended to an existing body in a later wave",
+                "reuses the scan of an unchanged body while only bindings are pending",
+                "indexes new subtrees for other demanded initializers in the same pass",
+                "does not index a materialized subtree with no live insertion point",
+                "fills every empty copy with the exact file and span while preserving populated blocks",
+                "reports the functions whose placeholders it fills",
+                "an update or an assignment of the binding demands its initializer",
+                "a specifier in a comment of island code shares nothing",
+                "a shared module's source stays out of the shipped tree",
+                "retains dependencies from function storage, captures, generator channels and globals",
+                "retains a constructible grandchild through an unused intermediate class",
+                "retains references carried by executable metadata and generator completion",
+                "closes nested structural types and index-signature values",
+                "boxed child values retain native stdio classes through recursive storage",
+                "preserves typed function bodies when other functions box classes",
+                "discovers dispatch sites added during a later reachability pass",
+                "shares method dispatch while preserving source error labels and callback evaluation order",
+                "known class property bags preserve one owned receiver without boxing",
+                "unknown receivers keep checked class property dispatch",
+                "read-only class bags are never stored; a settled prototype bag is made per read",
+                "the untyped read-only bag selects classes as the bag dispatch does, without storing",
+                "normalizes base capsules before dispatching each derived member once",
+                "class branches read their exact class's bag, also for classes with subclasses",
+                "records a class's bag initializer only when all its class-table branches agree",
+                "every collection of the lowerer is journaled, checked or left out by name",
+                "every scalar field of the lowerer is journaled or left out by name",
+                "every name the lists hold is a field of the lowerer",
+                "a map table hands over the entries added after a size",
+                "a table's content snapshot notices changed, reordered and removed entries",
+                "a function table keeps the function an earlier unit made",
+                "a set table adds what the parent lacks",
+                "a recorded wave keeps what the records carry, in wave order",
+                "a unit's record lists its events, flags and added entries",
+                "a unit that changes an entry it did not add has no record",
+                "a recorded wave throws when a unit changes a held function in place",
+                "a recorded wave holds the entries an applied record adds after its first lowering unit",
+                "units without a record may change a function they name in place",
+                "a unit that changes a function it names in place has no record",
+                "a record's binary function names the held functions its strings name",
+                "a record lists the held functions it names, with their digests",
+                "rewrites a nested named read",
+                "rewrites a nested computed read",
+                "rewrites a nested named write",
+                "rewrites a nested computed string write",
+                "rewrites a nested computed dynamic write",
+                "rewrites isolated dyn.reflectGet calls and preserves the supplied receiver",
+                "rewrites isolated dyn.reflectSet calls and preserves the supplied receiver"
+              ]
+            },
+            {
+              "id": "regression-plain",
+              "args": [
+                "exec",
+                "vitest",
+                "run",
+                "tests/harness/node-island.test.ts",
+                "-t",
+                "(?:shared function instantiation preserves reassignment \\(island\\-first, main\\)|shared function instantiation preserves reassignment \\(native\\-first, main\\)|shared function instantiation preserves reassignment \\(island\\-first, worker\\)|shared function instantiation preserves reassignment \\(island\\-first, fork\\)|nonshared CommonJS retries recreate reassigned functions|shared function instantiation leaves module effects lazy and ordered|the build does not evaluate a program module that runs in an island)$"
+              ],
+              "seconds": 1200,
+              "sanitize": false,
+              "tests": [
+                "shared function instantiation preserves reassignment (island-first, main)",
+                "shared function instantiation preserves reassignment (native-first, main)",
+                "shared function instantiation preserves reassignment (island-first, worker)",
+                "shared function instantiation preserves reassignment (island-first, fork)",
+                "nonshared CommonJS retries recreate reassigned functions",
+                "shared function instantiation leaves module effects lazy and ordered",
+                "the build does not evaluate a program module that runs in an island"
+              ]
+            },
+            {
+              "id": "siblings-plain",
+              "args": [
+                "exec",
+                "vitest",
+                "run",
+                "tests/harness/differential.test.ts",
+                "-t",
+                "(?:6560\\-npm\\-js\\-capability\\-probes/main\\.ts|6565\\-rebindable\\-function\\-import\\-cycle/main\\.ts|6850\\-node\\-island\\-shared\\-singleton/main\\.mjs|6852\\-node\\-island\\-shared\\-cycle/main\\.mjs|6854\\-node\\-island\\-shared\\-registry\\-native/main\\.mjs)$"
+              ],
+              "seconds": 900,
+              "sanitize": false,
+              "tests": [
+                "6560-npm-js-capability-probes/main.ts",
+                "6565-rebindable-function-import-cycle/main.ts",
+                "6850-node-island-shared-singleton/main.mjs",
+                "6852-node-island-shared-cycle/main.mjs",
+                "6854-node-island-shared-registry-native/main.mjs"
+              ]
+            },
+            {
+              "id": "regression-san",
+              "args": [
+                "exec",
+                "vitest",
+                "run",
+                "tests/harness/node-island.test.ts",
+                "-t",
+                "(?:shared function instantiation preserves reassignment \\(island\\-first, main\\)|shared function instantiation preserves reassignment \\(native\\-first, main\\)|shared function instantiation preserves reassignment \\(island\\-first, worker\\)|shared function instantiation preserves reassignment \\(island\\-first, fork\\)|nonshared CommonJS retries recreate reassigned functions|shared function instantiation leaves module effects lazy and ordered|the build does not evaluate a program module that runs in an island)$"
+              ],
+              "seconds": 1200,
+              "sanitize": true,
+              "tests": [
+                "shared function instantiation preserves reassignment (island-first, main)",
+                "shared function instantiation preserves reassignment (native-first, main)",
+                "shared function instantiation preserves reassignment (island-first, worker)",
+                "shared function instantiation preserves reassignment (island-first, fork)",
+                "nonshared CommonJS retries recreate reassigned functions",
+                "shared function instantiation leaves module effects lazy and ordered",
+                "the build does not evaluate a program module that runs in an island"
+              ]
+            },
+            {
+              "id": "siblings-san",
+              "args": [
+                "exec",
+                "vitest",
+                "run",
+                "tests/harness/differential.test.ts",
+                "-t",
+                "(?:6560\\-npm\\-js\\-capability\\-probes/main\\.ts|6565\\-rebindable\\-function\\-import\\-cycle/main\\.ts|6850\\-node\\-island\\-shared\\-singleton/main\\.mjs|6852\\-node\\-island\\-shared\\-cycle/main\\.mjs|6854\\-node\\-island\\-shared\\-registry\\-native/main\\.mjs)$"
+              ],
+              "seconds": 900,
+              "sanitize": true,
+              "tests": [
+                "6560-npm-js-capability-probes/main.ts",
+                "6565-rebindable-function-import-cycle/main.ts",
+                "6850-node-island-shared-singleton/main.mjs",
+                "6852-node-island-shared-cycle/main.mjs",
+                "6854-node-island-shared-registry-native/main.mjs"
+              ]
+            },
+            {
+              "id": "lowering-order",
+              "command": "node",
+              "args": [
+                "scripts/lowering-order.mjs",
+                "--limit",
+                "0",
+                "--entry",
+                "<fixture-entry>",
+                "--seeds",
+                "1,2,3",
+                "--jobs",
+                "1",
+                "--fail-on",
+                "names",
+                "--out",
+                "<lowering-out>"
+              ],
+              "seconds": 900
+            }
+          ];
+          const fixtures = join(out, "fixtures"); mkdirSync(fixtures);
+          for (const spec of specs) {
+            const dir = join(fixtures, spec.id); mkdirSync(dir);
+            for (const [file, contents] of Object.entries(spec.files))
+              writeFileSync(join(dir, file), contents);
+            writeFileSync(join(dir, "expected.stdout.log"), spec.expected);
+          }
+          const fixtureManifest = moduleFiles(fixtures);
+          report.fixtureManifest = fixtureManifest; report.fixtureDigest = digest(JSON.stringify(fixtureManifest));
+          const verifyFixtures = () => assert.deepEqual(moduleFiles(fixtures), fixtureManifest);
+          const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
+          save();
+          try {
+            assert.equal(report.fixtureDigest, "d9ce7973bcec467417e18ae584b7264ac49ef6b8bbc5180fd7b391ba91d38036", "authored fixture bytes changed");
+            report.sourceInputs = source(); report.sourceVerifiedBefore = true;
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
+            report.tools = { node: process.version, pnpm: capture("pnpm", "pnpm", ["--version"]), llvm: capture("llvm", "llvm-config", ["--version"]), zig: capture("zig", "zig", ["version"]) };
+            assert.deepEqual(report.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
+            requireSuccess(execute("verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]));
+            report.runtimeManifestSha256 = hash("packages/runtime-linux-x64-gnu/runtime-pack.json");
+            report.build = execute("workspace-build", "pnpm", ["build"], 600); requireSuccess(report.build);
+            report.helper = JSON.parse(capture("helper", "packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+            assert.equal(report.helper.ok, true);
+            report.helperBinarySha256 = hash("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen");
+            assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
+            assert.equal(report.helper.scriptc_package_version, JSON.parse(readFileSync("packages/llvm-linux-x64-gnu/package.json", "utf8")).version);
+            const toolIdentity = (name, command) => {
+              const path = realpathSync(capture(name + "-path", "sh", ["-c", 'command -v "$1"', "diagnostic", command]));
+              return { command, path, sha256: hash(path), version: capture(name + "-version", command, ["--version"]) };
+            };
+            const cxx = process.env.CXX || "g++";
+            report.bridgeBuild = {
+              kind: "independent-reproduction", sharedPack: false, crossRevisionByteIdentity: "not-assumed",
+              compiler: toolIdentity("bridge-cxx", cxx), strip: toolIdentity("bridge-strip", "strip"),
+              linker: toolIdentity("bridge-linker", capture("bridge-linker-name", cxx, ["-print-prog-name=ld"])),
+              compilerTarget: capture("bridge-cxx-target", cxx, ["-dumpmachine"]),
+              image: { os: process.env.ImageOS, version: process.env.ImageVersion },
+              buildRecipe: "packages/libnode-common/build-pack.mjs:66", source: "packages/libnode-common/bridge/scr_node_bridge.cc",
+              sourceSha256: report.sourceInputs["packages/libnode-common/bridge/scr_node_bridge.cc"],
+              pinnedLibnodeSha256: "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838",
+            };
+            const packRoot = join(work, "libnode");
+            requireSuccess(execute("fetch-libnode", process.execPath, ["packages/libnode-common/fetch-dev-pack.mjs", "--out", packRoot], 600));
+            const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
+            const { providedModulePlaceholder } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/modules.js")));
+            const pack = readLibnodePack(packRoot, { verifyHashes: true });
+            assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
+            assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
+            report.libnode = { manifest: pack.manifest, manifestSha256: hash(join(packRoot, "manifest.json")) };
+            report.bridgeBuild.currentBridgeSha256 = pack.manifest.files[pack.manifest.bridge].sha256;
+            report.bridgeBuild.currentLibnodeSha256 = pack.manifest.files[pack.manifest.libnode].sha256;
+            assert.equal(report.bridgeBuild.currentLibnodeSha256, report.bridgeBuild.pinnedLibnodeSha256);
+            for (const spec of specs) {
+              const observed = { id: spec.id, origin: spec.origin, fixtureSource: spec.fixtureSource, fixtureDefinitionSha256: spec.fixtureDefinitionSha256, transform: spec.transform, markedIslands: spec.islands, expectedStdoutSha256: digest(spec.expected), flavors: {} };
+              report.cases.push(observed);
+              const dir = join(fixtures, spec.id), entry = join(dir, "main.mjs"), markedIslands = spec.islands.map(file => join(dir, file));
+              const artifacts = join(out, spec.id); mkdirSync(artifacts);
+              verifyFixtures();
+              try {
+                observed.oracle = execute(spec.id + "-node", process.execPath, [entry], 30, { SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.oracle.attempted = observed.oracle.status !== "tool-error";
+                observed.oracle.parityOutcome = parityOutcome(observed.oracle);
+                observed.oracle.expectedMatched = observed.oracle.status === "completed" &&
+                  observed.oracle.stdoutSha256 === digest(spec.expected) && observed.oracle.stderrBytes === 0;
+              } catch (error) { observed.oracleError = scrub(error.stack ?? error); }
+              const common = ["packages/cli/dist/main.js", "build", entry, "--print=diagnostics", "--node-islands=explicit", ...markedIslands.map(file => "--node-island=" + file)];
+              const irPath = join(artifacts, "program.ir.json"), irCache = join(work, spec.id + "-ir-cache"); mkdirSync(irCache, { mode: 0o700 });
+              observed.ir = { status: "running", attempted: false };
+              try {
+                observed.ir.compile = execute(spec.id + "-ir", process.execPath, [...common, "--emit=ir", "-o", irPath], 180,
+                  { SCRIPTC_CACHE_DIR: irCache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                observed.ir.attempted = observed.ir.compile.status !== "tool-error";
+                if (existsSync(irPath)) observed.ir.artifact = recordFile(irPath);
+                assert.ok(validateCompile(observed.ir.compile, entry, irPath, markedIslands), "IR compilation or diagnostics failed");
+                assert.ok(observed.ir.artifact, "successful IR build did not produce its artifact");
+                observed.ir.status = "passed";
+              } catch (error) { observed.ir.status = "failed"; observed.ir.error = scrub(error.stack ?? error); }
+              finally { save(); }
+              for (const flavor of ["plain", "san"]) {
+                const result = observed.flavors[flavor] = { status: "running", execution: { status: "not-executed", attempted: false }, parity: "not-compared" };
+                const build = join(work, spec.id + "-" + flavor); mkdirSync(build);
+                const binary = join(build, "program"), cache = join(build, "cache"); mkdirSync(cache, { mode: 0o700 });
+                const env = { SCRIPTC_CACHE_DIR: cache, SCRIPTC_SAN: "", SCRIPTC_LIBNODE: packRoot, ASAN_OPTIONS: "detect_leaks=0" };
+                try {
+                  const args = [...common, "-o", binary, "--keep-llvm", "--libnode=beside", ...(flavor === "san" ? ["--sanitize"] : [])];
+                  result.compile = execute(spec.id + "-" + flavor + "-compile", process.execPath, args, 300, env);
+                  // The compiler retains LLVM by entry stem, not executable name.
+                  if (existsSync(join(build, "main.ll"))) {
+                    const llvm = join(artifacts, flavor + ".ll"); copyFileSync(join(build, "main.ll"), llvm); result.llvm = recordFile(llvm);
+                  }
+                  assert.ok(validateCompile(result.compile, entry, binary, markedIslands), "native compilation or diagnostics failed");
+                  result.execution = { status: "blocked-before-execution", attempted: false };
+                  assert.equal(observed.ir.status, "passed", "native execution requires admitted IR");
+                  const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
+                  assert.deepEqual(beside.manifest, pack.manifest);
+                  const modules = join(beside.root, "modules");
+                  result.moduleFiles = moduleFiles(modules);
+                  assert.deepEqual(result.moduleFiles.map(file => file.path).sort(), ["helper.mjs", "package.json", ...spec.islands].sort());
+                  for (const file of ["package.json", ...spec.islands]) assert.equal(hash(join(modules, file)), hash(join(dir, file)));
+                  assert.deepEqual(readFileSync(join(modules, "helper.mjs")), Buffer.from(providedModulePlaceholder("helper.mjs")));
+                  result.moduleOwners = { entry: "native", islands: spec.islands, helper: "native-provided-placeholder" };
+                  result.binarySha256 = hash(binary);
+                  const manifestCopy = join(artifacts, flavor + ".libnode-manifest.json");
+                  copyFileSync(join(beside.root, "manifest.json"), manifestCopy); result.libnodeManifest = recordFile(manifestCopy);
+                  result.execution = execute(spec.id + "-" + flavor + "-run", binary, [], 30, { ...env, SCRIPTC_LIBNODE: "" });
+                  result.execution.attempted = result.execution.status !== "tool-error";
+                  result.execution.parityOutcome = parityOutcome(result.execution, flavor === "san");
+                  result.crashKind = crashKind(result.execution, flavor, readFileSync(join(out, result.execution.stderr), "utf8"));
+                  const expectedOutcome = observed.oracle?.parityOutcome, actualOutcome = result.execution.parityOutcome;
+                  result.parity = observed.oracle?.expectedMatched && expectedOutcome && result.execution.status === "completed" &&
+                    actualOutcome.code === expectedOutcome.code && actualOutcome.signal === expectedOutcome.signal &&
+                    actualOutcome.stdoutSha256 === expectedOutcome.stdoutSha256 && actualOutcome.stderrSha256 === expectedOutcome.stderrSha256 ? "matched" : "mismatch";
+                  assert.equal(hash(binary), result.binarySha256);
+                  assert.deepEqual(readLibnodePack(binary + ".libnode", { verifyHashes: true }).manifest, pack.manifest);
+                  assert.deepEqual(moduleFiles(modules), result.moduleFiles);
+                  result.inputsVerifiedAfter = true;
+                  assert.ok(result.llvm, "successful native build did not retain LLVM");
+                  assert.equal(result.parity, "matched"); result.status = "passed";
+                } catch (error) { result.status = "failed"; result.error = scrub(error.stack ?? error); }
+                finally { save(); }
+              }
+              observed.complete = observed.oracle?.attempted === true && observed.ir.attempted === true &&
+                ["plain", "san"].every(flavor => observed.flavors[flavor].execution.attempted === true); save();
+            }
+            if (report.label === "candidate") {
+              // The harness has one fixed output path; route only our absent path into owned scratch.
+              const harnessLink = join(root, "node_modules/.cache/scriptc-tests");
+              assert.equal(lstatSync(harnessLink, { throwIfNoEntry: false }), undefined, "harness output already has an owner");
+              const harnessOutput = join(work, "harness-output"); mkdirSync(harnessOutput);
+              mkdirSync(join(root, "node_modules/.cache"), { recursive: true });
+              symlinkSync(harnessOutput, harnessLink, "dir");
+              const gateArtifacts = join(out, "gates"); mkdirSync(gateArtifacts);
+              for (const spec of gateSpecs) {
+                const gate = { id: spec.id, status: "running", expectedTests: spec.tests ?? [] }; report.gates.push(gate);
+                const scratch = join(work, "gate-" + spec.id); mkdirSync(scratch, { mode: 0o700 });
+                const cache = join(scratch, "cache"), temp = join(scratch, "tmp"); mkdirSync(cache, { mode: 0o700 }); mkdirSync(temp);
+                const jsonPath = join(gateArtifacts, spec.id + ".vitest.json");
+                const loweringOut = join(scratch, "lowering-order");
+                const args = [...spec.args.map(arg => arg === "<fixture-entry>" ? join(fixtures, specs[0].id, "main.mjs") :
+                  arg === "<lowering-out>" ? loweringOut : arg), ...(spec.tests ? ["--reporter=default", "--reporter=json", "--outputFile=" + jsonPath] : [])];
+                try {
+                  gate.step = execute("gate-" + spec.id, spec.command ?? "pnpm", args, spec.seconds, {
+                    SCRIPTC_TEST_WORKERS: "2", SCRIPTC_TEST_SHARD: "", SCRIPTC_SAN: spec.sanitize ? "1" : "",
+                    SCRIPTC_LIBNODE: packRoot, SCRIPTC_CACHE_DIR: cache, XDG_CACHE_HOME: join(scratch, "xdg"),
+                    TMPDIR: temp, ASAN_OPTIONS: "detect_leaks=0",
+                  });
+                  gate.attempted = gate.step.status !== "tool-error";
+                  if (spec.tests) {
+                    assert.ok(existsSync(jsonPath), "fresh Vitest JSON missing");
+                    gate.artifact = recordFile(jsonPath); assert.ok(gate.artifact.bytes <= 16 * 1024 ** 2);
+                    const data = JSON.parse(readFileSync(jsonPath, "utf8"));
+                    const rows = data.testResults.flatMap(suite => suite.assertionResults);
+                    const selected = spec.tests.flatMap(name => rows.filter(row => row.fullName === name || row.fullName.endsWith(" " + name)));
+                    gate.tests = selected.map(row => ({ name: row.fullName, status: row.status }));
+                    gate.executedCount = rows.filter(row => !["pending", "skipped", "todo"].includes(row.status)).length;
+                    for (const name of spec.tests) {
+                      const found = selected.filter(row => row.fullName === name || row.fullName.endsWith(" " + name));
+                      assert.equal(found.length, 1, "missing or duplicate test: " + name); assert.equal(found[0].status, "passed", name);
+                    }
+                    assert.equal(gate.executedCount, spec.tests.length, "unexpected executed tests");
+                    assert.equal(data.success, true); assert.equal(data.numFailedTests, 0); assert.equal(data.numFailedTestSuites, 0);
+                  }
+                  if (spec.id === "lowering-order") {
+                    gate.loweringArtifacts = [];
+                    for (const name of loweringFiles) {
+                      const sourcePath = join(loweringOut, name);
+                      if (!existsSync(sourcePath)) continue;
+                      const target = join(gateArtifacts, "lowering-order", name);
+                      mkdirSync(dirname(target), { recursive: true }); copyFileSync(sourcePath, target);
+                      gate.loweringArtifacts.push({ name, ...recordFile(target) });
+                    }
+                    gate.lowering = verifyLowering(gate.loweringArtifacts, name =>
+                      readFileSync(join(gateArtifacts, "lowering-order", name), "utf8"));
+                  }
+                  requireSuccess(gate.step); gate.status = "passed";
+                } catch (error) { gate.status = "failed"; gate.error = scrub(error.stack ?? error); }
+                finally { save(); }
+              }
+              assert.equal(readlinkSync(harnessLink), harnessOutput);
+            }
+            report.executionAttempts = report.cases.flatMap(item => Object.values(item.flavors)).filter(item => item.execution.attempted === true).length;
+            report.diagnosticComplete = report.cases.length === specs.length && report.cases.every(item => item.complete);
+            report.diagnosticComplete &&= report.executionAttempts === report.expectedExecutionAttempts;
+            report.qualificationComplete = report.diagnosticComplete && report.cases.every(item => item.oracle?.expectedMatched && item.ir.status === "passed" && ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed")) &&
+              (report.label === "baseline" || report.gates.length === gateSpecs.length && report.gates.every(gate => gate.status === "passed"));
+            report.baselineComplete = report.label === "baseline" && report.diagnosticComplete && report.cases.every(item =>
+              item.oracle.expectedMatched && item.ir.status === "passed" && ["plain", "san"].every(flavor => {
+                const native = item.flavors[flavor];
+                return native.compile?.diagnosticsStatus === "passed" && native.llvm && native.libnodeManifest && native.moduleOwners && native.inputsVerifiedAfter === true && native.execution.attempted;
+              }));
+            report.regressionObserved = report.label === "baseline" && report.cases.every(item => crashRegression(item, execution => readFileSync(join(out, execution.stderr), "utf8")));
+            report.status = report.qualificationComplete ? "passed" : report.baselineComplete && report.regressionObserved ? "regression-observed" : "failed";
+          } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
+          finally {
+            try { assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true; verifyFixtures(); report.fixturesVerifiedAfter = true; }
+            catch (error) { report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false; report.baselineComplete = false; report.sourceError = scrub(error.stack ?? error); }
+            report.finishedAt = new Date().toISOString(); save();
+            writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
+            console.log(JSON.stringify({ label: report.label, status: report.status, diagnosticComplete: report.diagnosticComplete, qualificationComplete: report.qualificationComplete }));
+            const accepted = report.label === "baseline" ? report.baselineComplete && report.regressionObserved : report.qualificationComplete;
+            if (!accepted) { console.error("[shared-module-diagnostic] FAILED (exit 1)"); process.exitCode = 1; }
+          }
+          PROOF
+          ulimit -c 0
+          node "$RUNNER_TEMP/shared-module-diagnostic.mjs"
+      - name: Remove this diagnostic's build scratch
+        if: always()
+        run: |
+          node --input-type=module <<'CLEANUP'
+          import assert from "node:assert/strict";
+          import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const temp = process.env.RUNNER_TEMP, work = join(temp, "shared-module-work"), out = join(temp, "shared-module-proof");
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          const receipt = { ...owner, work: "absent", payload: "absent", harnessLink: "absent" };
+          try {
+            if (existsSync(work)) {
+              assert.deepEqual(JSON.parse(readFileSync(join(work, ".diagnostic-owner.json"), "utf8")), owner);
+              const harnessLink = join(process.cwd(), "node_modules/.cache/scriptc-tests");
+              const info = lstatSync(harnessLink, { throwIfNoEntry: false });
+              if (info !== undefined) {
+                assert.equal(owner.label, "candidate"); assert.ok(info.isSymbolicLink());
+                assert.equal(readlinkSync(harnessLink), join(work, "harness-output"));
+                rmSync(harnessLink); receipt.harnessLink = "removed";
+              }
+              rmSync(work, { recursive: true }); receipt.work = "removed";
+            }
+            const payload = join(temp, "shared-module-diagnostic.mjs");
+            if (existsSync(payload)) { rmSync(payload); receipt.payload = "removed"; }
+          } catch (error) { receipt.error = String(error); process.exitCode = 1; }
+          finally {
+            mkdirSync(out, { recursive: true });
+            writeFileSync(join(out, "cleanup.json"), JSON.stringify(receipt, null, 2) + "\n");
+            if (process.exitCode) console.error("[shared-module-cleanup] FAILED (exit 1)");
+          }
+          CLEANUP
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: function-instantiation-${{ matrix.label }}
+          path: ${{ runner.temp }}/shared-module-proof
+          if-no-files-found: error
+          retention-days: 3
+
+  aggregate:
+    needs: diagnose
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: function-instantiation-*
+          path: ${{ runner.temp }}/function-instantiation-results
+      - name: Verify paired completeness and candidate gates
+        run: |
+          node --input-type=module <<'COMPARE'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const heads = { baseline: "71a9441c824262150f35acd2b8359f156ed3289c", candidate: "ffed371753d0124f8482b69540f58a37d43bb903" };
+          const id = "shared-function-instantiation", markedIslands = ["island.mjs"];
+          const gateSpecs = [{"id":"lint","args":["lint"],"seconds":300},{"id":"format","args":["format:check"],"seconds":300},{"id":"units","args":["exec","vitest","run","packages/compiler/src/frontend/lowering/deferred-module-initializers.test.ts","tests/harness/node-island-shared-sources.test.ts","packages/compiler/src/frontend/lowering/lower-modules.test.ts","packages/compiler/src/frontend/lowering/class-dynamic-dispatch.test.ts","packages/compiler/src/frontend/lowering/unit-journal.test.ts"],"seconds":300,"tests":["materializes many demanded registries without a whole-program scan per action","finds replaced blocks and references appended to an existing body in a later wave","reuses the scan of an unchanged body while only bindings are pending","indexes new subtrees for other demanded initializers in the same pass","does not index a materialized subtree with no live insertion point","fills every empty copy with the exact file and span while preserving populated blocks","reports the functions whose placeholders it fills","an update or an assignment of the binding demands its initializer","a specifier in a comment of island code shares nothing","a shared module's source stays out of the shipped tree","retains dependencies from function storage, captures, generator channels and globals","retains a constructible grandchild through an unused intermediate class","retains references carried by executable metadata and generator completion","closes nested structural types and index-signature values","boxed child values retain native stdio classes through recursive storage","preserves typed function bodies when other functions box classes","discovers dispatch sites added during a later reachability pass","shares method dispatch while preserving source error labels and callback evaluation order","known class property bags preserve one owned receiver without boxing","unknown receivers keep checked class property dispatch","read-only class bags are never stored; a settled prototype bag is made per read","the untyped read-only bag selects classes as the bag dispatch does, without storing","normalizes base capsules before dispatching each derived member once","class branches read their exact class's bag, also for classes with subclasses","records a class's bag initializer only when all its class-table branches agree","every collection of the lowerer is journaled, checked or left out by name","every scalar field of the lowerer is journaled or left out by name","every name the lists hold is a field of the lowerer","a map table hands over the entries added after a size","a table's content snapshot notices changed, reordered and removed entries","a function table keeps the function an earlier unit made","a set table adds what the parent lacks","a recorded wave keeps what the records carry, in wave order","a unit's record lists its events, flags and added entries","a unit that changes an entry it did not add has no record","a recorded wave throws when a unit changes a held function in place","a recorded wave holds the entries an applied record adds after its first lowering unit","units without a record may change a function they name in place","a unit that changes a function it names in place has no record","a record's binary function names the held functions its strings name","a record lists the held functions it names, with their digests","rewrites a nested named read","rewrites a nested computed read","rewrites a nested named write","rewrites a nested computed string write","rewrites a nested computed dynamic write","rewrites isolated dyn.reflectGet calls and preserves the supplied receiver","rewrites isolated dyn.reflectSet calls and preserves the supplied receiver"]},{"id":"regression-plain","args":["exec","vitest","run","tests/harness/node-island.test.ts","-t","(?:shared function instantiation preserves reassignment \\(island\\-first, main\\)|shared function instantiation preserves reassignment \\(native\\-first, main\\)|shared function instantiation preserves reassignment \\(island\\-first, worker\\)|shared function instantiation preserves reassignment \\(island\\-first, fork\\)|nonshared CommonJS retries recreate reassigned functions|shared function instantiation leaves module effects lazy and ordered|the build does not evaluate a program module that runs in an island)$"],"seconds":1200,"sanitize":false,"tests":["shared function instantiation preserves reassignment (island-first, main)","shared function instantiation preserves reassignment (native-first, main)","shared function instantiation preserves reassignment (island-first, worker)","shared function instantiation preserves reassignment (island-first, fork)","nonshared CommonJS retries recreate reassigned functions","shared function instantiation leaves module effects lazy and ordered","the build does not evaluate a program module that runs in an island"]},{"id":"siblings-plain","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:6560\\-npm\\-js\\-capability\\-probes/main\\.ts|6565\\-rebindable\\-function\\-import\\-cycle/main\\.ts|6850\\-node\\-island\\-shared\\-singleton/main\\.mjs|6852\\-node\\-island\\-shared\\-cycle/main\\.mjs|6854\\-node\\-island\\-shared\\-registry\\-native/main\\.mjs)$"],"seconds":900,"sanitize":false,"tests":["6560-npm-js-capability-probes/main.ts","6565-rebindable-function-import-cycle/main.ts","6850-node-island-shared-singleton/main.mjs","6852-node-island-shared-cycle/main.mjs","6854-node-island-shared-registry-native/main.mjs"]},{"id":"regression-san","args":["exec","vitest","run","tests/harness/node-island.test.ts","-t","(?:shared function instantiation preserves reassignment \\(island\\-first, main\\)|shared function instantiation preserves reassignment \\(native\\-first, main\\)|shared function instantiation preserves reassignment \\(island\\-first, worker\\)|shared function instantiation preserves reassignment \\(island\\-first, fork\\)|nonshared CommonJS retries recreate reassigned functions|shared function instantiation leaves module effects lazy and ordered|the build does not evaluate a program module that runs in an island)$"],"seconds":1200,"sanitize":true,"tests":["shared function instantiation preserves reassignment (island-first, main)","shared function instantiation preserves reassignment (native-first, main)","shared function instantiation preserves reassignment (island-first, worker)","shared function instantiation preserves reassignment (island-first, fork)","nonshared CommonJS retries recreate reassigned functions","shared function instantiation leaves module effects lazy and ordered","the build does not evaluate a program module that runs in an island"]},{"id":"siblings-san","args":["exec","vitest","run","tests/harness/differential.test.ts","-t","(?:6560\\-npm\\-js\\-capability\\-probes/main\\.ts|6565\\-rebindable\\-function\\-import\\-cycle/main\\.ts|6850\\-node\\-island\\-shared\\-singleton/main\\.mjs|6852\\-node\\-island\\-shared\\-cycle/main\\.mjs|6854\\-node\\-island\\-shared\\-registry\\-native/main\\.mjs)$"],"seconds":900,"sanitize":true,"tests":["6560-npm-js-capability-probes/main.ts","6565-rebindable-function-import-cycle/main.ts","6850-node-island-shared-singleton/main.mjs","6852-node-island-shared-cycle/main.mjs","6854-node-island-shared-registry-native/main.mjs"]},{"id":"lowering-order","command":"node","args":["scripts/lowering-order.mjs","--limit","0","--entry","<fixture-entry>","--seeds","1,2,3","--jobs","1","--fail-on","names","--out","<lowering-out>"],"seconds":900}];
+          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            scope: "shared-function-instantiation", diagnosticComplete: false, qualificationComplete: false, sources: {} };
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const ASAN_SWAP = /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext.*\n/gm;
+          const crashKind = (execution, flavor, stderr) => {
+            if (execution?.attempted !== true || execution.error ||
+                ["timeout", "killed", "tool-error", "not-executed", "blocked-before-execution"].includes(execution.status)) return null;
+            if ((execution.status === "signal" && execution.signal === "SIGSEGV" && execution.code === null) ||
+                (execution.status === "nonzero-exit" && execution.code === 139 && execution.signal === null)) return "SIGSEGV";
+            if (flavor === "san" && execution.status === "nonzero-exit" && execution.code === 1 && execution.signal === null &&
+                /^==\d+==ERROR: AddressSanitizer: SEGV\b/m.test(stderr) &&
+                /^SUMMARY: AddressSanitizer: SEGV\b/m.test(stderr)) return "ASan-SEGV";
+            return null;
+          };
+          const crashRegression = (item, readStderr) => item.oracle?.expectedMatched === true && ["plain", "san"].every(flavor => {
+            const native = item.flavors[flavor], execution = native.execution;
+            return native.parity === "mismatch" && execution.attempted === true &&
+              execution.stderrBytes <= 16 * 1024 ** 2 && crashKind(execution, flavor, readStderr(execution)) !== null;
+          });
+          const loweringFiles = ["results.json", "main.mjs/audit.json", "main.mjs/base.ir.json", "main.mjs/base.state.json",
+            ...[1, 2, 3].flatMap(seed => ["main.mjs/seed" + seed + ".ir.json", "main.mjs/seed" + seed + ".state.json"])];
+          const verifyLowering = (files, read) => {
+            assert.deepEqual(files.map(file => file.name).sort(), [...loweringFiles].sort(), "lowering-order evidence incomplete");
+            const data = JSON.parse(read("results.json"));
+            assert.equal(data.length, 1); assert.equal(data[0].program, "main.mjs");
+            assert.equal(data[0].status, "order-independent"); assert.deepEqual(data[0].diffs, {});
+            for (const name of loweringFiles.filter(name => name.endsWith(".ir.json"))) {
+              const ir = JSON.parse(read(name)); assert.ok(Array.isArray(ir.functions) && ir.functions.length > 0);
+              assert.equal(typeof ir.entry, "string");
+            }
+            for (const name of loweringFiles.filter(name => name.endsWith(".state.json"))) {
+              const state = JSON.parse(read(name));
+              assert.ok(state && !Array.isArray(state) && typeof state === "object" && Object.keys(state).length > 0);
+            }
+            const audit = JSON.parse(read("main.mjs/audit.json")); assert.ok(audit && typeof audit === "object" && !Array.isArray(audit));
+            return data[0];
+          };
+          // Baseline is deliberately unfixed. Missing native executions are incomplete evidence.
+          const baselineComplete = summary => summary.diagnosticComplete === true && summary.executionAttempts === 2 &&
+            summary.sourceVerifiedBefore === true && summary.sourceVerifiedAfter === true && summary.fixturesVerifiedAfter === true &&
+            summary.cases.length === 1 && summary.cases.every(item => item.oracle.expectedMatched && item.ir.status === "passed" &&
+              ["plain", "san"].every(flavor => {
+                const native = item.flavors[flavor];
+                return native.compile?.diagnosticsStatus === "passed" && native.llvm && native.libnodeManifest &&
+                  native.moduleOwners && native.inputsVerifiedAfter === true && native.execution.attempted === true;
+              }));
+          try {
+            for (const [label, head] of Object.entries(heads)) {
+              const dir = join(process.env.RUNNER_TEMP, "function-instantiation-results", "function-instantiation-" + label);
+              const verifyFile = file => {
+                const bytes = readFileSync(join(dir, file.path));
+                assert.equal(digest(bytes), file.sha256); assert.equal(bytes.length, file.bytes);
+              };
+              const verifyOutcome = (execution, sanitize) => {
+                const outcome = execution.parityOutcome;
+                if (!outcome) return;
+                let removedLines = 0;
+                const raw = readFileSync(join(dir, execution.stderr), "utf8");
+                const normalized = sanitize ? raw.replace(ASAN_SWAP, () => { removedLines += 1; return ""; }) : raw;
+                assert.equal(readFileSync(join(dir, outcome.stderr), "utf8"), normalized);
+                assert.equal(outcome.stderrSha256, digest(normalized)); assert.equal(outcome.stdoutSha256, execution.stdoutSha256);
+                assert.equal(outcome.stdout, execution.stdout); assert.equal(outcome.status, execution.status);
+                assert.equal(outcome.code, execution.code); assert.equal(outcome.signal, execution.signal);
+                assert.deepEqual(outcome.normalization, { stdout: "none", stderr: sanitize ? "ASAN_SWAP" : "none", removedLines,
+                  ruleSource: "tests/harness/node-island-order.test.ts:63", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags });
+              };
+              const verifyDiagnostics = (compile, suffix) => {
+                if (compile?.diagnosticsStatus !== "passed") return;
+                const value = JSON.parse(readFileSync(join(dir, compile.stdout), "utf8"));
+                const entrySuffix = "/shared-module-proof/fixtures/" + id + "/main.mjs";
+                assert.ok(value.entry.endsWith(entrySuffix));
+                const temp = value.entry.slice(0, -entrySuffix.length);
+                assert.equal(value.schema, "scriptc-diagnostics"); assert.equal(value.schemaVersion, 1);
+                assert.equal(value.command, "build"); assert.equal(value.phase, "complete"); assert.equal(value.success, true);
+                assert.equal(value.artifact, temp + suffix); assert.ok(Array.isArray(value.diagnostics));
+                assert.equal(value.diagnostics.filter(item => item.severity === "error").length, 0);
+                const marked = markedIslands.map(file => temp + "/shared-module-proof/fixtures/" + id + "/" + file);
+                assert.deepEqual(value.diagnostics.filter(item => item.code === "SC8001").map(item => item.file).sort(), marked.sort());
+              };
+              const bytes = readFileSync(join(dir, "summary.json")), summary = JSON.parse(bytes);
+              result.sources[label] = { summarySha256: digest(bytes), summary };
+              assert.equal(digest(bytes), readFileSync(join(dir, "summary.sha256"), "utf8").trim());
+              assert.equal(summary.head, head); assert.equal(summary.label, label); assert.equal(summary.scope, result.scope);
+              assert.equal(summary.templateCommit, "d8c8545d73adfe364db6666d1b90ed4b587aa1a1");
+              assert.equal(summary.workflow, result.workflow); assert.equal(summary.runId, result.runId); assert.equal(summary.attempt, result.attempt);
+              assert.equal(summary.settledEvidence.repeated, false); assert.equal(summary.settledEvidence.usedForQualification, false);
+              assert.equal(summary.fixtureDigest, "d9ce7973bcec467417e18ae584b7264ac49ef6b8bbc5180fd7b391ba91d38036");
+              assert.equal(digest(JSON.stringify(summary.fixtureManifest)), summary.fixtureDigest);
+              assert.deepEqual(summary.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
+              assert.equal(summary.build.status, "completed"); assert.equal(summary.helper.protocol_version, "1");
+              assert.equal(summary.helper.llvm_version, "22.1.8"); assert.match(summary.helperBinarySha256, /^[a-f0-9]{64}$/);
+              assert.equal(summary.libnode.manifest.nodeVersion, "24.22.1"); assert.equal(summary.libnode.manifest.bridgeAbi, 10);
+              assert.equal(summary.bridgeBuild.currentLibnodeSha256, "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838");
+              const cleanup = JSON.parse(readFileSync(join(dir, "cleanup.json"), "utf8"));
+              assert.equal(cleanup.runId, result.runId); assert.equal(cleanup.attempt, result.attempt);
+              assert.equal(cleanup.workflow, result.workflow); assert.equal(cleanup.label, label);
+              assert.equal(cleanup.error, undefined); assert.equal(cleanup.work, "removed"); assert.equal(cleanup.payload, "removed");
+              assert.equal(cleanup.harnessLink, label === "candidate" ? "removed" : "absent");
+              result.sources[label].cleanup = cleanup;
+              assert.deepEqual(summary.cases.map(item => item.id), [id]);
+              for (const file of summary.fixtureManifest) verifyFile({ ...file, path: "fixtures/" + file.path });
+              for (const step of summary.steps) for (const stream of ["stdout", "stderr"])
+                verifyFile({ path: step[stream], sha256: step[stream + "Sha256"], bytes: step[stream + "Bytes"] });
+              const item = summary.cases[0];
+              assert.deepEqual(item.markedIslands, markedIslands); assert.equal(item.fixtureSource, heads.candidate);
+              assert.equal(item.fixtureDefinitionSha256, "68ecca08b7c3d82c9ad104d52e4d8d546171ac5f5befd9d58fc0b69e61974aaf");
+              assert.equal(item.transform, "instantiate test.each row order=island-first root=main; no source rewrite");
+              const expectedStdout = digest(readFileSync(join(dir, "fixtures", id, "expected.stdout.log")));
+              assert.equal(expectedStdout, digest("island true original replacement false\nprivate private-original private-replacement\nnative replacement private-replacement\nsaved false original replacement\ndiamond replacement\nclass 7 null\n")); assert.equal(item.expectedStdoutSha256, expectedStdout);
+              if (item.oracle) {
+                verifyOutcome(item.oracle, false);
+                const step = summary.steps.find(step => step.name === id + "-node");
+                assert.ok(step); assert.deepEqual(step.args, ["<temp>/shared-module-proof/fixtures/" + id + "/main.mjs"]);
+                assert.equal(step.stdoutSha256, item.oracle.stdoutSha256); assert.equal(step.stderrSha256, item.oracle.stderrSha256);
+                assert.equal(item.oracle.expectedMatched, item.oracle.status === "completed" &&
+                  item.oracle.stdoutSha256 === expectedStdout && item.oracle.stderrBytes === 0);
+              }
+              if (item.ir.artifact) verifyFile(item.ir.artifact);
+              verifyDiagnostics(item.ir.compile, "/shared-module-proof/" + id + "/program.ir.json");
+              for (const flavor of ["plain", "san"]) {
+                const native = item.flavors[flavor], execution = native.execution;
+                for (const file of [native.llvm, native.libnodeManifest].filter(Boolean)) verifyFile(file);
+                verifyDiagnostics(native.compile, "/shared-module-work/" + id + "-" + flavor + "/program");
+                verifyOutcome(execution, flavor === "san");
+                if (execution.attempted) {
+                  assert.equal(item.ir.status, "passed");
+                  assert.equal(native.crashKind, crashKind(execution, flavor, readFileSync(join(dir, execution.stderr), "utf8")));
+                  const step = summary.steps.find(step => step.name === id + "-" + flavor + "-run");
+                  assert.ok(step); assert.equal(step.command, "<temp>/shared-module-work/" + id + "-" + flavor + "/program");
+                  assert.notEqual(step.status, "tool-error"); assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
+                  const actual = execution.parityOutcome, oracle = item.oracle?.parityOutcome;
+                  const matched = Boolean(item.oracle?.expectedMatched && actual && oracle && execution.status === "completed" &&
+                    actual.code === oracle.code && actual.signal === oracle.signal &&
+                    actual.stdoutSha256 === oracle.stdoutSha256 && actual.stderrSha256 === oracle.stderrSha256);
+                  assert.equal(native.parity, matched ? "matched" : "mismatch");
+                }
+              }
+              assert.equal(item.complete, item.oracle?.attempted === true && item.ir.attempted === true &&
+                ["plain", "san"].every(flavor => item.flavors[flavor].execution.attempted === true));
+              const attempts = Object.values(item.flavors).filter(native => native.execution.attempted === true).length;
+              assert.equal(summary.expectedExecutionAttempts, 2); assert.equal(summary.executionAttempts, attempts);
+              const complete = item.complete && attempts === 2 && summary.sourceVerifiedBefore === true &&
+                summary.sourceVerifiedAfter === true && summary.fixturesVerifiedAfter === true;
+              assert.equal(summary.diagnosticComplete, complete);
+              assert.deepEqual(summary.gates.map(gate => gate.id), label === "candidate" ? gateSpecs.map(gate => gate.id) : []);
+              for (const gate of summary.gates) {
+                const spec = gateSpecs.find(spec => spec.id === gate.id);
+                assert.deepEqual(gate.expectedTests, spec.tests ?? []);
+                assert.equal(gate.step.name, "gate-" + gate.id); assert.equal(gate.step.command, spec.command ?? "pnpm");
+                const expectedArgs = spec.args.map(arg => arg === "<fixture-entry>" ? "<temp>/shared-module-proof/fixtures/" + id + "/main.mjs" :
+                  arg === "<lowering-out>" ? "<temp>/shared-module-work/gate-lowering-order/lowering-order" : arg);
+                assert.deepEqual(gate.step.args.slice(0, expectedArgs.length), expectedArgs);
+                if (gate.loweringArtifacts) for (const file of gate.loweringArtifacts) verifyFile(file);
+                if (gate.status === "passed" && gate.id === "lowering-order") {
+                  const observed = verifyLowering(gate.loweringArtifacts, name =>
+                    readFileSync(join(dir, "gates", "lowering-order", name), "utf8"));
+                  assert.deepEqual(gate.lowering, observed);
+                }
+                if (gate.artifact) {
+                  verifyFile(gate.artifact);
+                  const data = JSON.parse(readFileSync(join(dir, gate.artifact.path), "utf8"));
+                  const rows = data.testResults.flatMap(suite => suite.assertionResults);
+                  const selected = spec.tests.flatMap(name => rows.filter(row => row.fullName === name || row.fullName.endsWith(" " + name)));
+                  assert.deepEqual(gate.tests, selected.map(row => ({ name: row.fullName, status: row.status })));
+                  assert.equal(gate.executedCount, rows.filter(row => !["pending", "skipped", "todo"].includes(row.status)).length);
+                  if (gate.status === "passed") {
+                    for (const name of spec.tests) {
+                      const found = selected.filter(row => row.fullName === name || row.fullName.endsWith(" " + name));
+                      assert.equal(found.length, 1); assert.equal(found[0].status, "passed");
+                    }
+                    assert.equal(gate.executedCount, spec.tests.length); assert.equal(data.success, true);
+                    assert.equal(data.numFailedTests, 0); assert.equal(data.numFailedTestSuites, 0);
+                  }
+                }
+                if (gate.status === "passed") {
+                  assert.equal(gate.step.status, "completed"); assert.equal(gate.attempted, true);
+                  if (spec.tests) assert.ok(gate.artifact);
+                }
+              }
+              const qualified = complete && item.oracle.expectedMatched && item.ir.status === "passed" &&
+                ["plain", "san"].every(flavor => item.flavors[flavor].status === "passed") && summary.gates.every(gate => gate.status === "passed");
+              assert.equal(summary.qualificationComplete, qualified);
+              if (label === "baseline") {
+                assert.equal(summary.baselineComplete, baselineComplete(summary));
+                assert.equal(summary.regressionObserved, crashRegression(item, execution => readFileSync(join(dir, execution.stderr), "utf8")));
+                assert.equal(summary.status, qualified ? "passed" : summary.baselineComplete && summary.regressionObserved ? "regression-observed" : "failed");
+              } else assert.equal(summary.status, qualified ? "passed" : "failed");
+            }
+            const baseline = result.sources.baseline.summary, candidate = result.sources.candidate.summary;
+            assert.equal(baseline.fixtureDigest, candidate.fixtureDigest);
+            result.nativeIdentity = { runtimeManifestEqual: baseline.runtimeManifestSha256 === candidate.runtimeManifestSha256,
+              helperBinaryEqual: baseline.helperBinarySha256 === candidate.helperBinarySha256,
+              bridgeBinaryEqual: baseline.bridgeBuild.currentBridgeSha256 === candidate.bridgeBuild.currentBridgeSha256,
+              sharedPack: false };
+            result.diagnosticComplete = baselineComplete(baseline) && candidate.diagnosticComplete;
+            result.qualificationComplete = result.diagnosticComplete && baseline.regressionObserved && candidate.qualificationComplete;
+          } catch (error) { result.error = String(error); result.diagnosticComplete = false; result.qualificationComplete = false; }
+          writeFileSync(join(process.env.RUNNER_TEMP, "function-instantiation-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
+          console.log(JSON.stringify({ diagnosticComplete: result.diagnosticComplete, qualificationComplete: result.qualificationComplete }));
+          if (!result.qualificationComplete) { console.error("[shared-module-comparison] FAILED (exit 1)"); process.exitCode = 1; }
+          COMPARE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: function-instantiation-aggregate
+          path: ${{ runner.temp }}/function-instantiation-aggregate.json
+          if-no-files-found: error
+          retention-days: 3
