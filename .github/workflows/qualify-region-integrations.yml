@@ -1,0 +1,415 @@
+name: Qualify region runtime integrations
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-region-integrations.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qualify-region-integrations
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    name: ${{ matrix.id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - id: effect-plain-1
+            minutes: 90
+            proof: 65
+          - id: effect-plain-2
+            minutes: 90
+            proof: 65
+          - id: effect-plain-3
+            minutes: 90
+            proof: 65
+          - id: effect-plain-4
+            minutes: 90
+            proof: 65
+          - id: effect-plain-5
+            minutes: 90
+            proof: 65
+          - id: effect-plain-6
+            minutes: 90
+            proof: 65
+          - id: effect-plain-7
+            minutes: 90
+            proof: 65
+          - id: effect-plain-8
+            minutes: 90
+            proof: 65
+          - id: effect-plain-9
+            minutes: 90
+            proof: 65
+          - id: effect-plain-10
+            minutes: 90
+            proof: 65
+          - id: effect-plain-11
+            minutes: 90
+            proof: 65
+          - id: effect-plain-12
+            minutes: 90
+            proof: 65
+          - id: effect-plain-13
+            minutes: 90
+            proof: 65
+          - id: effect-plain-14
+            minutes: 90
+            proof: 65
+          - id: effect-plain-15
+            minutes: 90
+            proof: 65
+          - id: effect-plain-16
+            minutes: 90
+            proof: 65
+          - id: effect-san-1
+            minutes: 90
+            proof: 65
+          - id: effect-san-2
+            minutes: 90
+            proof: 65
+          - id: effect-san-3
+            minutes: 90
+            proof: 65
+          - id: effect-san-4
+            minutes: 90
+            proof: 65
+          - id: effect-san-5
+            minutes: 90
+            proof: 65
+          - id: effect-san-6
+            minutes: 90
+            proof: 65
+          - id: effect-san-7
+            minutes: 90
+            proof: 65
+          - id: effect-san-8
+            minutes: 90
+            proof: 65
+          - id: effect-san-9
+            minutes: 90
+            proof: 65
+          - id: effect-san-10
+            minutes: 90
+            proof: 65
+          - id: effect-san-11
+            minutes: 90
+            proof: 65
+          - id: effect-san-12
+            minutes: 90
+            proof: 65
+          - id: effect-san-13
+            minutes: 90
+            proof: 65
+          - id: effect-san-14
+            minutes: 90
+            proof: 65
+          - id: effect-san-15
+            minutes: 90
+            proof: 65
+          - id: effect-san-16
+            minutes: 90
+            proof: 65
+          - id: three-sanitized-nodes
+            minutes: 40
+            proof: 25
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      GROUP_ID: ${{ matrix.id }}
+      PROOF_MINUTES: ${{ matrix.proof }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: region-san-native
+          run-id: 41171675587
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/region-native
+      - name: Verify and restore the pinned native artifact
+        run: |
+          node --input-type=module <<'RESTORE'
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const dir=process.env.RUNNER_TEMP+"/region-native";
+          const receipt=JSON.parse(readFileSync(dir+"/native.json","utf8"));
+          if(receipt.head!=="0e17511aaa44ede74b06d6483a0f802d30e7846e"||receipt.runId!=="41171675587"||receipt.workflow!=="85264e5f036dbf93bb7519c2e8aae63f2c51ebc9"||receipt.sourceVerifiedAfter!==true)throw Error("native artifact identity differs");
+          if(createHash("sha256").update(readFileSync(dir+"/native.tar.gz")).digest("hex")!==receipt.archiveSha256)throw Error("native artifact hash differs");
+          RESTORE
+          tar -xzf "$RUNNER_TEMP/region-native/native.tar.gz"
+          node packages/runtime-linux-x64-gnu/scripts/verify.mjs
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Qualify the selected integration
+        run: |
+          cat > "$RUNNER_TEMP/region-integrations.mjs" <<'PROOF'
+          import { spawn, spawnSync } from "node:child_process";
+          import { appendFileSync, globSync, mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+          import { cpus, totalmem } from "node:os";
+          import { basename, join, relative } from "node:path";
+          import { createHash } from "node:crypto";
+          import { pathToFileURL } from "node:url";
+          const head="0e17511aaa44ede74b06d6483a0f802d30e7846e",allowed=["effect-plain-1","effect-plain-2","effect-plain-3","effect-plain-4","effect-plain-5","effect-plain-6","effect-plain-7","effect-plain-8","effect-plain-9","effect-plain-10","effect-plain-11","effect-plain-12","effect-plain-13","effect-plain-14","effect-plain-15","effect-plain-16","effect-san-1","effect-san-2","effect-san-3","effect-san-4","effect-san-5","effect-san-6","effect-san-7","effect-san-8","effect-san-9","effect-san-10","effect-san-11","effect-san-12","effect-san-13","effect-san-14","effect-san-15","effect-san-16","three-sanitized-nodes"];
+          const root=process.cwd(),id=process.env.GROUP_ID;
+          const out=join(process.env.RUNNER_TEMP,"region-integrations",id??"invalid");
+          mkdirSync(out,{recursive:true});
+          const report={head,id,workflow:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,status:"running",completeSuite:false,startedAt:new Date().toISOString(),steps:[]};
+          const minutes=Number(process.env.PROOF_MINUTES);
+          if(!allowed.includes(id)||!Number.isSafeInteger(minutes)||minutes<1||minutes>65)throw Error("invalid selected group or budget");
+          const deadline=Date.now()+minutes*60_000;
+          const scrub=s=>String(s).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
+          const save=()=>writeFileSync(join(out,"receipt.json"),scrub(JSON.stringify(report,null,2))+"\n");
+          const hash=file=>createHash("sha256").update(readFileSync(file)).digest("hex");
+          const scopeState=unit=>{
+           if(!/^region-integration-\d+-\d+-(?:effect-(?:plain|san)-\d+|three-sanitized-nodes)\.scope$/.test(unit))throw Error("invalid owned scope");
+           const result=spawnSync("systemctl",["show","--property=LoadState","--property=ActiveState",unit],{encoding:"utf8",timeout:3000});
+           const fields=Object.fromEntries(result.stdout?.trim().split("\n").map(line=>line.split("=",2))??[]);
+           if(result.error||!fields.LoadState||!fields.ActiveState)throw Error("scope state unavailable: "+result.stderr);
+           return fields;
+          };
+          const scopeActive=unit=>{
+           if(!unit)return false;
+           const state=scopeState(unit);
+           return state.LoadState!=="not-found"&&!["inactive","failed"].includes(state.ActiveState);
+          };
+          const execute=async(command,args,{capture=false,logfile,scope,env={},timeoutMs=deadline-Date.now()}={})=>{
+           const start=Date.now();
+           if(timeoutMs<=0)throw Error("qualification deadline expired");
+           const result=await new Promise((resolve)=>{
+            let stdout="",stderr="",timedOut=false,cancelled=false,spawnError,forceTimer,completionTimer,closed=false,settled=false,cleanup=Promise.resolve({}),cleanupErrors=[];
+            const child=spawn(command,args,{cwd:root,env:{...process.env,...env},stdio:(capture||logfile)?["ignore","pipe","pipe"]:"inherit",detached:true});
+            const alive=()=>{if(!Number.isInteger(child.pid)||child.pid<=1)return false;try{process.kill(-child.pid,0);return true;}catch(error){if(error.code==="ESRCH")return false;throw error;}};
+            const kill=signal=>{
+             try{if(scope&&scopeActive(scope)){const result=spawnSync("sudo",["-n","systemctl","kill","--kill-whom=all","--signal="+signal,scope],{encoding:"utf8",timeout:3000});if(result.error)cleanupErrors.push(String(result.error));}}catch(error){cleanupErrors.push(String(error));}
+             if(Number.isInteger(child.pid)&&child.pid>1)try{process.kill(-child.pid,signal);}catch(error){if(error.code!=="ESRCH")cleanupErrors.push(String(error));}
+            };
+            const cancel=()=>{cancelled=true;kill("SIGTERM");forceTimer=setTimeout(()=>kill("SIGKILL"),1000);};
+            process.once("SIGTERM",cancel);process.once("SIGINT",cancel);
+            const pause=ms=>new Promise(done=>setTimeout(done,ms));
+            const drain=async()=>{
+             await pause(100);
+             const graceUntil=Date.now()+1000;
+             while(scopeActive(scope)&&Date.now()<graceUntil)await pause(100);
+             const leftoverChildren=alive()||scopeActive(scope);
+             if(leftoverChildren){
+              kill("SIGTERM");
+              const until=Date.now()+1000;
+              while((alive()||scopeActive(scope))&&Date.now()<until)await pause(100);
+              if(alive()||scopeActive(scope))kill("SIGKILL");
+              const forcedUntil=Date.now()+9000;
+              while((alive()||scopeActive(scope))&&Date.now()<forcedUntil)await pause(100);
+             }
+             return {leftoverChildren,groupDrained:!alive(),scopeDrained:!scopeActive(scope)};
+            };
+            if(logfile){
+             for(const stream of [child.stdout,child.stderr])stream.on("data",data=>{appendFileSync(logfile,data);process.stdout.write(data);});
+            }
+            if(capture){
+             child.stdout.on("data",data=>{stdout+=data;if(stdout.length>4*1024*1024)kill("SIGKILL");});
+             child.stderr.on("data",data=>{stderr+=data;if(stderr.length>4*1024*1024)kill("SIGKILL");});
+            }
+            const timer=setTimeout(()=>{
+             timedOut=true;kill("SIGTERM");
+             forceTimer=setTimeout(()=>kill("SIGKILL"),1000);
+            },timeoutMs);
+            const finish=(code,signal,group)=>{
+             if(settled)return;settled=true;
+             clearTimeout(timer);clearTimeout(forceTimer);clearTimeout(completionTimer);
+             process.removeListener("SIGTERM",cancel);process.removeListener("SIGINT",cancel);
+             resolve({code,signal,timedOut,cancelled,spawnError,stdout,stderr,cleanupErrors,...group});
+            };
+            child.once("error",error=>{spawnError=String(error);});
+            // Start at exit, not close: orphaned grandchildren may still hold stdout open.
+            child.once("exit",(code,signal)=>{
+             cleanup=drain().catch(error=>({groupDrained:false,groupError:String(error)}));
+             cleanup.then(group=>{
+              if(closed)return;
+              // A descendant outside the drained group may still hold a captured pipe.
+              // Bound observation too; keep unresolved ownership in the failed receipt.
+              completionTimer=setTimeout(()=>{
+               if(closed)return;
+               child.stdout?.destroy();child.stderr?.destroy();
+               finish(code,signal,{...group,groupDrained:false,pipeDrainIncomplete:true});
+              },1000);
+             });
+            });
+            child.once("close",async(code,signal)=>{
+             closed=true;const group=await cleanup;finish(code,signal,group);
+            });
+           });
+           report.steps.push({command,args,seconds:Math.round((Date.now()-start)/1000),code:result.code,signal:result.signal,timedOut:result.timedOut,cancelled:result.cancelled,scope,scopeDrained:result.scopeDrained,leftoverChildren:result.leftoverChildren,groupDrained:result.groupDrained});save();
+           if(result.code!==0||result.signal||result.timedOut||result.cancelled||result.scopeDrained===false||result.cleanupErrors.length||result.spawnError||result.leftoverChildren||result.groupDrained===false)throw Error(command+" failed: "+JSON.stringify({...result,stdout:result.stdout.slice(-2000),stderr:result.stderr.slice(-2000)}));
+           return result.stdout.trim();
+          };
+
+          const capture=(command,args)=>execute(command,args,{capture:true,timeoutMs:30_000});
+          const expectedInputs={"packages/runtime/src/scr_region.c":"9f6c6ffac906d79c9c643a043cabdb117c5576cbc85190e174f2d863425fdf30","packages/runtime/src/scr_region.test.c":"a38ae232cab4b0526f65b3d57f6e946bc686d56353286b8e01b3b4839b03be34","packages/runtime/src/scr_region.test.ts":"3328b7dc3d2d80878574770f0fbbd41dbae11c3f09ba4e74a3ecdae1c17dc2a0","packages/compiler/src/backend/native/runtime-inputs.ts":"261d9462b2464d085d44f1c767e82adbbc3672c787b71c602de1046f3ccf45d8"};
+          const source=async()=>{
+           if(await capture("git",["rev-parse","HEAD"])!==head)throw Error("head differs");
+           if(await capture("git",["status","--porcelain"])!=="")throw Error("source changed");
+           for(const [file,expected]of Object.entries(expectedInputs))if(hash(file)!==expected)throw Error("input differs: "+file);
+           report.inputs=expectedInputs;
+          };
+          const pending=t=>["skipped","todo"].includes(t.status);
+          save();
+          try{
+           await source();report.sourceVerifiedBefore=true;
+           if(process.platform!=="linux"||process.arch!=="x64"||process.version!=="v24.22.0"||process.getuid()===0)throw Error("host or unprivileged Node pin differs");
+           report.uid=process.getuid();
+           report.capacity={memoryBytes:totalmem(),cores:cpus().length,swap:readFileSync("/proc/swaps","utf8"),cgroup:readFileSync("/proc/self/cgroup","utf8")};
+           const swapKiB=report.capacity.swap.trim().split("\n").slice(1).reduce((sum,line)=>sum+Number(line.trim().split(/\s+/)[2]),0);
+           if(totalmem()<14*1024**3||swapKiB<1024**2||!existsSync("/run/systemd/system"))throw Error("canonical memory/swap/systemd unavailable");
+           report.tools={node:process.version,pnpm:await capture("pnpm",["--version"]),llvm:await capture("llvm-config",["--version"]),nm:await capture("llvm-nm",["--version"])};
+           if(report.tools.pnpm!=="11.1.3"||report.tools.llvm!=="22.1.8"||!report.tools.nm.includes("22.1.8"))throw Error("tool pin differs");
+           const native=JSON.parse(readFileSync(join(process.env.RUNNER_TEMP,"region-native","native.json"),"utf8"));
+           if(native.head!==head||native.runId!=="41171675587"||native.workflow!=="85264e5f036dbf93bb7519c2e8aae63f2c51ebc9"||native.sourceVerifiedAfter!==true)throw Error("native artifact identity differs");
+           report.native=native;
+           for(const target of ["linux-x64-gnu"]){
+            await execute("node",["packages/runtime-"+target+"/scripts/verify.mjs"]);
+            const manifest=JSON.parse(readFileSync("packages/runtime-"+target+"/runtime-pack.json","utf8"));
+            if(manifest.runtime_abi.version!==48)throw Error("runtime ABI differs");
+           }
+           report.helper=JSON.parse(await capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen",["version","--format=json"]));
+           if(report.helper.protocol_version!=="1"||report.helper.llvm_version!=="22.1.8")throw Error("helper identity differs");
+           const isThree=id==="three-sanitized-nodes";
+           const task={name:id,args:["test"],env:{SCRIPTC_TEST_WORKERS:"1",SCRIPTC_EFFECT_TEST_CONCURRENCY:"1",SCRIPTC_TEST_SHARD:"",SCRIPTC_SAN:"1",SCRIPTC_THREE_SANITIZED_NODES_JOB:"",ASAN_OPTIONS:"detect_leaks=0",LSAN_OPTIONS:""}};
+           const expectedCases={};
+           if(isThree){
+            task.args.push("tests/harness/three.test.ts","-t","'nodes' runs statically through LLVM on 'native'");
+            task.env.ASAN_OPTIONS="detect_leaks=1";
+            task.env.LSAN_OPTIONS="suppressions="+join(root,"tests/harness/lsan.supp")+":print_suppressions=0";
+            const fixtures=["math","spatial","attributes","geometry","scene","materials","mesh","raycast-mesh","raycast-camera","raycast-lines-points","buffers-animation","collision","package-imports","curves","textures","math-extended","procedural-geometry","render-data","mesh-workflows","animation","loaders","gltf","nodes"];
+            expectedCases["tests/harness/three.test.ts"]=fixtures.flatMap(fixture=>["native","wasm32-wasi"].map(target=>({name:"published three.js '"+fixture+"' runs statically through LLVM on '"+target+"'",status:fixture==="nodes"&&target==="native"?"passed":"skipped"})));
+           }else{
+            const [,flavor,shardText]=id.split("-"),shard=Number(shardText);
+            if(!Number.isInteger(shard)||shard<1||shard>16)throw Error("invalid integration shard");
+            task.env.SCRIPTC_TEST_SHARD=shard+"/16";task.env.SCRIPTC_SAN=flavor==="san"?"1":"";
+            const {balancedShardSelect}=await import(pathToFileURL(join(root,"tests/harness/shard.ts")));
+            report.fixtures={};
+            for(const [version,total,fallback]of [["effect",125,120],["effect4",180,40]]){
+             const file="tests/harness/"+version+".test.ts";
+             task.args.push(file);
+             const all=globSync(join(root,"tests/fixtures/"+version+"/*.ts")).filter(file=>version!=="effect4"||!file.endsWith(".d.ts")).sort();
+             if(all.length!==total)throw Error("Effect fixture inventory differs");
+             const costs=JSON.parse(readFileSync("tests/harness/"+version+"-costs.json","utf8"));
+             const chosen=balancedShardSelect(all,basename,file=>costs[basename(file)]??fallback,{index:shard,count:16});
+             report.fixtures[version]=chosen.map(file=>relative(root,file));
+             expectedCases[file]=chosen.map(file=>({name:"published Effect "+(version==="effect4"?"4 ":"")+file+" matches Node statically",status:"passed"}));
+            }
+           }
+           const files=Object.keys(expectedCases).sort();
+           report.task={name:task.name,args:task.args,env:task.env,files};
+           report.baseEnv={NODE_OPTIONS:process.env.NODE_OPTIONS};
+           const output=join(out,"vitest.json"),log=join(out,"test.log");
+           if(existsSync(output)||existsSync(log))throw Error("test evidence already exists");
+           writeFileSync(log,"");
+           const scope="region-integration-"+report.runId+"-"+report.attempt+"-"+id+".scope";
+           if(scopeState(scope).LoadState!=="not-found")throw Error("scope already exists");
+           report.scope=scope;
+           const started=Date.now();
+           let failure;
+           console.log("START "+id);
+           try{await execute("sudo",["-n","--preserve-env","systemd-run","--scope","--quiet","--unit="+scope,"-p","MemoryMax=15G","-p","OOMPolicy=continue","--uid="+process.getuid(),"--gid="+process.getgid(),"--","env","PATH="+process.env.PATH,"HOME="+process.env.HOME,"NODE_OPTIONS=--max-old-space-size=4096","pnpm",...task.args,"--reporter=default","--reporter=json","--outputFile="+output],{env:task.env,logfile:log,scope});}catch(error){failure=error;}
+           if(!existsSync(output)||statSync(output).mtimeMs<started)throw Error("fresh reporter output missing");
+           const data=JSON.parse(readFileSync(output,"utf8")),cases=data.testResults.flatMap(suite=>suite.assertionResults);
+           const observedFiles=data.testResults.map(suite=>relative(root,suite.name)).sort();
+           report.result={success:data.success,passed:cases.filter(t=>t.status==="passed").length,pending:cases.filter(pending).map(t=>t.fullName),failed:cases.filter(t=>t.status==="failed").map(t=>t.fullName),files:observedFiles,reportSha256:hash(output),logSha256:hash(log)};
+           if(failure)throw failure;
+           if(data.startTime<started-1000||data.success!==true||data.numFailedTests!==0||data.numFailedTestSuites!==0||cases.some(t=>t.status!=="passed"&&!pending(t))||cases.some(t=>t.failureMessages?.length)||JSON.stringify(observedFiles)!==JSON.stringify(files))throw Error("test result or file coverage differs");
+           for(const suite of data.testResults){
+            const file=relative(root,suite.name);
+            const observed=suite.assertionResults.map(test=>({name:test.fullName,status:test.status})).sort((a,b)=>a.name.localeCompare(b.name));
+            const expected=expectedCases[file].sort((a,b)=>a.name.localeCompare(b.name));
+            if(JSON.stringify(observed)!==JSON.stringify(expected))throw Error("integration case inventory differs: "+file);
+           }
+           if(isThree&&(cases.length!==46||report.result.passed!==1||report.result.pending.length!==45))throw Error("three.js coverage differs");
+           if(!isThree&&report.result.pending.length!==0)throw Error("Effect fixture skipped");
+           report.status="passed";
+          }catch(error){report.status="failed";report.error=scrub(error.stack??error);process.exitCode=1;}
+          finally{
+           try{await source();report.sourceVerifiedAfter=true;}catch(error){report.status="failed";report.sourceError=scrub(error);process.exitCode=1;}
+           report.finishedAt=new Date().toISOString();save();
+           console.log("QUALIFICATION "+JSON.stringify({id,status:report.status,result:report.result}));
+           if(process.exitCode)console.error("[scriptc-region-integrations] FAILED (exit 1)");
+          }
+          PROOF
+          ulimit -c 0
+          node "$RUNNER_TEMP/region-integrations.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: region-integration-proof-${{ matrix.id }}
+          path: ${{ runner.temp }}/region-integrations
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    needs: integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: region-integration-proof-*
+          path: ${{ runner.temp }}/integration-results
+      - name: Verify the complete integration inventory
+        run: |
+          node --input-type=module <<'AGGREGATE'
+          import { readFileSync,readdirSync,writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          import { createHash } from "node:crypto";
+          const head="0e17511aaa44ede74b06d6483a0f802d30e7846e",expected=["effect-plain-1","effect-plain-2","effect-plain-3","effect-plain-4","effect-plain-5","effect-plain-6","effect-plain-7","effect-plain-8","effect-plain-9","effect-plain-10","effect-plain-11","effect-plain-12","effect-plain-13","effect-plain-14","effect-plain-15","effect-plain-16","effect-san-1","effect-san-2","effect-san-3","effect-san-4","effect-san-5","effect-san-6","effect-san-7","effect-san-8","effect-san-9","effect-san-10","effect-san-11","effect-san-12","effect-san-13","effect-san-14","effect-san-15","effect-san-16","three-sanitized-nodes"];
+          const files=[];
+          function walk(dir){for(const entry of readdirSync(dir,{withFileTypes:true})){const path=join(dir,entry.name);if(entry.isDirectory())walk(path);else if(entry.name==="receipt.json")files.push(path);}}
+          walk(process.env.RUNNER_TEMP+"/integration-results");
+          const receipts=files.map(file=>({file,data:JSON.parse(readFileSync(file,"utf8"))}));
+          if(JSON.stringify(receipts.map(r=>r.data.id).sort())!==JSON.stringify([...expected].sort()))throw Error("integration receipts incomplete or duplicated");
+          for(const {file,data}of receipts){
+           if(data.head!==head||data.runId!==process.env.GITHUB_RUN_ID||data.workflow!==process.env.GITHUB_SHA||data.status!=="passed"||data.sourceVerifiedBefore!==true||data.sourceVerifiedAfter!==true||data.result.failed.length!==0)throw Error("integration did not qualify: "+data.id);
+           for(const [name,digest]of [["vitest.json",data.result.reportSha256],["test.log",data.result.logSha256]])if(createHash("sha256").update(readFileSync(join(file,"..",name))).digest("hex")!==digest)throw Error("integration evidence changed");
+          }
+          for(const flavor of ["plain","san"]){
+           const selected=receipts.filter(r=>r.data.id.startsWith("effect-"+flavor+"-"));
+           for(const [version,total]of [["effect",125],["effect4",180]]){
+            const fixtures=selected.flatMap(r=>r.data.fixtures[version]);
+            if(fixtures.length!==total||new Set(fixtures).size!==total)throw Error("Effect union missing or duplicated");
+           }
+          }
+          const summary={head,workflow:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,status:"passed",completeSuite:false,groups:receipts.map(({data})=>({id:data.id,passed:data.result.passed,skipped:data.result.pending.length,reportSha256:data.result.reportSha256})),effectComparisons:610,threeNodesComparisons:1};
+          writeFileSync(process.env.RUNNER_TEMP+"/region-integrations-summary.json",JSON.stringify(summary,null,2)+"\n");
+          console.log(JSON.stringify(summary));
+          AGGREGATE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: region-integrations-summary
+          path: ${{ runner.temp }}/region-integrations-summary.json
+          if-no-files-found: error
+          retention-days: 1
