@@ -1,0 +1,372 @@
+name: Diagnose retrying initializer locals
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-retrying-initializer-locals.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-retrying-initializer-locals
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            source: 71a9441c824262150f35acd2b8359f156ed3289c
+          - label: candidate
+            source: 022f251fc38b4c169333f133398ee5150172f2bc
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      DIAGNOSTIC_SOURCE: ${{ matrix.source }}
+      DIAGNOSTIC_LABEL: ${{ matrix.label }}
+      SCRIPTC_CHECKER: tsc-ts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = "$DIAGNOSTIC_SOURCE"
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Observe initializer binding and storage emission
+        run: |
+          cat > "$RUNNER_TEMP/initializer-locals.mjs" <<'PROOF'
+          import assert from "node:assert/strict";
+          import { spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+          import { dirname, join, relative } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+          const root = process.cwd(), head = process.env.DIAGNOSTIC_SOURCE;
+          const temp = process.env.RUNNER_TEMP, out = join(temp, "initializer-locals-proof"), work = join(temp, "initializer-locals-work");
+          const fixtureSha256 = "a96777cca9f409031ebc7cce9471e0e9994287f5378f60953ced504e0bc5f94a";
+          const testPath = "packages/compiler/test/int32-local-emission.test.ts";
+          const testSha256 = "9ee05470d4a3e15294fd56380063ff8a3838452c34052f604b11f5ca687400bf";
+          const expected = "673909 3 6\n";
+          const digest = value => createHash("sha256").update(value).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const scrub = value => String(value).split(root).join("<repo>").split(temp).join("<temp>");
+          const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
+          const testSource = readFileSync(testPath, "utf8");
+          assert.equal(digest(testSource), testSha256);
+          const definitions = [...testSource.matchAll(/const moduleSource = `([\s\S]*?)`;/g)];
+          assert.equal(definitions.length, 1);
+          const moduleSource = definitions[0][1]; assert.equal(digest(moduleSource), fixtureSha256);
+          const collect = (value, predicate, found = []) => {
+            if (value && typeof value === "object") {
+              if (predicate(value)) found.push(value);
+              for (const child of Object.values(value)) collect(child, predicate, found);
+            }
+            return found;
+          };
+          const functionBody = (ll, name) => ll.match(new RegExp(
+            "define internal [^\\n]+ @sc_(?:b)?f_" + name + "(?:\\.i32)?\\([^\\n]*\\) #0 \\{ ;([\\s\\S]*?)\\n\\}",
+          ))?.[1] ?? null;
+          const live = fn => {
+            const pure = /^\s*(%[\w.]+) = (?:[su]itofp|fpto[su]i|f(?:add|sub|mul|div|neg|cmp)|select|[sz]ext|trunc|add|sub|mul|and|or|xor|shl|lshr|ashr|icmp|phi|freeze|bitcast|getelementptr|load) /;
+            let lines = fn.split("\n");
+            for (let changed = true; changed;) {
+              changed = false; const text = lines.join("\n");
+              lines = lines.filter(line => {
+                const name = line.match(pure)?.[1]; if (!name) return true;
+                const uses = text.split(new RegExp(name.replace(/\./g, "\\.") + "(?![\\w.])")).length - 2;
+                if (uses > 0) return true; changed = true; return false;
+              });
+            }
+            return lines.join("\n");
+          };
+          const carriers = fn => {
+            const body = live(fn), start = body.search(/\nloop\.c\d+:/);
+            if (start <= 0) return null;
+            const end = body.indexOf("\nloop.e", start), loop = body.slice(start, end < 0 ? undefined : end);
+            const reads = new Set([...loop.matchAll(/^\s*(%[\w.]+) = load i32, ptr %sc_l_\w+$/gm)].map(m => m[1]));
+            return [
+              ...loop.matchAll(/^\s*(?:%[\w.]+ = load double, ptr|store double [^,]+, ptr) %sc_l_\w+$/gm),
+              ...[...loop.matchAll(/^\s*%[\w.]+ = [su]itofp i32 (%[\w.]+) to double$/gm)].filter(m => reads.has(m[1])),
+            ].map(m => m[0].trim());
+          };
+          const storageObservations = (ll, debug = false) => {
+            if (debug) return { predicates: { debugNoI32V: !/alloca i32 ; v\n/.test(ll) },
+              vStorage: ll.split("\n").filter(line => /alloca .*; (?:module binding )?v$|@sc_g_\w*_v\b/.test(line)) };
+            const init = functionBody(ll, "_x25_init_0"), step = functionBody(ll, "step");
+            assert.notEqual(init, null, "original initializer LLVM body was not found");
+            assert.notEqual(step, null, "original step LLVM body was not found");
+            const foundCarriers = carriers(init);
+            return { predicates: {
+              vI32: /alloca i32 ; v\n/.test(init),
+              vZeroStore: /store i32 0, ptr %sc_l__x25_g_\w+_v\n/.test(init),
+              noGlobalDoubleV: !/(?:load double, ptr|store double [^,]+, ptr) @sc_g_\w*_v\b/.test(ll),
+              noLoopDoubleCarriers: foundCarriers !== null && foundCarriers.length === 0,
+              sharedNotI32: !/alloca i32 ; shared\n/.test(init),
+              sharedGlobalStore: /store double [^,]+, ptr @sc_g_\w*_shared\b/.test(init),
+              stepUrem32: / = urem i32 /.test(step),
+              stepNoUrem64: !/ = urem i64 /.test(step),
+            }, loopFound: foundCarriers !== null, carriers: foundCarriers,
+              vStorage: ll.split("\n").filter(line => /alloca .*; (?:module binding )?v$|@sc_g_\w*_v\b/.test(line)) };
+          };
+          const analyzeBindings = (mod, findInitializerBindings) => {
+            const bindings = [...findInitializerBindings(mod)].map(([initializer, globals]) => ({ initializer, globals }));
+            const globals = new Map((mod.globals ?? []).map(global => [global.id, global]));
+            const initializers = mod.functions.filter(fn => fn.body[0]?.kind === "if" &&
+              fn.body[0].cond.kind === "varRef" && globals.get(fn.body[0].cond.localId)?.type.kind === "bool").map(fn => {
+                const guardId = fn.body[0].cond.localId;
+                const writes = mod.functions.flatMap(owner => collect(owner.body, node =>
+                  ["assign", "assignExpr", "incDec", "varDecl", "forOf"].includes(node.kind) && node.localId === guardId)
+                  .map(node => ({ function: owner.name, kind: node.kind, value: node.value ?? null, loc: node.loc ?? null })));
+                return { name: fn.name, guardId, guard: globals.get(guardId), writes, writeCount: writes.length,
+                  bindings: bindings.find(row => row.initializer === fn.name)?.globals ?? [] };
+              });
+            assert.ok(initializers.length > 0, "no guarded initializer was observed");
+            const v = [...globals.values()].filter(global => global.name === "v");
+            assert.equal(v.length, 1);
+            return JSON.parse(JSON.stringify({ bindings, initializers, v: v[0] }));
+          };
+          async function inspectCase(id, entry, artifactDir) {
+            const output = join(artifactDir, "emission.json"), irPath = join(artifactDir, "program.ir.json");
+            const result = { id, head, status: "running", diagnosticComplete: false, qualificationComplete: false,
+              nativeExecution: false, timingProof: false, emissions: {} };
+            const persist = () => writeFileSync(output, scrub(JSON.stringify(result, null, 2)) + "\n");
+            try {
+              assert.equal(hash(entry), fixtureSha256);
+              const { compile, deserializeModule } = await import(pathToFileURL(join(root, "packages/compiler/dist/index.js")));
+              const { emitLlvmModule } = await import(pathToFileURL(join(root, "packages/compiler/dist/backend/llvm/emitter.js")));
+              const { findInitializerBindings } = await import(pathToFileURL(join(root, "packages/compiler/dist/ir/initializer-bindings.js")));
+              result.compile = await compile(entry, { outDir: artifactDir, outPath: irPath, outputKind: "ir" });
+              writeFileSync(join(artifactDir, "compile-result.json"), scrub(JSON.stringify(result.compile, null, 2)) + "\n");
+              assert.equal(result.compile.ok, true, "IR compilation failed");
+              assert.deepEqual(result.compile.artifact, { kind: "ir", path: irPath });
+              assert.equal((result.compile.warnings ?? []).filter(item => item.code === "SC8001").length, 0);
+              assert.deepEqual(result.compile.islands ?? { packages: [], modules: [] }, { packages: [], modules: [] });
+              result.ir = recordFile(irPath);
+              const irText = readFileSync(irPath, "utf8"), mod = deserializeModule(irText);
+              assert.equal(mod.irVersion, 17); assert.equal(mod.nodeIsland, undefined);
+              result.commonJsEntry = mod.commonJsEntry ?? false;
+              // Extension and lack of package metadata select the same CJS case as the original test.
+              assert.equal(result.commonJsEntry, id === "cjs");
+              result.analysis = analyzeBindings(mod, findInitializerBindings);
+              for (const mode of ["release", "debug"]) {
+                const emission = result.emissions[mode] = { status: "running", pointerBits: 64, debugSources: mode === "debug" };
+                try {
+                  const options = mode === "debug" ? { pointerBits: 64, debugSources: new Map([[entry, moduleSource]]) } : { pointerBits: 64 };
+                  const llvm = emitLlvmModule(deserializeModule(irText), options);
+                  const llvmPath = join(artifactDir, mode + ".ll"); writeFileSync(llvmPath, llvm);
+                  emission.artifact = recordFile(llvmPath); emission.observations = storageObservations(llvm, mode === "debug");
+                  emission.status = "completed";
+                  emission.originalAssertionsPassed = Object.values(emission.observations.predicates).every(Boolean);
+                } catch (error) { emission.status = "failed"; emission.error = scrub(error.stack ?? error); }
+                finally { persist(); }
+              }
+              assert.equal(hash(irPath), result.ir.sha256); assert.equal(hash(entry), fixtureSha256);
+              result.inputsVerifiedAfter = true;
+              result.diagnosticComplete = ["release", "debug"].every(mode => result.emissions[mode].status === "completed");
+              result.qualificationComplete = result.diagnosticComplete && ["release", "debug"].every(mode => result.emissions[mode].originalAssertionsPassed);
+              result.status = result.qualificationComplete ? "passed" : "failed";
+            } catch (error) { result.status = "failed"; result.error = scrub(error.stack ?? error); }
+            finally {
+              persist();
+              console.log(JSON.stringify({ id, status: result.status, diagnosticComplete: result.diagnosticComplete }));
+              if (!result.qualificationComplete) { console.error("[initializer-emission-case] FAILED (exit 1)"); process.exitCode = 1; }
+            }
+          }
+          const completeCase = item => item.oracle?.status === "completed" && item.oracle.expectedMatched === true &&
+            item.probe?.error === null && item.probe.signal === null &&
+            ["completed", "nonzero-exit"].includes(item.probe.status) && [0, 1].includes(item.probe.code) &&
+            item.evidence?.diagnosticComplete === true && item.evidence.inputsVerifiedAfter === true &&
+            item.evidence.compile?.ok === true && item.evidence.ir && item.evidence.analysis &&
+            ["release", "debug"].every(mode => item.evidence.emissions[mode]?.status === "completed" &&
+              item.evidence.emissions[mode].artifact && item.evidence.emissions[mode].observations) &&
+            item.artifactsVerifiedAfter === true;
+          if (process.argv[2] === "--case") {
+            await inspectCase(process.argv[3], process.argv[4], process.argv[5]);
+          } else {
+            mkdirSync(out); mkdirSync(work);
+            const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+              label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+            writeFileSync(join(work, ".diagnostic-owner.json"), JSON.stringify(owner), { flag: "wx" });
+            const report = { ...owner, head, scope: "retrying-initializer-locals", status: "running",
+              diagnosticComplete: false, qualificationComplete: false, nativeExecution: false, timingProof: false,
+              expectedCases: ["cjs", "esm"], expectedIRCompiles: 2, expectedLLVMEmissions: 4, steps: [], cases: [],
+              origin: { test: testPath, testSha256, fixtureSha256, expectedStdoutSha256: digest(expected) },
+              runnerSha256: hash(fileURLToPath(import.meta.url)), startedAt: new Date().toISOString() };
+            const save = () => writeFileSync(join(out, "summary.json"), scrub(JSON.stringify(report, null, 2)) + "\n");
+            let sequence = 0;
+            const execute = (name, command, args, seconds = 60, env = {}) => {
+              const stem = String(++sequence).padStart(2, "0") + "-" + name;
+              const stdout = join(out, stem + ".stdout.log"), stderr = join(out, stem + ".stderr.log");
+              const fds = [openSync(stdout, "wx"), openSync(stderr, "wx")], started = Date.now();
+              let result;
+              try {
+                result = spawnSync("timeout", ["--signal=TERM", "--kill-after=5s", seconds + "s", command, ...args],
+                  { cwd: root, env: { ...process.env, ...env }, stdio: ["ignore", ...fds] });
+              } finally { fds.forEach(closeSync); }
+              const observed = { name, command, args, seconds: (Date.now() - started) / 1000, limitSeconds: seconds,
+                code: result.status, signal: result.signal, error: result.error?.message ?? null,
+                stdout: relative(out, stdout), stderr: relative(out, stderr), stdoutSha256: hash(stdout), stderrSha256: hash(stderr),
+                stdoutBytes: lstatSync(stdout).size, stderrBytes: lstatSync(stderr).size };
+              observed.status = observed.error || [125, 126, 127].includes(observed.code) ? "tool-error" :
+                observed.signal ? "signal" : observed.code === 124 ? "timeout" : observed.code === 137 ? "killed" :
+                observed.code === 0 ? "completed" : "nonzero-exit";
+              report.steps.push(observed); save(); return observed;
+            };
+            const success = step => { assert.equal(step.status, "completed", step.name); return step; };
+            const text = step => {
+              assert.ok(step.stdoutBytes <= 16 * 1024 ** 2, "bounded reader exceeded; raw log retained");
+              return readFileSync(join(out, step.stdout), "utf8");
+            };
+            const capture = (name, command, args) => text(success(execute(name, command, args))).trim();
+            const sourceFiles = [
+              "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json",
+              "packages/compiler/tsconfig.json", "tsconfig.base.json", testPath,
+              "packages/compiler/src/index.ts", "packages/compiler/src/executable/prepare.ts",
+              "packages/compiler/src/frontend/lowering/lower-modules.ts", "packages/compiler/src/frontend/lowering/lowerer.ts",
+              "packages/compiler/src/frontend/ts7/checker-backend.ts", "packages/compiler/src/frontend/ts7/program-host.ts",
+              "packages/compiler/src/ir/initializer-bindings.ts", "packages/compiler/src/ir/int32-slots.ts",
+              "packages/compiler/src/ir/ir.ts", "packages/compiler/src/ir/serialize.ts", "packages/compiler/src/ir/node-index.ts",
+              "packages/compiler/src/backend/llvm/emitter.ts", "packages/compiler/src/backend/llvm/emit-function.ts",
+              "packages/compiler/src/backend/llvm/int32-abi.ts", "packages/compiler/src/backend/llvm/common.ts",
+            ];
+            const source = () => {
+              assert.equal(capture("source-head", "git", ["rev-parse", "HEAD"]), head);
+              assert.equal(capture("source-status", "git", ["status", "--porcelain"]), "");
+              success(execute("source-diff", "git", ["diff", "--exit-code", "HEAD"]));
+              return Object.fromEntries(sourceFiles.map(file => [file, hash(file)]));
+            };
+            let verifyInputs = null;
+            try {
+              report.sourceInputs = source(); report.sourceVerifiedBefore = true;
+              assert.equal(process.version, "v24.22.1"); assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
+              report.tools = { node: process.version, nodeBinarySha256: hash(realpathSync(process.execPath)),
+                pnpm: capture("pnpm", "pnpm", ["--version"]) }; assert.equal(report.tools.pnpm, "11.1.3");
+              report.dependencies = execute("dependency-inventory", "pnpm", ["list", "--depth", "0", "--json"]); success(report.dependencies);
+              report.build = execute("workspace-build", "pnpm", ["build"], 600); success(report.build);
+              const { checkerBackend, hostTscTsExecutable } = await import(pathToFileURL(join(root, "packages/compiler/dist/frontend/ts7/checker-backend.js")));
+              assert.equal(checkerBackend(), "tsc-ts");
+              const checker = realpathSync(hostTscTsExecutable());
+              const inputPaths = [fileURLToPath(import.meta.url), realpathSync(process.execPath), checker,
+                ...["typescript", "typescript5", "tsc-ts"].flatMap(name => [
+                  join(root, "packages/compiler/node_modules", name, "package.json")]),
+                ...["index.js", "backend/llvm/emitter.js", "backend/llvm/emit-function.js", "ir/initializer-bindings.js",
+                  "ir/int32-slots.js", "frontend/lowering/lower-modules.js"].map(file => join(root, "packages/compiler/dist", file))];
+              report.executionInputs = Object.fromEntries(inputPaths.map(path => [path, hash(path)]));
+              report.checker = { backend: checkerBackend(), path: checker, sha256: hash(checker) };
+              report.packageVersions = Object.fromEntries(["typescript", "typescript5", "tsc-ts"].map(name =>
+                [name, JSON.parse(readFileSync(join(root, "packages/compiler/node_modules", name, "package.json"), "utf8")).version]));
+              assert.deepEqual(report.packageVersions, { typescript: "7.0.2", typescript5: "5.9.3", "tsc-ts": "0.0.10" });
+              verifyInputs = () => {
+                for (const [path, sha256] of Object.entries(report.executionInputs)) assert.equal(hash(path), sha256);
+                assert.equal(capture("pnpm-after", "pnpm", ["--version"]), report.tools.pnpm);
+                report.executionInputsVerifiedAfter = true;
+              };
+              copyFileSync(testPath, join(out, "int32-local-emission.test.ts"));
+              for (const [id, filename] of [["cjs", "main.ts"], ["esm", "main.mts"]]) {
+                const dir = join(work, id), artifacts = join(out, id); mkdirSync(dir); mkdirSync(artifacts);
+                const entry = join(dir, filename), copy = join(artifacts, filename);
+                writeFileSync(entry, moduleSource); writeFileSync(copy, moduleSource);
+                writeFileSync(join(artifacts, "expected.stdout.log"), expected);
+                symlinkSync(join(root, "node_modules"), join(dir, "node_modules"), "dir");
+                const verifyFixture = () => {
+                  assert.equal(hash(entry), fixtureSha256); assert.equal(hash(copy), fixtureSha256);
+                  assert.equal(realpathSync(join(dir, "node_modules")), realpathSync(join(root, "node_modules")));
+                  for (let parent = dir;; parent = dirname(parent)) {
+                    assert.equal(existsSync(join(parent, "package.json")), false, "package metadata changed entry classification");
+                    if (dirname(parent) === parent) break;
+                  }
+                };
+                const observed = { id, entry: filename, fixture: recordFile(copy), status: "running" }; report.cases.push(observed);
+                try {
+                  verifyFixture();
+                  observed.oracle = execute(id + "-node", process.execPath, [entry], 30);
+                  observed.oracle.expectedMatched = observed.oracle.status === "completed" &&
+                    observed.oracle.stdoutSha256 === digest(expected) && observed.oracle.stderrBytes === 0;
+                  const cache = join(work, id + "-cache"); mkdirSync(cache);
+                  observed.probe = execute(id + "-emission", process.execPath, [fileURLToPath(import.meta.url), "--case", id, entry, artifacts], 180,
+                    { SCRIPTC_CACHE_DIR: cache, SCRIPTC_CHECKER: "tsc-ts", SCRIPTC_SAN: "", SCRIPTC_LIBNODE: "" });
+                  const evidence = join(artifacts, "emission.json");
+                  if (existsSync(evidence)) {
+                    assert.ok(lstatSync(evidence).size <= 16 * 1024 ** 2);
+                    observed.evidence = JSON.parse(readFileSync(evidence, "utf8")); observed.receipt = recordFile(evidence);
+                    assert.equal(observed.evidence.id, id); assert.equal(observed.evidence.head, head);
+                    for (const artifact of [observed.evidence.ir, ...Object.values(observed.evidence.emissions).map(item => item.artifact)].filter(Boolean)) {
+                      assert.equal(hash(join(out, artifact.path)), artifact.sha256);
+                      assert.equal(lstatSync(join(out, artifact.path)).size, artifact.bytes);
+                    }
+                    observed.artifactsVerifiedAfter = true;
+                  }
+                  verifyFixture(); verifyInputs();
+                  observed.complete = Boolean(completeCase(observed));
+                  observed.status = observed.complete && observed.evidence.qualificationComplete ? "passed" : "failed";
+                } catch (error) { observed.status = "failed"; observed.complete = false; observed.error = scrub(error.stack ?? error); }
+                finally { save(); }
+              }
+              report.diagnosticComplete = report.cases.length === 2 && report.cases.every(item => item.complete);
+              report.qualificationComplete = report.diagnosticComplete && report.cases.every(item => item.status === "passed");
+              report.status = report.qualificationComplete ? "passed" : "failed";
+            } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); }
+            finally {
+              try {
+                assert.ok(verifyInputs, "preparation incomplete"); verifyInputs();
+                assert.deepEqual(source(), report.sourceInputs); report.sourceVerifiedAfter = true;
+              } catch (error) {
+                report.status = "failed"; report.diagnosticComplete = false; report.qualificationComplete = false;
+                report.sourceError = scrub(error.stack ?? error);
+              }
+              report.finishedAt = new Date().toISOString(); save();
+              writeFileSync(join(out, "summary.sha256"), hash(join(out, "summary.json")) + "\n");
+              console.log(JSON.stringify({ label: report.label, status: report.status,
+                diagnosticComplete: report.diagnosticComplete, qualificationComplete: report.qualificationComplete }));
+              if (!report.qualificationComplete) { console.error("[initializer-locals] FAILED (exit 1)"); process.exitCode = 1; }
+            }
+          }
+          PROOF
+          node "$RUNNER_TEMP/initializer-locals.mjs"
+      - name: Remove this diagnostic's build scratch
+        if: always()
+        run: |
+          node --input-type=module <<'CLEANUP'
+          import assert from "node:assert/strict";
+          import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const temp = process.env.RUNNER_TEMP, work = join(temp, "initializer-locals-work"), out = join(temp, "initializer-locals-proof");
+          const owner = { runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            label: process.env.DIAGNOSTIC_LABEL, workflow: process.env.GITHUB_SHA };
+          const receipt = { ...owner, work: "absent", payload: "absent" };
+          try {
+            if (existsSync(work)) {
+              assert.deepEqual(JSON.parse(readFileSync(join(work, ".diagnostic-owner.json"), "utf8")), owner);
+              rmSync(work, { recursive: true }); receipt.work = "removed";
+            }
+            const payload = join(temp, "initializer-locals.mjs");
+            if (existsSync(payload)) { rmSync(payload); receipt.payload = "removed"; }
+          } catch (error) { receipt.error = String(error); process.exitCode = 1; }
+          finally {
+            mkdirSync(out, { recursive: true });
+            writeFileSync(join(out, "cleanup.json"), JSON.stringify(receipt, null, 2) + "\n");
+            if (process.exitCode) console.error("[initializer-locals-cleanup] FAILED (exit 1)");
+          }
+          CLEANUP
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: initializer-locals-${{ matrix.label }}
+          path: ${{ runner.temp }}/initializer-locals-proof
+          if-no-files-found: error
+          retention-days: 1
