@@ -1,6 +1,6 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { expect, test } from "vitest";
 import { compile, deserializeModule } from "../src/index.js";
 import { checkPreflight, loadProgram } from "../src/frontend/program-node.js";
@@ -153,13 +153,14 @@ const ${member}_${index}: void = ${member}(${argument}, ${options}(error, stats)
   });
 }
 
-async function lowered(source: string) {
+async function lowered(source: string, extension = "ts", files: Record<string, string> = {}) {
   const directory = mkdtempSync(join(tmpdir(), "scriptc-fallback-callback-ir-"));
   try {
     writeFileSync(join(directory, "package.json"), '{"type":"module"}');
-    const entry = join(directory, "main.ts");
+    const entry = join(directory, `main.${extension}`);
     const outPath = join(directory, "main.ir.json");
     writeFileSync(entry, source);
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(directory, name), text);
     const load = loadProgram(entry);
     try {
       expect(load.typeWorld?.nodeFallback).toBe(true);
@@ -257,6 +258,154 @@ function authoredFunction(mod: IrModule, source: string, name: string): IrFuncti
   );
   expect(functions).toHaveLength(1);
   return functions[0]!;
+}
+
+for (const [context, prefix, suffix] of [
+  ["uncaughtException", 'process.on("uncaughtException", ', ");"],
+  ["exit", 'process.on("exit", ', ");"],
+  [
+    "user-defined number",
+    "/** @type {(value: number) => void} */\nconst callback = ",
+    ";\ncallback(7);",
+  ],
+]) {
+  test(`JavaScript contextual ${context} parameters stay dynamic when passed and logged`, async () => {
+    const source = `
+function forward(value) { console.log("forward", value); }
+${prefix}function observe(value) {
+  forward(value);
+  console.log("value", value);
+}${suffix}
+`;
+    const mod = await lowered(source, "cjs");
+    const fn = authoredFunction(mod, source, "observe");
+    expect(fn.params[0]?.type).toEqual({ kind: "dyn" });
+    const reads = [
+      source.indexOf("forward(value);") + "forward(".length,
+      source.indexOf('console.log("value", value)') + 'console.log("value", '.length,
+    ];
+    for (const start of reads) {
+      const atRead = expressions(fn).filter(
+        (expr) =>
+          expr.loc.file === mod.sourceFile &&
+          expr.loc.start === start &&
+          expr.loc.end === start + 5,
+      );
+      expect(atRead).toContainEqual(
+        expect.objectContaining({
+          kind: "varRef",
+          localId: fn.params[0]!.localId,
+          type: { kind: "dyn" },
+        }),
+      );
+      expect(atRead.some((expr) => expr.kind === "dynCheck")).toBe(false);
+    }
+  });
+}
+
+test("JavaScript unknown callback parameters retain Error and string flow narrowing", async () => {
+  const source = `
+process.on("unhandledRejection", function narrowed(value) {
+  if (value instanceof Error) console.log(value.message);
+  if (typeof value === "string") console.log(value.length);
+});
+`;
+  const mod = await lowered(source, "cjs");
+  const fn = authoredFunction(mod, source, "narrowed");
+  expect(fn.params[0]?.type).toEqual({ kind: "dyn" });
+  for (const [read, type] of [
+    ["value.message", { kind: "object", className: "%Error" }],
+    ["value.length", { kind: "string" }],
+  ] as const) {
+    const start = source.indexOf(read);
+    expect(expressions(fn)).toContainEqual(
+      expect.objectContaining({
+        kind: "dynCheck",
+        type,
+        loc: { file: mod.sourceFile, start, end: start + 5 },
+        value: expect.objectContaining({ kind: "varRef", localId: fn.params[0]!.localId }),
+      }),
+    );
+  }
+});
+
+test("JavaScript contextual Error callbacks keep an authored instanceof guard", async () => {
+  const source = `
+process.on("uncaughtException", function guarded(value) {
+  console.log(value instanceof Error);
+});
+`;
+  const mod = await lowered(source, "cjs");
+  const fn = authoredFunction(mod, source, "guarded");
+  const start = source.indexOf("value instanceof Error");
+  expect(fn.params[0]?.type).toEqual({ kind: "dyn" });
+  expect(expressions(fn)).toContainEqual(
+    expect.objectContaining({
+      kind: "dynTest",
+      test: "error",
+      loc: { file: mod.sourceFile, start, end: start + "value instanceof Error".length },
+      value: expect.objectContaining({
+        kind: "varRef",
+        localId: fn.params[0]!.localId,
+        type: { kind: "dyn" },
+      }),
+    }),
+  );
+});
+
+for (const [event, typeName, type] of [
+  ["uncaughtException", "Error", { kind: "object", className: "%Error" }],
+  ["exit", "number", { kind: "f64" }],
+] as const) {
+  test(`JavaScript contextual ${event} parameters are checked by a typed ${typeName} consumer`, async () => {
+    const source = `
+const { consume } = require("./consumer");
+process.on("${event}", function checked(value) {
+  consume(value);
+});
+`;
+    const mod = await lowered(source, "cjs", {
+      "consumer.ts": `export function consume(value: ${typeName}): void { console.log(value); }`,
+    });
+    const fn = authoredFunction(mod, source, "checked");
+    const consumers = mod.functions.filter(
+      (candidate) =>
+        candidate.loc.file === join(dirname(mod.sourceFile), "consumer.ts") &&
+        candidate.sourceName === "consume" &&
+        candidate.params.every((param) => param.type.kind !== "jsval"),
+    );
+    expect(consumers).toHaveLength(1);
+    const consumer = consumers[0]!;
+    expect(consumer.params).toHaveLength(1);
+    expect(consumer.params[0]).toMatchObject({ name: "value", type });
+    const callStart = source.indexOf("consume(value)");
+    const calls = expressions(fn).filter(
+      (expr): expr is Extract<IrExpr, { kind: "call" }> =>
+        expr.kind === "call" &&
+        expr.callee === consumer.name &&
+        expr.loc.file === mod.sourceFile &&
+        expr.loc.start === callStart &&
+        expr.loc.end === callStart + "consume(value)".length,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toHaveLength(1);
+    const start = source.indexOf("consume(value)") + "consume(".length;
+    expect(fn.params[0]?.type).toEqual({ kind: "dyn" });
+    expect(calls[0]!.args[0]).toMatchObject({
+      kind: "dynCheck",
+      type,
+      loc: { file: mod.sourceFile, start, end: start + 5 },
+      value: { kind: "varRef", localId: fn.params[0]!.localId, type: { kind: "dyn" } },
+    });
+    expect(expressions(fn)).toContainEqual(
+      expect.objectContaining({
+        kind: "dynCheck",
+        type,
+        loc: { file: mod.sourceFile, start, end: start + 5 },
+        value: expect.objectContaining({ kind: "varRef", localId: fn.params[0]!.localId }),
+      }),
+    );
+  });
 }
 
 test.for(["fs", "node:fs"])(
