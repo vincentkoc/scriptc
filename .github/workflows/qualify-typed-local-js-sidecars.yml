@@ -1,0 +1,226 @@
+name: Qualify typed local JavaScript declaration sidecars
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-typed-local-js-sidecars.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-typed-local-js-sidecars
+  cancel-in-progress: false
+
+jobs:
+  typed_local_js:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: d233c964c4d61c4541806e89d088f2e5ea449e32
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = d233c964c4d61c4541806e89d088f2e5ea449e32
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Verify local sidecar loading and native behavior
+        run: |
+          cat > "$RUNNER_TEMP/typed-local-js-proof.mjs" <<'PROOF'
+          import assert from "node:assert/strict";
+          import { spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+          import { dirname, join } from "node:path";
+          import { pathToFileURL } from "node:url";
+          const spec = {"head":"d233c964c4d61c4541806e89d088f2e5ea449e32","inputs":{".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","CHANGELOG.md":"699b9198670c1294d8ac0dee4cd08861e632d4fff557d50d5ba6099ad66652ac","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/frontend/input-tracker.test.ts":"a4becf0c0c04e9cbbb07ef7d8a5442ea5637e36c26dd9a96054e3092737f509b","packages/compiler/src/frontend/program-node.ts":"ffb2931f97266923981eac111f04bfd441099f614fcb02860ef74a56b5c330a5","packages/compiler/src/frontend/program.test.ts":"e87dd7fd3141cb8f733cb29caa596a4da3924e9641c53dd4ad7dbf951cda351d","packages/compiler/src/frontend/program.ts":"82dbf37e5a5b03c0c98d0b9ba9d99a8e833119f8d8308f86d8d2afebde1b2f27","packages/compiler/src/frontend/project-sidecars.test.ts":"7dc7a7fadf5b9d5c5f3cf90ace85eb834032c646b0b975826ac0fcaa7e0ed2b0","packages/compiler/src/frontend/project-sidecars.ts":"594ada1476ecd382d6fcdd672a5e16befb98c42631923bca59ea8ef149d37fcf","packages/compiler/src/frontend/resolve.test.ts":"d846866ba12c281261ea47da109306d783f0221a41a72d87cdb6343a5d3ca282","packages/compiler/src/frontend/resolve.ts":"20ede77c2dcf148030caef81ec362e6a770df7399bfa66f7808fa4237c7ab376","packages/compiler/src/frontend/services.test.ts":"eb3e6a082ac5b722566413cef76a6b238dfc01d6da1a1e52135afb37397d27e9","packages/compiler/src/frontend/source-phase-imports.test.ts":"8a52e9fc46f8f2ee83efdb6cb8f8b84e6b9a515981f8a05cc8743c2868c3bf6b","packages/compiler/src/frontend/ts7/program-host.test.ts":"1a003afe966069a62a112eb420901ff8ea0b792ce5600b2e70265a3932549d2b","packages/compiler/src/frontend/ts7/program-host.ts":"ff84d4842d8d41e72e1fd058adbac07e40dc58472a9da329807fbecb523c2cd8","packages/compiler/test/ts7/order-parity.test.ts":"7bf12e7d4b9186846c69416b985d3bfad8ec5befb0f3e2e04f36e05748e13efc","packages/compiler/test/ts7/program-adapter.test.ts":"485ff6e83db9b7fad5eb15852bf6d8a622d8a9c5d387e38760fb247087f744d1","packages/compiler/test/ts7/resolver-parity.test.ts":"1fbdd1190c8db5a8482e5e7f2a582fae72660f983df2e4de1f3d835caac40356","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","scripts/ts7-order-fixtures.mjs":"53b2f36fdf75a6436eb60af7259499ff6fd140f2ac14cc5e158dfd772befc34e","tests/corpus/typed-local-js-sidecars/adjust.cjs":"b2f86653665b3bc0ce88684b2b067d22165cb33f45735f375fd22162ee4e11d8","tests/corpus/typed-local-js-sidecars/adjust.d.cts":"598200917a90a2a3980d773b1d0bcdfd3ed065e1b6635b618929df8c51297780","tests/corpus/typed-local-js-sidecars/main.ts":"ba366eb6c188031e6ed96bc69ba39c5985cf5ab49c8a39ee183ced73de99b592","tests/corpus/typed-local-js-sidecars/measure.d.mts":"d1fce93fcb09318a0ff0d64dc0710706ea6ab4a763aa22ed1cd12ffb1ac85ed7","tests/corpus/typed-local-js-sidecars/measure.mjs":"2ce12a28165a32f948bfed19f95330543059d6082112d118750aaca03694cecf","tests/corpus/typed-local-js-sidecars/offset.d.ts":"a1e47f63adbdee46130ff2583065d1178e60e2bb7ebf876c6ea39860caf769a6","tests/corpus/typed-local-js-sidecars/offset.js":"62ea79e4f5a65c1c3f36e6fc0ee85ffeaa142a637c546670de13298c83335d0b","tests/corpus/typed-local-js-sidecars/reexport.ts":"7425f9efb49bd3c3e59d817fea8c305fbf6afffd7979666ce81c331a3f727b01","tests/corpus/typed-local-js-sidecars/type-effect.d.mts":"eb967d3786d65aac2d1d3d164d68c65298f54827a2d81c71d9e9357e1bde7a9d","tests/corpus/typed-local-js-sidecars/type-effect.mjs":"7cd2af38a5e00063d28cc07a74ad8cfb6347c93b593a2a972a87440cdb0f4890","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/harness/self-hosting-frontend-program.test.ts":"c73b7b994107dd533097d4989482f73fbb8579e1410362969b2680246a4f85e7"},"units":["packages/compiler/src/frontend/project-sidecars.test.ts","packages/compiler/src/frontend/resolve.test.ts","packages/compiler/src/frontend/program.test.ts","packages/compiler/src/frontend/input-tracker.test.ts","packages/compiler/src/frontend/services.test.ts","packages/compiler/src/frontend/ts7/program-host.test.ts","packages/compiler/test/ts7/program-adapter.test.ts","packages/compiler/test/ts7/resolver-parity.test.ts","packages/compiler/src/frontend/source-phase-imports.test.ts"],"newFixtures":["tests/corpus/typed-local-js-sidecars/main.ts"],"orderFixtures":["tests/fixtures/npm/cases/dynamic-import-local/main.ts"],"corpus":["typed-local-js-sidecars/main.ts"],"formatFiles":["packages/compiler/src/frontend/program-node.ts","packages/compiler/src/frontend/program.ts","packages/compiler/src/frontend/project-sidecars.test.ts","packages/compiler/src/frontend/project-sidecars.ts","packages/compiler/src/frontend/resolve.test.ts","packages/compiler/src/frontend/resolve.ts","packages/compiler/src/frontend/source-phase-imports.test.ts","packages/compiler/src/frontend/ts7/program-host.ts","tests/harness/self-hosting-frontend-program.test.ts"]}, root = process.cwd(), out = join(process.env.RUNNER_TEMP, "typed-local-js-proof");
+          mkdirSync(out, { recursive: true });
+          const hash = path => createHash("sha256").update(readFileSync(path)).digest("hex");
+          const scrub = value => String(value).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
+          const report = { source: spec.head, workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", completeSuite: false, startedAt: new Date().toISOString(), steps: [], groups: [], generatedBaselines: {} };
+          const save = () => writeFileSync(join(out, "summary.json"), scrub(JSON.stringify(report, null, 2)) + "\n");
+          let sequence = 0;
+          const execute = (name, command, args, seconds = 600, env = {}) => {
+            const stem = String(++sequence).padStart(2, "0") + "-" + name, start = Date.now();
+            const result = spawnSync("timeout", ["--signal=TERM", "--kill-after=5s", seconds + "s", command, ...args],
+              { cwd: root, env: { ...process.env, ...env }, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+            for (const channel of ["stdout", "stderr"]) writeFileSync(join(out, stem + "." + channel + ".log"), scrub(result[channel] ?? ""));
+            report.steps.push({ name, command, args, seconds: (Date.now() - start) / 1000, limitSeconds: seconds,
+              code: result.status, signal: result.signal, error: result.error?.message,
+              stdout: stem + ".stdout.log", stderr: stem + ".stderr.log",
+              stdoutSha256: hash(join(out, stem + ".stdout.log")), stderrSha256: hash(join(out, stem + ".stderr.log")) });
+            save(); console.log(name + ": exit " + result.status);
+            if (result.error || result.status !== 0 || result.signal)
+              throw Error(name + " failed: " + scrub(JSON.stringify({ code: result.status, signal: result.signal, error: result.error?.message, stderr: result.stderr?.slice(-4000) })));
+            return result.stdout.trim();
+          };
+          const source = () => {
+            assert.equal(execute("source-head", "git", ["rev-parse", "HEAD"]), spec.head);
+            assert.equal(execute("source-diff", "git", ["diff", "--name-only", "HEAD"]), "");
+            const status = execute("source-status", "git", ["status", "--porcelain", "--untracked-files=all"]);
+            assert.deepEqual(status ? status.split("\n").sort() : [], Object.keys(report.generatedBaselines).map(p => "?? " + p).sort());
+            for (const [file, expected] of Object.entries({ ...spec.inputs, ...report.generatedBaselines })) assert.equal(hash(file), expected, file);
+            report.inputs = spec.inputs;
+          };
+          const escape = value => value.replace(/[.*+?^\x24{}()|[\]\\]/g, "\\$&");
+          const suite = (label, files, { names, pattern, san = false, env = {} } = {}) => {
+            const output = join(out, label + ".json");
+            let failure;
+            try { execute(label, "pnpm", ["test", ...files, ...(pattern ? ["-t", pattern] : []), "--reporter=json", "--outputFile=" + output],
+              1200, { SCRIPTC_SAN: san ? "1" : "", ...env }); } catch (error) { failure = error; }
+            if (!existsSync(output)) throw failure ?? Error(label + " produced no result");
+            const data = JSON.parse(readFileSync(output, "utf8"));
+            writeFileSync(output, scrub(JSON.stringify(data)));
+            const all = data.testResults.flatMap(s => s.assertionResults);
+            const active = all.filter(t => !["pending", "skipped", "todo", "disabled"].includes(t.status));
+            report.groups.push({ label, success: data.success, passed: active.filter(t => t.status === "passed").length, pending: all.length - active.length,
+              cases: active.map(t => ({ name: t.fullName, status: t.status, failures: t.failureMessages.map(scrub) })), output: label + ".json", sha256: hash(output) });
+            save();
+            if (failure) throw failure;
+            assert.equal(data.success, true, label); assert.ok(active.length > 0, label);
+            assert.ok(active.every(t => t.status === "passed"), label);
+            if (names) assert.deepEqual(active.map(t => {
+              const matches = names.filter(n => t.fullName.endsWith(n)); assert.equal(matches.length, 1, t.fullName); return matches[0];
+            }).sort(), [...names].sort(), label + " inventory");
+            else for (const file of files) {
+              const suites = data.testResults.filter(s => s.name.endsWith("/" + file));
+              assert.equal(suites.length, 1, file);
+              assert.ok(suites[0].assertionResults.length > 0 && suites[0].assertionResults.every(t => t.status === "passed"), file);
+            }
+          };
+          save();
+          try {
+            assert.ok(Object.hasOwn(spec.inputs, "packages/compiler/src/frontend/project-sidecars.ts"), "source pins incomplete");
+            assert.ok(spec.formatFiles.length > 0, "format paths incomplete");
+            source(); report.sourceVerifiedBefore = true;
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.notEqual(process.getuid(), 0);
+            assert.equal(process.version, "v" + readFileSync(".node-version", "utf8").trim());
+            report.host = { node: process.version, uid: process.getuid(), platform: process.platform, arch: process.arch };
+            report.tools = { pnpm: execute("pnpm-version", "pnpm", ["--version"]), llvm: execute("llvm-version", "llvm-config", ["--version"]), zig: execute("zig-version", "zig", ["version"]) };
+            assert.deepEqual(report.tools, { pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
+            for (const key of ["SCRIPTC_RUNTIME_PACK", "SCRIPTC_LLVM_CODEGEN", "SCRIPTC_LIBNODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION",
+              "SCRIPTC_CPU_DISPATCH", "SCRIPTC_CACHE_DIR", "SCRIPTC_TS7_ALL", "SCRIPTC_UPDATE_BASELINES"]) delete process.env[key];
+            Object.assign(process.env, { CI: "1", SCRIPTC_TEST_WORKERS: "2", SCRIPTC_NO_CACHE: "1", SCRIPTC_SAN: "",
+              SCRIPTC_LLVM_TEST_MODE: "dev", ASAN_OPTIONS: "detect_leaks=0", CMAKE_BUILD_PARALLEL_LEVEL: "8" });
+            execute("runtime-pack-verify", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]);
+            const manifestFile = "packages/runtime-linux-x64-gnu/runtime-pack.json", manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+            assert.deepEqual(manifest.runtime_abi, { version: 48, marker: "scr_runtime_abi_v48" });
+            report.runtimePack = { abi: manifest.runtime_abi, manifestSha256: hash(manifestFile) };
+            // Formatting is prepared on the disposable runner, then restored before proof.
+            // The receipt remains failed until the reviewed formatting patch is committed.
+            try { execute("format", "pnpm", ["format:check"], 300); report.formatPassed = true; }
+            catch {
+              report.formatPassed = false;
+              try {
+                execute("prepare-format", "pnpm", ["exec", "oxfmt", "--write", ...spec.formatFiles], 300);
+                const patch = execute("format-patch", "git", ["diff", "--binary", "--", ...spec.formatFiles]);
+                assert.ok(patch.length > 0, "format failure is outside the changed files");
+                writeFileSync(join(out, "format.patch"), patch + "\n");
+                report.formatPatchSha256 = hash(join(out, "format.patch"));
+              } finally {
+                execute("restore-format", "git", ["restore", "--source=HEAD", "--", ...spec.formatFiles]);
+                source();
+              }
+            }
+            execute("build", "pnpm", ["build"], 900);
+            execute("lint", "pnpm", ["lint"], 300);
+            suite("units", spec.units, { env: { SCRIPTC_NO_CACHE: "" } });
+            const { allOrderEntries, orderBaselinePath } = await import(pathToFileURL(join(root, "scripts/ts7-order-fixtures.mjs")));
+            const entries = allOrderEntries(root);
+            const missing = spec.newFixtures.filter(fixture => !existsSync(orderBaselinePath(root, fixture)));
+            for (const fixture of spec.newFixtures)
+              assert.ok(entries.includes(join(root, fixture)), "fixture absent from canonical inventory: " + fixture);
+            if (missing.length > 0) {
+              const answers = JSON.parse(execute("generate-baselines", process.execPath,
+                ["--import", "tsx", "--input-type=module", "--eval", "import { join } from \"node:path\";\nimport { pathToFileURL } from \"node:url\";\nconst root = process.cwd();\nconst { checkPreflightTs7 } = await import(pathToFileURL(join(root, \"packages/compiler/src/frontend/program-node.ts\")));\nconst { Ts7Host } = await import(pathToFileURL(join(root, \"packages/compiler/src/frontend/ts7/program-adapter.ts\")));\nconst rel = value => value.replaceAll(\"\\\\\", \"/\").split(root.replaceAll(\"\\\\\", \"/\") + \"/\").join(\"<repo>/\");\nconst host = new Ts7Host();\ntry {\n  const answers = process.argv.slice(1).map(fixture => {\n    const answer = checkPreflightTs7(join(root, fixture), host);\n    return { fixture, baseline: { order: answer.moduleOrder.map(rel),\n      diags: answer.diags.map(d => ({ ...d, message: rel(d.message), loc: { ...d.loc, file: rel(d.loc.file) } })) } };\n  });\n  console.log(JSON.stringify(answers));\n} finally { host.close(); }\n", ...missing], 240));
+              assert.deepEqual(answers.map(answer => answer.fixture), missing);
+              for (const { fixture, baseline } of answers) {
+                assert.deepEqual(baseline.diags, [], fixture);
+                const target = orderBaselinePath(root, fixture), relative = target.slice(root.length + 1);
+                const content = JSON.stringify(baseline, null, 1) + "\n";
+                mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, content, { flag: "wx" });
+                report.generatedBaselines[relative] = hash(target);
+                const artifact = join(out, relative);
+                mkdirSync(dirname(artifact), { recursive: true }); writeFileSync(artifact, content, { flag: "wx" }); save();
+              }
+            }
+            execute("baseline-completeness", "pnpm", ["test:ts7", "--baselines-only"], 60);
+            const batches = new Map();
+            for (const fixture of [...spec.newFixtures, ...(spec.orderFixtures ?? [])]) {
+              const index = entries.indexOf(join(root, fixture)); assert.ok(index >= 0);
+              const batch = entries.slice(Math.floor(index / 20) * 20, Math.floor(index / 20) * 20 + 20);
+              batches.set(batch[0].slice(root.length + 1) + " … +" + (batch.length - 1), batch.map(p => p.slice(root.length + 1)));
+            }
+            report.orderParityBatches = Object.fromEntries(batches);
+            const names = [...batches.keys()];
+            suite("order-parity", ["packages/compiler/test/ts7/order-parity.test.ts"], { pattern: "(" + names.map(escape).join("|") + ")$", names, env: { SCRIPTC_TS7_ALL: "1" } });
+            const pattern = "(" + spec.corpus.map(escape).join("|") + ")$";
+            for (const san of [false, true]) {
+              for (const mode of ["release", "dev"]) suite((san ? "san" : "plain") + "-" + mode,
+                [mode === "release" ? "tests/harness/differential.test.ts" : "tests/harness/llvm-differential.test.ts"], { pattern, names: spec.corpus, san });
+              suite((san ? "san" : "plain") + "-self-hosting", ["tests/harness/self-hosting-frontend-program.test.ts"], { san });
+            }
+            assert.equal(report.formatPassed, true, "formatting patch must be reviewed and committed before proof passes");
+            report.status = "passed";
+          } catch (error) { report.status = "failed"; report.error = scrub(error.stack ?? error); process.exitCode = 1; }
+          finally {
+            try { source(); report.sourceVerifiedAfter = true; }
+            catch (error) { report.status = "failed"; report.sourceError = scrub(error.stack ?? error); process.exitCode = 1; }
+            report.finishedAt = new Date().toISOString(); save();
+            console.log(JSON.stringify({ status: report.status, groups: report.groups.length }));
+            if (process.exitCode) console.error("[typed-local-js-proof] FAILED (exit 1)");
+          }
+          PROOF
+          ulimit -c 0
+          node --import tsx "$RUNNER_TEMP/typed-local-js-proof.mjs"
+      - name: Retain a failed setup receipt
+        if: always()
+        run: |
+          node --input-type=module <<'RECEIPT'
+          import { spawnSync } from "node:child_process";
+          import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+          const out = join(process.env.RUNNER_TEMP, "typed-local-js-proof");
+          const summary = join(out, "summary.json");
+          if (!existsSync(summary)) {
+            mkdirSync(out, { recursive: true });
+            const head = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 30000 });
+            const status = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8", timeout: 30000 });
+            writeFileSync(summary, JSON.stringify({
+              source: "d233c964c4d61c4541806e89d088f2e5ea449e32", workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
+              attempt: process.env.GITHUB_RUN_ATTEMPT, status: "failed", completeSuite: false,
+              error: "setup failed before the proof runner produced a receipt",
+              sourceVerifiedAfter: head.status === 0 && status.status === 0 && head.stdout.trim() === "d233c964c4d61c4541806e89d088f2e5ea449e32" && status.stdout.trim() === "",
+              finishedAt: new Date().toISOString(),
+            }, null, 2) + "\n");
+            console.error("[typed-local-js-proof] FAILED (exit 1)");
+            process.exitCode = 1;
+          }
+          RECEIPT
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typed-local-js-proof
+          path: ${{ runner.temp }}/typed-local-js-proof
+          if-no-files-found: error
+          retention-days: 1
