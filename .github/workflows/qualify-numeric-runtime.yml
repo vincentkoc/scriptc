@@ -1,0 +1,617 @@
+name: Qualify numeric runtime restoration
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-numeric-runtime.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-numeric-runtime
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -eo pipefail {0}
+
+env:
+  BASE_SHA: 71a9441c824262150f35acd2b8359f156ed3289c
+  CAND_SHA: ed5cf0b5493a8969c25261ae21cfa6801e2dc82d
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      NR_JOB: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ed5cf0b5493a8969c25261ae21cfa6801e2dc82d
+          persist-credentials: false
+      - name: Write the qualification runner
+        run: |
+          mkdir -p "$RUNNER_TEMP/numeric-runtime-assets" "$RUNNER_TEMP/numeric-runtime-native"
+          cat > "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { spawn, spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import {
+            closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync,
+            readdirSync, readlinkSync, realpathSync, statfsSync, statSync, writeFileSync, writeSync,
+          } from "node:fs";
+          import { availableParallelism, totalmem } from "node:os";
+          import { join } from "node:path";
+          import { fileURLToPath } from "node:url";
+
+          const BASE = "71a9441c824262150f35acd2b8359f156ed3289c";
+          const CAND = "ed5cf0b5493a8969c25261ae21cfa6801e2dc82d";
+          const pins = {"scripts/bench-runtime.mjs":"be9734581c353d862af707b7104fbc489a6d294391f40c048dcf1bacdad3a68e","benchmarks/runtime/workloads.mjs":"de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c","benchmarks/runtime/workloads/numeric-kernels.json":"f46a7516c0e8acd961985c7c436a34c7dd0f3a8d12802825a3b37173fa57023e","benchmarks/runtime/workloads/numeric-kernels.ts":"c369d9f88cf3b13507f1beb0b28fc4f9ef955be8dea740981028d4b65a3ed4e0"};
+          const GiB = 1024 ** 3;
+          const task = process.env.NR_JOB;
+          assert.ok(task === "native" || task === "compare");
+          const mode = process.argv[2];
+          const modeDeadline = Date.now() + ({ prepare: 8, "install-native": 20, package: 22,
+            initialize: 8, build: 65, bench: 35, finish: 3 }[mode] ?? 1) * 60_000;
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const temp = process.env.RUNNER_TEMP;
+          const assets = join(temp, "numeric-runtime-assets");
+          const out = join(temp, "numeric-runtime-" + task);
+          const candidate = task === "native" ? workspace : join(workspace, "candidate");
+          const baseline = join(workspace, "baseline");
+          mkdirSync(out, { recursive: true });
+          const summaryPath = join(out, "summary.json");
+          const report = existsSync(summaryPath) ? JSON.parse(readFileSync(summaryPath, "utf8")) : {
+            schema: 1, task, baseline: BASE, candidate: CAND, workflow: process.env.GITHUB_SHA,
+            run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+            status: "running", complete: false, startedAt: new Date().toISOString(), steps: [],
+          };
+          assert.equal(report.workflow, process.env.GITHUB_SHA);
+          assert.equal(report.run, process.env.GITHUB_RUN_ID);
+          assert.equal(report.attempt, process.env.GITHUB_RUN_ATTEMPT);
+          const sha = data => createHash("sha256").update(data).digest("hex");
+          const hash = file => sha(readFileSync(file));
+          const scrub = value => String(value).replaceAll(workspace, "<workspace>").replaceAll(temp, "<temp>");
+          const save = () => writeFileSync(summaryPath, JSON.stringify(report, null, 2) + "\n");
+          const pause = ms => new Promise(done => setTimeout(done, ms));
+          const capture = (command, args, cwd = candidate) => {
+            const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 ** 2 });
+            assert.equal(result.error, undefined, command + ": " + String(result.error));
+            assert.equal(result.status, 0, command + ": " + (result.stderr ?? "").slice(-4000));
+            return result.stdout.trim();
+          };
+          let active;
+          let interrupted;
+          for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
+            interrupted = signal;
+            active?.stop();
+          });
+
+          // Each subprocess owns one detached group. Drain at leader exit,
+          // not pipe closure; descendants can otherwise keep the runner alive.
+          async function execute(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(interrupted, undefined, "runner interrupted");
+            const timeoutMs = Math.min(minutes * 60_000, modeDeadline - Date.now());
+            assert.ok(timeoutMs > 0, "qualification phase deadline expired");
+            const step = { label, command, args: args.map(scrub), cwd: scrub(cwd), startedAt: new Date().toISOString() };
+            report.steps.push(step); save();
+            const log = openSync(join(out, label + ".log"), "wx");
+            const started = Date.now();
+            const result = await new Promise(resolveResult => {
+              let timedOut = false, overflow = false, closed = false, settled = false, exited = false;
+              let force, pipeDeadline, hardDeadline;
+              let code = null, signal = null, error;
+              let bytes = 0;
+              const child = spawn(command, args, {
+                cwd, env: { ...process.env, ...env }, detached: true, stdio: ["ignore", "pipe", "pipe"],
+              });
+              const alive = () => {
+                if (!child.pid) return false;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, 0); return true; }
+                catch (failure) { if (failure.code === "ESRCH") return false; throw failure; }
+              };
+              const kill = sig => {
+                if (!child.pid) return;
+                assert.ok(child.pid > 1, "invalid owned process group");
+                try { process.kill(-child.pid, sig); }
+                catch (failure) { if (failure.code !== "ESRCH") throw failure; }
+              };
+              const finish = group => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer); clearTimeout(force); clearTimeout(pipeDeadline); clearTimeout(hardDeadline);
+                active = undefined;
+                child.stdout.destroy(); child.stderr.destroy();
+                child.unref();
+                closeSync(log);
+                resolveResult({ code, signal, error, timedOut, overflow, ...group, elapsedMs: Date.now() - started });
+              };
+              const stop = () => {
+                kill("SIGTERM");
+                if (!force) force = setTimeout(() => kill("SIGKILL"), 1000);
+                if (!hardDeadline) hardDeadline = setTimeout(() => finish({ groupDrained: false, cleanupDeadline: true }), 15_000);
+              };
+              active = { stop };
+              const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
+              const output = data => {
+                if (settled) return;
+                bytes += data.length;
+                if (bytes > 128 * 1024 ** 2) { overflow = true; stop(); return; }
+                writeSync(log, data);
+              };
+              child.stdout.on("data", output); child.stderr.on("data", output);
+              child.once("error", failure => {
+                error = String(failure);
+                if (!child.pid) finish({ groupDrained: true });
+              });
+              let drained;
+              child.once("exit", (exitCode, exitSignal) => {
+                exited = true; code = exitCode; signal = exitSignal;
+                drained = (async () => {
+                  await pause(100);
+                  const leftoverChildren = alive();
+                  if (leftoverChildren) {
+                    kill("SIGTERM");
+                    const gentle = Date.now() + 1000;
+                    while (alive() && Date.now() < gentle) await pause(100);
+                    if (alive()) kill("SIGKILL");
+                    const deadline = Date.now() + 9000;
+                    while (alive() && Date.now() < deadline) await pause(100);
+                  }
+                  return { leftoverChildren, groupDrained: !alive() };
+                })().catch(failure => ({ groupDrained: false, cleanupError: String(failure) }));
+                drained.then(group => {
+                  if (closed) finish(group);
+                  else pipeDeadline = setTimeout(() => finish({ ...group, groupDrained: false, unresolvedPipe: true }), 1000);
+                });
+              });
+              child.once("close", () => {
+                closed = true;
+                if (exited) drained.then(finish);
+                else if (error) finish({ groupDrained: !child.pid });
+              });
+            });
+            Object.assign(step, result, { finishedAt: new Date().toISOString(), log: label + ".log",
+              logSha256: hash(join(out, label + ".log")), logBytes: statSync(join(out, label + ".log")).size }); save();
+            assert.equal(interrupted, undefined, "runner interrupted");
+            assert.ok(result.groupDrained && !result.leftoverChildren && !result.timedOut &&
+              !result.overflow && !result.error && result.signal === null, label + ": incomplete subprocess " + JSON.stringify(result));
+            return result.code;
+          }
+          async function checked(label, command, args, cwd, minutes = 15, env = {}) {
+            assert.equal(await execute(label, command, args, cwd, minutes, env), 0, label + " failed");
+          }
+          function source(root, expected) {
+            assert.equal(capture("git", ["rev-parse", "HEAD"], root), expected);
+            assert.equal(capture("git", ["status", "--porcelain", "--untracked-files=all"], root), "", "dirty source");
+            const files = capture("git", ["ls-files", "-s", "-z"], root).split("\0").filter(Boolean);
+            const content = createHash("sha256");
+            for (const row of files) {
+              const tab = row.indexOf("\t"), name = row.slice(tab + 1), mode = row.slice(0, 6);
+              assert.ok(tab > 0 && !name.startsWith("/") && !name.split("/").includes(".."));
+              const path = join(root, name), info = lstatSync(path);
+              const bytes = info.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : readFileSync(path);
+              content.update(mode + "\0" + name + "\0" + sha(bytes) + "\0");
+            }
+            for (const [name, expectedHash] of Object.entries(pins)) assert.equal(hash(join(root, name)), expectedHash, name);
+            return { head: expected, tree: capture("git", ["rev-parse", "HEAD^{tree}"], root), files: files.length, contentSha256: content.digest("hex") };
+          }
+          function sources() {
+            return task === "native" ? { candidate: source(candidate, CAND) }
+              : { baseline: source(baseline, BASE), candidate: source(candidate, CAND) };
+          }
+          function nativeInputs(root, ref) {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", ref], root).split("\n");
+            return rows.filter(row => {
+              const name = row.slice(row.indexOf("\t") + 1);
+              return name.startsWith("native/llvm-codegen/") ||
+                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+                  "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
+            });
+          }
+          function memory() {
+            const fields = Object.fromEntries(readFileSync("/proc/meminfo", "utf8").trim().split("\n").map(line => {
+              const [name, amount] = line.split(/:\s*/); return [name, Number(amount.split(/\s/)[0]) * 1024];
+            }));
+            const disk = statfsSync(temp);
+            return { total: totalmem(), available: fields.MemAvailable, swapTotal: fields.SwapTotal,
+              swapFree: fields.SwapFree, diskFree: Number(disk.bavail) * Number(disk.bsize),
+              cores: availableParallelism(), swaps: readFileSync("/proc/swaps", "utf8") };
+          }
+          function admit(createSwap) {
+            const before = memory();
+            const minimum = 28;
+            const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));
+            const capacity = { phase: mode, createSwap, before, minimumGiB: minimum,
+              missingSwapGiB: missing, requiredDiskBytes: (missing + 16) * GiB, admitted: false };
+            (report.capacity ??= []).push(capacity); save();
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
+            assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, "insufficient physical runner capacity");
+            if (createSwap && missing > 0) {
+              assert.ok(missing <= 24, "swap requirement exceeds the task budget");
+              assert.ok(before.diskFree >= (missing + 16) * GiB, "insufficient disk for swap and builds");
+              const path = join(temp, "numeric-runtime-" + process.env.GITHUB_RUN_ID + "-" + task + ".swap");
+              assert.ok(!existsSync(path), "owned swap path already exists");
+              report.swap = { path, bytes: missing * GiB, originalSwaps: before.swaps, active: false }; save();
+              capture("sudo", ["fallocate", "-l", String(missing * GiB), path]);
+              capture("sudo", ["chmod", "600", path]);
+              capture("sudo", ["mkswap", path]);
+              capture("sudo", ["swapon", path]);
+              report.swap.active = true; save();
+            }
+            const after = memory(); capacity.after = after; save();
+            assert.ok(after.available + after.swapFree >= minimum * GiB, "compiler heaps lack RAM/swap headroom");
+            assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, "insufficient remaining disk");
+            capacity.admitted = true; save();
+          }
+          function cleanupSwap() {
+            if (!report.swap) return;
+            const swap = report.swap;
+            assert.equal(swap.path, join(temp, "numeric-runtime-" + process.env.GITHUB_RUN_ID + "-" + task + ".swap"));
+            const live = () => readFileSync("/proc/swaps", "utf8").split("\n").slice(1).some(line => line.split(/\s+/)[0] === swap.path);
+            if (live()) capture("sudo", ["swapoff", swap.path]);
+            assert.equal(live(), false, "owned swap remains active");
+            if (existsSync(swap.path)) capture("sudo", ["rm", "--", swap.path]);
+            swap.active = false; swap.removed = true; save();
+          }
+          function filesUnder(root, prefix = "") {
+            const files = [];
+            for (const name of readdirSync(join(root, prefix)).sort()) {
+              const path = prefix ? prefix + "/" + name : name;
+              const info = lstatSync(join(root, path));
+              if (info.isDirectory()) files.push(...filesUnder(root, path));
+              else { assert.ok(info.isFile(), "artifact must be a regular file: " + path); files.push(path); }
+            }
+            return files;
+          }
+          const fileFacts = (root, paths) => paths.map(path => {
+            const info = lstatSync(join(root, path));
+            assert.ok(info.isFile(), "not a regular artifact: " + path);
+            return { path, size: info.size, mode: info.mode & 0o777, sha256: hash(join(root, path)) };
+          });
+          function checkFacts(root, expected) { assert.deepEqual(fileFacts(root, expected.map(file => file.path)), expected); }
+          function tools() {
+            const node = process.version, pnpm = capture("pnpm", ["--version"]);
+            const llvm = capture("llvm-config", ["--version"]);
+            assert.equal(node, "v24.22.0"); assert.equal(pnpm, "11.1.3"); assert.equal(llvm, "22.1.8");
+            const zig = capture("zig", ["version"]); assert.equal(zig, "0.16.0");
+            return { node, pnpm, llvm, zig, clang: capture("clang", ["--version"]), nm: capture("nm", ["--version"]),
+              executables: Object.fromEntries(["node", "pnpm", "llvm-config", "clang", "g++", "nm", "strip", "zig"].map(name => [name, executable(name)])),
+              imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion, platform: process.platform, arch: process.arch };
+          }
+          function executable(name) {
+            const path = realpathSync(capture("which", [name]));
+            assert.ok(lstatSync(path).isFile());
+            return { path: scrub(path), size: statSync(path).size, sha256: hash(path) };
+          }
+          function readAssetManifest() {
+            const manifest = JSON.parse(readFileSync(join(assets, "inputs.json"), "utf8"));
+            assert.equal(manifest.baseline, BASE); assert.equal(manifest.candidate, CAND);
+            assert.equal(manifest.workflow, process.env.GITHUB_SHA);
+            assert.equal(manifest.run, process.env.GITHUB_RUN_ID); assert.equal(manifest.attempt, process.env.GITHUB_RUN_ATTEMPT);
+            assert.equal(manifest.runnerSha256, hash(fileURLToPath(import.meta.url)));
+            assert.equal(hash(join(assets, "native.tar.gz")), manifest.nativeArchiveSha256);
+            assert.equal(manifest.nativeInputs.length, 1049);
+            assert.equal(sha(manifest.nativeInputs.join("\n")), "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25");
+            assert.equal(manifest.nativeInputSha256, "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25");
+            return manifest;
+          }
+          function median(xs) {
+            const s = [...xs].sort((a, b) => a - b);
+            const m = s.length >> 1;
+            return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+          }
+          function makeRandom(seed) {
+            let state = seed >>> 0;
+            return () => {
+              state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+              return state / 4294967296;
+            };
+          }
+          function bootstrapRatio(candidate, baseline, resamples = 2000) {
+            const random = makeRandom(0x5eed);
+            const ratios = [];
+            const pick = (xs) =>
+              Array.from({ length: xs.length }, () => xs[Math.floor(random() * xs.length)]);
+            for (let i = 0; i < resamples; i++) ratios.push(median(pick(candidate)) / median(pick(baseline)));
+            ratios.sort((a, b) => a - b);
+            return {
+              low: ratios[Math.floor(resamples * 0.025)],
+              high: ratios[Math.floor(resamples * 0.975)],
+            };
+          }
+
+
+          const builtFacts = root => fileFacts(root, readdirSync(join(root, "packages")).flatMap(name => {
+            const path = "packages/" + name + "/dist";
+            return existsSync(join(root, path)) ? filesUnder(join(root, path)).map(file => path + "/" + file) : [];
+          }));
+          function verifyRuntime(data) {
+            assert.equal(data.schema, 1);
+            assert.deepEqual(data.host, { platform: "linux", arch: "x64", node: "v24.22.0" });
+            assert.equal(data.runs, 15); assert.equal(data.layouts, 1);
+            assert.deepEqual(data.contenders, [["baseline", baseline, BASE], ["candidate", candidate, CAND]].map(([label, root, head]) => ({
+              label, root, optimization: "release", cpuDispatch: false,
+              revision: capture("git", ["rev-parse", "--short", head], root),
+            })));
+            assert.ok(Array.isArray(data.workloads)); assert.equal(data.workloads.length, 1);
+            const row = data.workloads[0];
+            assert.equal(row.name, "numeric-kernels"); assert.deepEqual(row.args, ["0.5"]); assert.equal(row.category, "cpu");
+            assert.equal(row.error, undefined);
+            assert.deepEqual(Object.keys(row.results).sort(), ["baseline", "candidate"]);
+            for (const label of ["baseline", "candidate"]) {
+              const result = row.results[label];
+              assert.equal(result.status, "ok"); assert.equal(result.error, undefined);
+              assert.ok(Array.isArray(result.samples) && result.samples.length === 15);
+              assert.ok(result.samples.every(value => Number.isFinite(value) && value > 0), "invalid timing sample");
+              assert.equal(result.median_ms, Math.round(median(result.samples) * 100) / 100);
+              assert.ok(Number.isInteger(result.bytes) && result.bytes > 0);
+              assert.ok(Number.isFinite(result.cold_build_ms) && result.cold_build_ms > 0);
+            }
+            const b = row.results.baseline, c = row.results.candidate;
+            const ci = bootstrapRatio(c.samples, b.samples);
+            const verdict = ci.high < 1 ? "faster" : ci.low > 1 ? "slower" : "neutral";
+            assert.deepEqual(row.ci95, [Math.round(ci.low * 10000) / 10000, Math.round(ci.high * 10000) / 10000]);
+            assert.equal(row.ratio, Math.round(c.median_ms / b.median_ms * 10000) / 10000);
+            assert.equal(row.verdict, verdict); assert.equal(row.size_ratio, Math.round(c.bytes / b.bytes * 10000) / 10000);
+            assert.ok(Number.isFinite(row.node_ms) && row.node_ms > 0, "Node timing missing");
+            assert.equal(row.vs_node, Math.round(c.median_ms / row.node_ms * 1000) / 1000);
+            return { verdict, ratio: row.ratio, ci95: row.ci95, restorationPassed: verdict !== "slower",
+              interpretation: verdict === "neutral" ? "no detected slowdown; not equivalence" : verdict,
+              nodeParity: "canonical status=ok requires Node stdout/stderr/exit parity before timing",
+              evidenceLimit: "canonical JSON does not retain raw Node oracle output or Node timing samples" };
+          }
+          function verifyBuiltInputs(manifest) {
+            assert.deepEqual(tools(), report.tools);
+            for (const [name, root] of [["baseline", baseline], ["candidate", candidate]]) {
+              checkFacts(root, manifest.nativeFiles); checkFacts(root, report.builds[name].files);
+              assert.equal(hash(join(root, "pnpm-lock.yaml")), report.builds[name].lockSha256);
+            }
+          }
+
+          save();
+          try {
+            if (mode === "prepare") {
+              assert.equal(task, "native"); report.sourceBefore = sources();
+              await checked("baseline-objects", "git", ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                "fetch", "--no-tags", "--depth=1", "https://github.com/vincentkoc/scriptc.git", BASE], candidate, 5);
+              const before = nativeInputs(candidate, BASE), after = nativeInputs(candidate, CAND);
+              assert.equal(before.length, 1049); assert.deepEqual(after, before, "native source inputs changed");
+              report.nativeInputs = after; report.nativeInputSha256 = sha(after.join("\n"));
+              assert.equal(report.nativeInputSha256, "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25");
+              admit(true);
+            } else if (mode === "install-native") {
+              await checked("install", "pnpm", ["install", "--frozen-lockfile"], candidate, 20);
+            } else if (mode === "package") {
+              report.tools = tools();
+              await checked("verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], candidate, 5);
+              report.helper = JSON.parse(capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+              assert.equal(report.helper.ok, true); assert.equal(report.helper.protocol_version, "1");
+              assert.equal(report.helper.llvm_version, "22.1.8");
+              assert.equal(report.helper.scriptc_package_version, JSON.parse(readFileSync(join(candidate, "packages/llvm-linux-x64-gnu/package.json"), "utf8")).version);
+              const nativePaths = ["packages/llvm-linux-x64-gnu/bin", "packages/runtime-linux-x64-gnu/artifacts"];
+              const nativeFiles = fileFacts(candidate, [
+                ...nativePaths.flatMap(path => filesUnder(join(candidate, path)).map(file => path + "/" + file)),
+                "packages/runtime-linux-x64-gnu/runtime-pack.json",
+              ]);
+              await checked("pack-native", "tar", ["-czf", join(assets, "native.tar.gz"), ...nativePaths,
+                "packages/runtime-linux-x64-gnu/runtime-pack.json"], candidate, 10);
+              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              const manifest = {
+                baseline: BASE, candidate: CAND, workflow: report.workflow, run: report.run, attempt: report.attempt,
+                runnerSha256: hash(fileURLToPath(import.meta.url)), nativeInputs: report.nativeInputs,
+                nativeInputSha256: report.nativeInputSha256, nativeFiles,
+                nativeArchiveSha256: hash(join(assets, "native.tar.gz")), source: report.sourceAfter.candidate,
+                tools: report.tools, helper: report.helper, pins,
+              };
+              writeFileSync(join(assets, "inputs.json"), JSON.stringify(manifest, null, 2) + "\n");
+              report.complete = true; report.status = "complete";
+            } else if (mode === "initialize") {
+              assert.equal(task, "compare"); report.sourceBefore = sources();
+              const manifest = readAssetManifest();
+              assert.deepEqual(nativeInputs(baseline, BASE), manifest.nativeInputs);
+              assert.deepEqual(nativeInputs(candidate, CAND), manifest.nativeInputs);
+              assert.deepEqual(report.sourceBefore.candidate, manifest.source); assert.deepEqual(manifest.pins, pins);
+              report.assetsSha256 = hash(join(assets, "inputs.json")); report.nativeInputSha256 = manifest.nativeInputSha256;
+              admit(true);
+            } else if (mode === "build") {
+              const manifest = readAssetManifest(); report.tools = tools();
+              assert.deepEqual(report.tools, manifest.tools, "native toolchain differs");
+              report.builds = {};
+              for (const [name, root] of [["baseline", baseline], ["candidate", candidate]]) {
+                await checked(name + "-install", "pnpm", ["install", "--frozen-lockfile"], root, 20);
+                const listing = capture("tar", ["-tzf", join(assets, "native.tar.gz")], root).split("\n");
+                assert.ok(listing.every(path => /^(packages\/llvm-linux-x64-gnu\/bin\/|packages\/runtime-linux-x64-gnu\/artifacts\/|packages\/runtime-linux-x64-gnu\/runtime-pack\.json$)/.test(path) && !path.split("/").includes("..")));
+                assert.deepEqual(listing.filter(path => !path.endsWith("/")).sort(), manifest.nativeFiles.map(file => file.path).sort());
+                await checked(name + "-unpack", "tar", ["-xzf", join(assets, "native.tar.gz")], root, 10);
+                checkFacts(root, manifest.nativeFiles);
+                await checked(name + "-verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], root, 5);
+                await checked(name + "-build", "pnpm", ["build"], root, 25);
+                checkFacts(root, manifest.nativeFiles);
+                const files = builtFacts(root); assert.ok(files.length > 0);
+                assert.ok(files.some(file => file.path === "packages/cli/dist/bootstrap.js"));
+                report.builds[name] = { files, digest: sha(JSON.stringify(files)), lockSha256: hash(join(root, "pnpm-lock.yaml")) }; save();
+              }
+              report.sourcePreGate = sources(); assert.deepEqual(report.sourcePreGate, report.sourceBefore);
+              admit(false);
+            } else if (mode === "bench") {
+              assert.equal(task, "compare"); const manifest = readAssetManifest();
+              assert.equal(hash(join(assets, "inputs.json")), report.assetsSha256); verifyBuiltInputs(manifest);
+              for (const name of ["SCRIPTC_SAN", "SCRIPTC_LIBNODE", "SCRIPTC_CPU_LEVEL", "SCRIPTC_CPU_DISPATCH",
+                "SCRIPTC_LINKER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_OPTIMIZATION", "SCRIPTC_NO_CACHE", "SCRIPTC_TIMING"])
+                assert.equal(process.env[name], undefined, "benchmark override: " + name);
+              const lock = "/tmp/scriptc-bench-runtime.lock";
+              report.lock = { path: lock, absentBefore: !existsSync(lock), absentAfter: false }; save();
+              assert.equal(report.lock.absentBefore, true, "canonical lock has another owner");
+              const scratch = () => readdirSync("/tmp").filter(name => name.startsWith("scriptc-bench-runtime-")).sort();
+              report.scratchBefore = scratch(); save();
+              const output = join(out, "numeric-runtime.json");
+              const args = ["scripts/bench-runtime.mjs", "--baseline=" + baseline, "--candidate=" + candidate,
+                "--workloads=numeric-kernels", "--runs=15", "--warmup=2", "--timeout=120", "--layouts=1", "--json=" + output];
+              report.invocation = { command: "node", args, cwd: candidate, nodeEnabled: true, canonicalLock: true,
+                statisticsSourceSha256: pins["scripts/bench-runtime.mjs"], rawNodeEvidenceRetained: false }; save();
+              let code;
+              try { code = await execute("numeric-runtime", "node", args, candidate, 35); }
+              finally {
+                report.lock.absentAfter = !existsSync(lock); report.scratchAfter = scratch();
+                report.scratchCleanupPassed = JSON.stringify(report.scratchAfter) === JSON.stringify(report.scratchBefore); save();
+              }
+              assert.equal(report.lock.absentAfter, true, "benchmark lock was not released");
+              assert.equal(report.scratchCleanupPassed, true, "canonical scratch cleanup incomplete");
+              assert.ok(statSync(output).size <= 16 * 1024 ** 2);
+              report.runtimeJson = { path: "numeric-runtime.json", size: statSync(output).size, sha256: hash(output) };
+              report.verdict = verifyRuntime(JSON.parse(readFileSync(output, "utf8")));
+              verifyBuiltInputs(manifest);
+              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              report.nativeInputsVerifiedAfter = true; report.complete = true;
+              report.status = report.verdict.restorationPassed ? "complete" : "failed"; save();
+              assert.equal(code, 0, "canonical runtime comparison failed");
+              assert.equal(report.verdict.restorationPassed, true, "numeric runtime restoration is slower");
+            } else if (mode === "finish") {
+              try {
+                cleanupSwap();
+                assert.ok(report.steps.every(step => step.groupDrained === true), "owned process group unresolved");
+                if (task === "compare" && report.lock) {
+                  assert.equal(report.lock.absentAfter, true); assert.equal(report.scratchCleanupPassed, true);
+                }
+                report.cleanupPassed = true;
+              } finally {
+                report.sourceAfterCleanup = sources(); assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+              }
+              assert.equal(report.complete, true, "setup or measurement incomplete"); assert.equal(report.status, "complete");
+            } else throw Error("unknown mode: " + mode);
+          } catch (error) {
+            report.status = "failed"; (report.errors ??= []).push({ phase: mode, error: scrub(error.stack ?? error) });
+            process.exitCode = 1;
+          } finally {
+            if (interrupted) { report.status = "failed"; report.interrupted = interrupted; process.exitCode = 1; }
+            if (mode !== "finish" && report.status === "failed") {
+              try { report.sourceAfterFailure = sources(); } catch (error) { report.sourceError = scrub(error.stack ?? error); }
+            }
+            report.updatedAt = new Date().toISOString(); save();
+            console.log(JSON.stringify({ task, mode, status: report.status, complete: report.complete }));
+            if (process.exitCode) console.error("[numeric-runtime] FAILED (exit 1)");
+          }
+          RUNNER
+          node --check "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+      - name: Verify native input equality and admit runner capacity
+        timeout-minutes: 10
+        run: node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" prepare
+      - uses: ./.github/actions/llvm-linux
+      - name: Install frozen dependencies
+        timeout-minutes: 22
+        run: node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" install-native
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Verify and package shared native inputs
+        timeout-minutes: 25
+        run: node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" package
+      - name: Finalize source and owned swap
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if test -f "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs"; then
+            node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" finish
+          else
+            mkdir -p "$RUNNER_TEMP/numeric-runtime-native"
+            printf '%s\n' '{"complete":false,"status":"failed","error":"runner setup failed"}' > "$RUNNER_TEMP/numeric-runtime-native/summary.json"
+            echo '[numeric-runtime] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: numeric-runtime-native-assets
+          path: ${{ runner.temp }}/numeric-runtime-assets
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numeric-runtime-native-evidence
+          path: ${{ runner.temp }}/numeric-runtime-native
+          if-no-files-found: error
+          retention-days: 1
+
+  compare:
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NR_JOB: compare
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 71a9441c824262150f35acd2b8359f156ed3289c
+          path: baseline
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ed5cf0b5493a8969c25261ae21cfa6801e2dc82d
+          path: candidate
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: numeric-runtime-native-assets
+          path: ${{ runner.temp }}/numeric-runtime-assets
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+          cache-dependency-path: |
+            baseline/pnpm-lock.yaml
+            candidate/pnpm-lock.yaml
+      - name: Verify source and native inputs; admit paired-build capacity
+        timeout-minutes: 10
+        run: node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" initialize
+      - uses: ./candidate/.github/actions/llvm-linux
+      - uses: ./candidate/.github/actions/zig
+      - name: Build each checkout with its own frozen dependencies
+        timeout-minutes: 70
+        run: node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" build
+      - name: Compare the canonical numeric workload
+        timeout-minutes: 38
+        run: |
+          ulimit -c 0
+          sudo sysctl -w kernel.core_pattern=core
+          node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" bench
+      - name: Finalize source and owned swap
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if test -f "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs"; then
+            node "$RUNNER_TEMP/numeric-runtime-assets/runner.mjs" finish
+          else
+            mkdir -p "$RUNNER_TEMP/numeric-runtime-$NR_JOB"
+            printf '%s\n' '{"complete":false,"status":"failed","error":"setup failed before runner download"}' > "$RUNNER_TEMP/numeric-runtime-$NR_JOB/summary.json"
+            echo '[numeric-runtime] FAILED (exit 1)' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numeric-runtime-comparison
+          path: ${{ runner.temp }}/numeric-runtime-compare
+          if-no-files-found: error
+          retention-days: 1
