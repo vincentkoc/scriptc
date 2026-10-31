@@ -1,0 +1,565 @@
+name: Diagnose Darwin three stderr
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-darwin-three-stderr.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diagnose-darwin-three-stderr
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: macos-15
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
+          path: source
+          persist-credentials: false
+      - name: Verify the frozen source
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = 022f251fc38b4c169333f133398ee5150172f2bc
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+      - name: Authenticate the exact macOS native archive
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'DOWNLOAD'
+          import hashlib, json, os, shutil, stat, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          BASE = Path(os.environ["RUNNER_TEMP"])
+          OUT, WORK = BASE / "darwin-three-proof", BASE / "darwin-three-work"
+          SOURCE = Path(os.environ["GITHUB_WORKSPACE"]) / "source"
+          ORIGIN = {"workflow": "ffee2a1cd75230aa556294cdac6fabd8d383ffe5", "run": "41219050544", "attempt": "1", "job": 124589635389, "source": "022f251fc38b4c169333f133398ee5150172f2bc"}
+          ARTIFACT = 13049073593
+          ZIP_SHA = "d80e2888047067c37708a156491d92478a455e17b99b5ebbf2e9a96f92b8f517"
+          CONSUMER = {"workflow": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          OUT.mkdir()
+          WORK.mkdir(mode=0o700)
+          with (WORK / "owner.json").open("x") as marker:
+              marker.write(json.dumps(CONSUMER, sort_keys=True) + "\n")
+          receipt = {"origin": ORIGIN, "consumer": CONSUMER, "verified": False}
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+          def safe_name(name):
+              path = PurePosixPath(name)
+              assert name and "\\" not in name and "\0" not in name, "invalid archive path characters"
+              assert not path.is_absolute() and ".." not in path.parts, "absolute or parent archive path"
+              assert path.as_posix() == name.rstrip("/") and path.parts, "noncanonical archive path"
+              return path
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+          stage = "metadata"
+          try:
+              token = os.environ.pop("GH_TOKEN")
+              opener = urllib.request.build_opener(NoRedirect)
+              headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "scriptc-darwin-three-diagnostic"}
+              def api(path):
+                  with opener.open(urllib.request.Request("https://api.github.com/repos/vincentkoc/scriptc/" + path, headers=headers), timeout=120) as response:
+                      raw = response.read(1024**2 + 1)
+                  assert len(raw) <= 1024**2, "API response exceeds budget"
+                  return json.loads(raw)
+              metadata = api(f"actions/artifacts/{ARTIFACT}")
+              assert metadata["id"] == ARTIFACT and metadata["name"] == "native-darwin-arm64" and metadata["expired"] is False, "artifact identity or expiry mismatch"
+              assert metadata["size_in_bytes"] == 82387094 and metadata["digest"] == "sha256:" + ZIP_SHA, "artifact ZIP metadata mismatch"
+              assert str(metadata["workflow_run"]["id"]) == ORIGIN["run"] and metadata["workflow_run"]["head_sha"] == ORIGIN["workflow"], "artifact producer mismatch"
+              stage = "job"
+              job = api(f"actions/jobs/{ORIGIN['job']}")
+              assert job["run_id"] == int(ORIGIN["run"]) and job["head_sha"] == ORIGIN["workflow"], "native job producer mismatch"
+              assert job["conclusion"] == "success" and job["status"] == "completed", "native producer did not complete successfully"
+              assert job["name"] == "build (macOS arm64 native packages)", "native job name mismatch"
+              assert all(step["conclusion"] in ("success", "skipped") for step in job["steps"]), "native job step failed"
+              stage = "download"
+              try:
+                  response = opener.open(urllib.request.Request(f"https://api.github.com/repos/vincentkoc/scriptc/actions/artifacts/{ARTIFACT}/zip", headers=headers), timeout=120)
+              except urllib.error.HTTPError as error:
+                  assert error.code == 302, "artifact redirect refused"
+                  location = error.headers.get("Location", "")
+                  error.close()
+                  parsed = urllib.parse.urlsplit(location)
+                  assert parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password, "invalid artifact storage redirect"
+                  response = opener.open(urllib.request.Request(location), timeout=120)
+              archive = WORK / "native.zip"
+              size = 0
+              with response, archive.open("xb") as output:
+                  while block := response.read(1024 * 1024):
+                      size += len(block)
+                      assert size <= 128 * 1024**2, "ZIP download exceeds budget"
+                      output.write(block)
+              assert size == 82387094 and digest(archive) == ZIP_SHA, "downloaded ZIP identity mismatch"
+              tar_path = WORK / "native-darwin-arm64.tar.gz"
+              stage = "zip"
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  assert len(entries) == 1 and entries[0].filename == tar_path.name, "ZIP member inventory mismatch"
+                  item = entries[0]
+                  assert stat.S_IFMT(item.external_attr >> 16) in (0, stat.S_IFREG) and not item.flag_bits & 1, "unsafe ZIP member type"
+                  assert 0 < item.file_size <= 256 * 1024**2, "ZIP expansion exceeds budget"
+                  with bundle.open(item) as stream, tar_path.open("xb") as output:
+                      shutil.copyfileobj(stream, output, 1024 * 1024)
+                  assert tar_path.stat().st_size == item.file_size, "ZIP entry size mismatch"
+              allowed = ["packages/llvm-darwin-arm64/bin", "packages/runtime-darwin-arm64/artifacts", "packages/runtime-darwin-arm64/runtime-pack.json"]
+              files, seen = [], set()
+              stage = "tar"
+              with tarfile.open(tar_path, "r:gz") as bundle:
+                  members = bundle.getmembers()
+                  assert 0 < len(members) <= 20000 and sum(item.size for item in members) <= 2 * 1024**3, "tar inventory exceeds budget"
+                  for item in members:
+                      name = safe_name(item.name).as_posix()
+                      assert name not in seen, "duplicate tar member"
+                      seen.add(name)
+                      assert any(name == prefix or name.startswith(prefix + "/") for prefix in allowed), "tar member outside native artifact roots"
+                      assert item.isdir() or item.isfile(), "links and special files are not admitted"
+                      assert not item.mode & 0o7000, "unsafe tar permissions"
+                      target = SOURCE / name
+                      assert not target.is_symlink() and not target.exists(), "native artifact would overwrite an existing path"
+                      assert all(not parent.is_symlink() for parent in target.parents if parent != SOURCE.parent), "symlink in extraction parent"
+                  for item in members:
+                      target = SOURCE / item.name
+                      if item.isdir():
+                          target.mkdir(parents=True, exist_ok=True)
+                          continue
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with bundle.extractfile(item) as stream, target.open("xb") as output:
+                          shutil.copyfileobj(stream, output, 1024 * 1024)
+                      target.chmod(item.mode & 0o777)
+                      assert target.stat().st_size == item.size, "tar entry size mismatch"
+                      files.append({"path": item.name, "bytes": item.size, "sha256": digest(target)})
+              receipt.update({"artifact": ARTIFACT, "name": metadata["name"], "zipBytes": size, "zipSha256": ZIP_SHA, "tarSha256": digest(tar_path), "files": sorted(files, key=lambda row: row["path"]), "verified": True})
+              archive.unlink()
+              tar_path.unlink()
+          except Exception as error:
+              # HTTP exception text can contain signed storage URLs; never publish it.
+              receipt["failureType"] = type(error).__name__
+              receipt["failureStage"] = stage
+              if isinstance(error, urllib.error.HTTPError):
+                  receipt["httpStatus"] = error.code
+              if isinstance(error, AssertionError):
+                  receipt["admissionReason"] = str(error)
+              print("[darwin-three-download] FAILED (exit 1)")
+              raise SystemExit(1)
+          finally:
+              (OUT / "native-origin.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          DOWNLOAD
+      - name: Prepare the bounded compile observer
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/darwin-three-proof"
+          cat > "$RUNNER_TEMP/darwin-three-proof/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { dirname, join, relative, resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+
+          const root = join(process.env.GITHUB_WORKSPACE, "source");
+          const out = join(process.env.RUNNER_TEMP, "darwin-three-proof");
+          const work = join(process.env.RUNNER_TEMP, "darwin-three-work");
+          const self = resolve(process.argv[1]);
+          const consumerIdentity = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT };
+          const sourceHead = "022f251fc38b4c169333f133398ee5150172f2bc";
+          const sourcePins = {"AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/three.test.ts":"6260fb23d1f98752b201192db3a14e8c01f6c8419c9508a6d311c9962327c86a","tests/fixtures/three/procedural-geometry.mjs":"e6fa26f371d954d0f3473a649646234dfa455534646b319d3293fe979ade9615","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/backend/debug-symbols.ts":"979ae280386fc98ab75643e925e7067357b31d495b69026e960e2376c280bbb3","packages/compiler/src/backend/native/executable.ts":"3af4b1034b7cb9750720d78c1e803743aeee1e1cf60b57396cf50d351ee33d39","packages/compiler/src/backend/native/driver.ts":"64d65bb08e9d9b97e9f9a48d55b02d8d4f0fd3bdc5eee4ae937b67abc57cd82e","packages/compiler/src/backend/native/session.ts":"b82407816ed96933fee39c9cd5dd7f47bb0be6a4a025bd1841e7c3ca2baf56ce","packages/compiler/src/backend/build-cache.ts":"f4a3dfa56c1063cb1b5fd9642bd30af79e6727e51e6250b2de27b2a2448c33e2","packages/compiler/src/backend/cache-root.ts":"7a9e30aa817aea4b45bf8866d5b53677872885ce5b9f43536ca94f9bb677e628","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/runtime-darwin-arm64/package.json":"955755aff1488955fb3181895559ed72ed9cc2f1103ef7a3fcbbee9dff94ecd0","packages/runtime-darwin-arm64/scripts/verify.mjs":"758b2fef508d2a2ff23ce43a709adb15166461aac66ece808578abea85d2f357","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/llvm-darwin-arm64/package.json":"aa242a8579d99df616078e805e7b7441c94e3867dd8f722ed32929fba4b4e383","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631","packages/compiler/src/backend/native/process.ts":"341c216690b7f5d401786f46e80e5bba3c7f8b5c22896d1d0c047e5f328c75ea","packages/compiler/src/backend/native/runtime-inputs.ts":"261d9462b2464d085d44f1c767e82adbbc3672c787b71c602de1046f3ccf45d8","packages/compiler/src/backend/native/tool-identity.ts":"2d239087986b664aff948f9a8fa18ac2ada65b0102cd65e3fe9472147deb4cb8"};
+          const nativeInputSha256 = "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25";
+          const entry = join(root, "tests/fixtures/three/procedural-geometry.mjs");
+          const build = join(work, "compile"), cache = join(work, "cache"), scratch = join(work, "tmp");
+          const compileOptions = { outDir: build, outPath: join(build, "procedural-geometry"), backend: "llvm", npmStatic: ["three"], optimization: "dev", sanitize: true };
+          const CAP = 16 * 1024 * 1024;
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          function capture(command, args = [], cwd = root) {
+            const value = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
+            assert.equal(value.error, undefined, command + " launch failed");
+            assert.equal(value.status, 0, command + " failed: " + value.stderr);
+            return value.stdout.trim();
+          }
+          function fields(error) {
+            const object = error === null || (typeof error !== "object" && typeof error !== "function") ? Object(error) : error;
+            return Object.fromEntries(["name", "message", "stack", "code", "cmd", "killed", "signal", "driver", "stdout", "stderr"].map(key => {
+              const value = { present: key in object, own: Object.hasOwn(object, key) };
+              if (value.present) {
+                const observed = object[key];
+                value.type = Buffer.isBuffer(observed) ? "Buffer" : observed === null ? "null" : typeof observed;
+                if (!["stdout", "stderr"].includes(key) && (observed === null || ["string", "boolean", "number"].includes(typeof observed))) {
+                  if (typeof observed === "string") {
+                    const bytes = Buffer.from(observed, "utf8");
+                    value.bytes = bytes.length; value.sha256 = digest(bytes); value.storageTruncated = bytes.length > CAP;
+                    value.value = value.storageTruncated ? bytes.subarray(0, CAP).toString("utf8") : observed;
+                  } else value.value = observed;
+                }
+              }
+              return [key, value];
+            }));
+          }
+          function exposedStream(error, key) {
+            const object = Object(error);
+            const descriptor = fields(object)[key];
+            if (!descriptor.present) return descriptor;
+            const value = object[key];
+            if (!(typeof value === "string" || Buffer.isBuffer(value))) return { ...descriptor, supported: false };
+            const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+            const path = join(out, "error-" + key + ".raw");
+            writeFileSync(path, bytes.subarray(0, CAP));
+            return { ...descriptor, supported: true, representation: Buffer.isBuffer(value) ? "exposed-buffer-bytes" : "utf8-encoding-of-exposed-js-string",
+              capturedBytes: bytes.length, capturedSha256: digest(bytes), retained: record(path), storageTruncated: bytes.length > CAP };
+          }
+          function classify(attempt, processResult, inputsVerified) {
+            const terminal = ["returned", "thrown"].includes(attempt?.status);
+            const complete = terminal && attempt.compileCalls === 1 && attempt.storageComplete === true &&
+              processResult.status === "exited" && processResult.signal === null && processResult.drained === true &&
+              processResult.storageComplete === true && processResult.streamsClosed === true && !processResult.forcedCleanup && inputsVerified === true &&
+              ((attempt.status === "returned" && processResult.code === (attempt.ok ? 0 : 1)) || (attempt.status === "thrown" && processResult.code === 1));
+            return { diagnosticComplete: complete, compileSucceeded: complete && attempt.status === "returned" && attempt.ok === true,
+              observation: !complete ? "incomplete" : attempt.status === "returned" && attempt.ok ? "not-reproduced" : "compile-failure-observed",
+              runtimeAcceptance: false, attributionEstablished: false };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink(), "unexpected symlink: " + path);
+              if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile(), "unexpected special file: " + path);
+              return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function verifyWorkOwner() {
+            const info = lstatSync(work);
+            assert.ok(info.isDirectory() && !info.isSymbolicLink(), "owned scratch is not a directory");
+            assert.equal(info.mode & 0o777, 0o700, "owned scratch permissions changed");
+            const marker = join(work, "owner.json"), markerInfo = lstatSync(marker);
+            assert.ok(markerInfo.isFile() && !markerInfo.isSymbolicLink(), "scratch owner marker is not a regular file");
+            const owner = json(marker);
+            assert.deepEqual(owner, consumerIdentity, "scratch owner identity mismatch");
+            return owner;
+          }
+          function source() {
+            assert.equal(capture("git", ["rev-parse", "HEAD"]), sourceHead);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const found = Object.fromEntries(Object.keys(sourcePins).map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(found, sourcePins);
+            return { head: sourceHead, clean: true, pins: found };
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const name = row.slice(row.indexOf("\t") + 1);
+              return name.startsWith("native/llvm-codegen/") ||
+                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
+            });
+            assert.equal(rows.length, 1049); assert.equal(digest(rows.join("\n")), nativeInputSha256);
+            const disk = rows.map(row => { const path = row.split("\t")[1]; return { path, sha256: hash(join(root, path)) }; });
+            return { sourceTreeRows: rows, sourceTreeSha256: nativeInputSha256, disk };
+          }
+          function nativeFiles(origin) {
+            assert.equal(origin.verified, true);
+            assert.equal(origin.origin.source, sourceHead);
+            assert.equal(origin.origin.workflow, "ffee2a1cd75230aa556294cdac6fabd8d383ffe5");
+            assert.equal(origin.origin.run, "41219050544");
+            assert.equal(origin.origin.attempt, "1");
+            assert.equal(origin.origin.job, 124589635389);
+            assert.equal(origin.artifact, 13049073593);
+            assert.equal(origin.zipSha256, "d80e2888047067c37708a156491d92478a455e17b99b5ebbf2e9a96f92b8f517");
+            for (const item of origin.files) {
+              assert.ok(/^(packages\/llvm-darwin-arm64\/bin\/|packages\/runtime-darwin-arm64\/artifacts\/|packages\/runtime-darwin-arm64\/runtime-pack\.json$)/.test(item.path));
+              const path = join(root, item.path);
+              assert.ok(lstatSync(path).isFile()); assert.equal(statSync(path).size, item.bytes); assert.equal(hash(path), item.sha256);
+            }
+            return origin.files;
+          }
+          function identity(command, args) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            return { command, path, sha256: hash(path), version: capture(command, args) };
+          }
+          function tools() {
+            const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+            return {
+              node: identity(process.execPath, ["--version"]), pnpm: identity("pnpm", ["--version"]),
+              clang: identity("clang", ["--version"]), dsymutil: identity("dsymutil", ["--version"]),
+              xcrun: identity("xcrun", ["--version"]), clangXcrun: capture("xcrun", ["--find", "clang"]),
+              dsymutilXcrun: capture("xcrun", ["--find", "dsymutil"]),
+              sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]),
+                build: capture("xcrun", ["--sdk", "macosx", "--show-sdk-build-version"]),
+                settings: record(join(sdk, "SDKSettings.json")) },
+              xcode: capture("xcodebuild", ["-version"]), developerDirectory: capture("xcode-select", ["-p"]),
+              swVers: capture("sw_vers"), uname: capture("uname", ["-a"]),
+              imageOS: process.env.ImageOS ?? null, imageVersion: process.env.ImageVersion ?? null,
+            };
+          }
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE"]) delete childEnv[key];
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length; sink.hash.update(bytes);
+              const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+              if (keep.length) { writeSync(sink.fd, keep); sink.retained += keep.length; }
+              if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached Darwin group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function requireSuccess(value) {
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.forcedCleanup, false);
+          }
+          async function childMain() {
+            verifyWorkOwner();
+            writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            if (process.argv[3] !== "compile") {
+              const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+              child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+              child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+              return;
+            }
+            const attempt = { status: "preparing", compileCalls: 0, storageComplete: true, options: compileOptions, entry,
+              captureBoundary: "Only values exposed by compile(); wrappers may discard child fields. Exposed strings are re-encoded as UTF-8. Captured byte counts are not total child-produced output.",
+              runtimeExecuted: false };
+            save("compile-attempt.json", attempt);
+            try {
+              const { compile } = await import(pathToFileURL(join(root, "packages/compiler/dist/index.js")));
+              assert.equal(process.env.SCRIPTC_SAN, "1"); assert.equal(process.env.SCRIPTC_TEST_STABLE_TOOLCHAIN, "1");
+              for (const key of ["SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "NODE_OPTIONS"]) assert.equal(process.env[key], undefined);
+              assert.equal(statSync(cache).mode & 0o777, 0o700);
+              assert.equal(process.env.TMPDIR, scratch); assert.equal(statSync(scratch).mode & 0o777, 0o700);
+              const { prepareBuildCacheRoot } = await import(pathToFileURL(join(root, "packages/compiler/dist/backend/build-cache.js")));
+              assert.equal(await prepareBuildCacheRoot(cache), cache);
+              attempt.compileCalls = 1; attempt.status = "compiling"; attempt.startedAt = new Date().toISOString(); save("compile-attempt.json", attempt);
+              const start = performance.now();
+              let result;
+              try {
+                result = await compile(entry, compileOptions);
+              } catch (error) {
+                attempt.elapsedMs = performance.now() - start; attempt.status = "thrown"; attempt.error = fields(error);
+                attempt.thrownType = error === null ? "null" : typeof error;
+                if (typeof error === "string") attempt.thrownValue = error;
+                attempt.streams = { stdout: exposedStream(error, "stdout"), stderr: exposedStream(error, "stderr") };
+                attempt.storageComplete = Object.values(attempt.error).every(field => !field.storageTruncated) && Object.values(attempt.streams).every(stream => !stream.present || stream.supported && !stream.storageTruncated);
+                attempt.childCaptureMayBeTruncated = attempt.error.code.value === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+                // A wrapped CcCompileError can omit cmd/code. Absence does not identify or exonerate a child.
+                save("compile-attempt.json", attempt); process.exitCode = 1; return;
+              }
+              attempt.elapsedMs = performance.now() - start; attempt.status = "returned"; attempt.ok = result.ok === true;
+              const bytes = Buffer.from(JSON.stringify(result, null, 2) + "\n");
+              writeFileSync(join(out, "compile-result.json"), bytes.subarray(0, CAP));
+              attempt.result = record(join(out, "compile-result.json")); attempt.storageComplete = bytes.length <= CAP;
+              if (attempt.ok) {
+                assert.ok(statSync(compileOptions.outPath).isFile());
+                attempt.binary = { bytes: statSync(compileOptions.outPath).size, sha256: hash(compileOptions.outPath), executed: false };
+              }
+            } catch (error) { attempt.status = attempt.compileCalls === 0 ? "preparation-failed" : "observer-failed"; attempt.observerError = fields(error); }
+            save("compile-attempt.json", attempt);
+            process.exitCode = attempt.status === "returned" && attempt.ok && attempt.storageComplete ? 0 : 1;
+          }
+          async function main() {
+            const report = { schemaVersion: 1, source: sourceHead, consumer: consumerIdentity,
+              originFailure: { run: "41219050544", elapsedMs: 311945, concurrent: true },
+              runnerSha256: hash(self), expectedCompileCalls: 1, diagnosticComplete: false, runtimeAcceptance: false, attributionEstablished: false,
+              limits: { compileSeconds: 1200, retainedBytesPerStream: CAP, childProcessBuffersUnchanged: true, serialReplayCannotExcludeConcurrency: true } };
+            save("summary.json", report);
+            try {
+              report.workOwner = verifyWorkOwner();
+              assert.equal(process.platform, "darwin"); assert.equal(process.arch, "arm64"); assert.equal(process.version, "v24.22.0");
+              assert.equal(capture("pnpm", ["--version"]), "11.1.3");
+              report.sourceBefore = source(); report.nativeSourceInputs = nativeInputs();
+              save("native-source-inputs.json", report.nativeSourceInputs);
+              report.origin = json(join(out, "native-origin.json")); assert.deepEqual(report.origin.consumer, report.consumer); report.nativeFilesBefore = nativeFiles(report.origin);
+              report.install = await run("install", "pnpm", ["install", "--frozen-lockfile"], 1200); requireSuccess(report.install);
+              report.runtimeVerification = await run("runtime-verification", process.execPath, ["packages/runtime-darwin-arm64/scripts/verify.mjs"], 120); requireSuccess(report.runtimeVerification);
+              report.workspaceBuild = await run("workspace-build", "pnpm", ["build"], 900); requireSuccess(report.workspaceBuild);
+              report.nativeFilesPrepared = nativeFiles(report.origin); assert.deepEqual(report.nativeFilesPrepared, report.nativeFilesBefore);
+              const helper = join(root, "packages/llvm-darwin-arm64/bin/scriptc-llvm-codegen");
+              report.helper = { path: relative(root, helper), sha256: hash(helper), version: JSON.parse(capture(helper, ["version", "--format=json"])) };
+              assert.equal(report.helper.version.ok, true); assert.equal(report.helper.version.protocol_version, "1"); assert.equal(report.helper.version.llvm_version, "22.1.8");
+              assert.equal(report.helper.version.scriptc_package_version, json(join(root, "packages/llvm-darwin-arm64/package.json")).version);
+              assert.ok(report.helper.version.host_triple.startsWith("arm64-apple-") || report.helper.version.host_triple.startsWith("aarch64-apple-"));
+              report.runtimeManifest = { sha256: hash(join(root, "packages/runtime-darwin-arm64/runtime-pack.json")), package: json(join(root, "packages/runtime-darwin-arm64/runtime-pack.json")).package };
+              assert.equal(report.runtimeManifest.package, "@scriptc/runtime-darwin-arm64");
+              report.toolsBefore = tools(); assert.ok(report.toolsBefore.imageOS && report.toolsBefore.imageVersion);
+              const threeRoot = realpathSync(join(root, "node_modules/three"));
+              report.dependencies = { three: { root: realpathSync(threeRoot), version: json(join(threeRoot, "package.json")).version, files: files(threeRoot) },
+                typescript: { version: json(join(root, "packages/compiler/node_modules/typescript/package.json")).version, files: files(realpathSync(join(root, "packages/compiler/node_modules/typescript"))) },
+                checker: { version: json(join(root, "packages/compiler/node_modules/tsc-ts/package.json")).version, files: files(realpathSync(join(root, "packages/compiler/node_modules/tsc-ts"))) } };
+              assert.equal(report.dependencies.three.version, "0.186.1");
+              report.compilerFilesBefore = files(join(root, "packages/compiler/dist"));
+              report.sourcePrepared = source(); assert.deepEqual(report.sourcePrepared, report.sourceBefore);
+              mkdirSync(build); mkdirSync(cache, { mode: 0o700 }); mkdirSync(scratch, { mode: 0o700 });
+              report.temporaryDirectory = { path: scratch, mode: statSync(scratch).mode & 0o777, deviation: "Compile worker TMPDIR is confined to owned scratch for timeout cleanup." };
+              assert.equal(report.temporaryDirectory.mode, 0o700);
+              report.cache = { path: cache, mode: statSync(cache).mode & 0o777, initiallyEmpty: readdirSync(cache).length === 0, disabled: false };
+              assert.equal(report.cache.mode, 0o700); assert.equal(report.cache.initiallyEmpty, true);
+              copyFileSync(entry, join(out, "procedural-geometry.mjs")); report.fixture = record(join(out, "procedural-geometry.mjs"));
+              save("summary.json", report);
+              report.compileProcess = await run("compile", "compile", [], 1200, { SCRIPTC_SAN: "1", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1", SCRIPTC_CACHE_DIR: cache, TMPDIR: scratch });
+              report.attempt = json(join(out, "compile-attempt.json"));
+              report.sourceAfter = source(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              assert.deepEqual(nativeInputs(), report.nativeSourceInputs);
+              report.nativeFilesAfter = nativeFiles(report.origin); assert.deepEqual(report.nativeFilesAfter, report.nativeFilesBefore);
+              report.toolsAfter = tools(); assert.deepEqual(report.toolsAfter, report.toolsBefore);
+              assert.deepEqual(files(join(root, "packages/compiler/dist")), report.compilerFilesBefore);
+              for (const [name, path] of [["three", threeRoot], ["typescript", join(root, "packages/compiler/node_modules/typescript")], ["checker", join(root, "packages/compiler/node_modules/tsc-ts")]]) assert.deepEqual(files(realpathSync(path)), report.dependencies[name].files);
+              report.inputsVerifiedAfter = true;
+              report.cache.entriesAfter = files(cache).length;
+              Object.assign(report, classify(report.attempt, report.compileProcess, report.inputsVerifiedAfter));
+            } catch (error) { report.failure = fields(error); }
+            save("summary.json", report);
+            // A serial replay never clears the original concurrent failure, even when compile succeeds.
+            process.stderr.write("[darwin-three-diagnostic] FAILED (exit 1)\n"); process.exitCode = 1;
+          }
+          function finalize() {
+            const report = existsSync(join(out, "summary.json")) ? json(join(out, "summary.json")) : { schemaVersion: 1, diagnosticComplete: false, runtimeAcceptance: false, attributionEstablished: false };
+            const cleanup = { completed: false, groupChecks: [] };
+            try {
+              cleanup.owner = verifyWorkOwner();
+              for (const name of readdirSync(out).filter(name => name.endsWith(".process.json"))) {
+                const processResult = json(join(out, name));
+                assert.equal(processResult.drained, true, "unresolved process result; retain scratch");
+                if (processResult.pid !== null) assert.ok(existsSync(join(out, name.replace(".process.json", ".owner.json"))));
+              }
+              for (const name of readdirSync(out).filter(name => name.endsWith(".owner.json"))) {
+                const owner = json(join(out, name));
+                const processPath = join(out, name.replace(".owner.json", ".process.json"));
+                assert.ok(existsSync(processPath), "missing terminal process receipt; retain scratch");
+                const processResult = json(processPath);
+                assert.equal(processResult.pid, owner.pid); assert.equal(processResult.drained, true);
+                assert.equal(owner.pid, owner.group); assert.ok(Number.isInteger(owner.group) && owner.group > 1 && owner.group !== process.pid);
+                const members = groupMembers(owner.group); cleanup.groupChecks.push({ owner: name, members });
+                assert.equal(members.length, 0, "owned child group is not drained; retain scratch");
+              }
+              // Only this workflow's scratch is removed; source and retained proof stay available.
+              assert.equal(dirname(work), process.env.RUNNER_TEMP); assert.equal(work, join(process.env.RUNNER_TEMP, "darwin-three-work"));
+              verifyWorkOwner();
+              rmSync(work, { recursive: true });
+              cleanup.completed = !existsSync(work);
+              report.sourceAfterCleanup = source();
+              if (report.sourceBefore) assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+              if (report.origin?.verified) assert.deepEqual(nativeFiles(report.origin), report.nativeFilesBefore ?? report.origin.files);
+            } catch (error) { cleanup.error = fields(error); report.diagnosticComplete = false; }
+            report.cleanup = cleanup;
+            report.finalPassed = false;
+            report.finalVerdict = report.diagnosticComplete && cleanup.completed ? report.observation : "incomplete";
+            save("summary.json", report);
+            save("proof-manifest.json", files(out).filter(item => item.path !== "proof-manifest.json"));
+            process.stderr.write("[darwin-three-diagnostic] FAILED (exit 1)\n"); process.exitCode = 1;
+          }
+          if (process.argv[2] === "--child") await childMain();
+          else if (process.argv[2] === "--finalize") finalize();
+          else await main();
+          RUNNER
+      - name: Replay the single sanitized dev compile
+        timeout-minutes: 60
+        run: node "$RUNNER_TEMP/darwin-three-proof/runner.mjs"
+      - name: Verify child drain and remove owned scratch
+        if: always()
+        timeout-minutes: 3
+        run: node "$RUNNER_TEMP/darwin-three-proof/runner.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-three-stderr
+          path: ${{ runner.temp }}/darwin-three-proof
+          if-no-files-found: error
+          retention-days: 1
