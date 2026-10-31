@@ -22,11 +22,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          ref: 923a57d63cc1a32324cd0a4d514935db3f2ad264
           persist-credentials: false
       - name: Verify source before setup
         run: |
-          test "$(git rev-parse HEAD)" = 4d31e4f1f1d983f4ef6ac2c231e8444613fbd486
+          test "$(git rev-parse HEAD)" = 923a57d63cc1a32324cd0a4d514935db3f2ad264
           test -z "$(git status --porcelain)"
       - uses: pnpm/action-setup@v4
         with:
@@ -57,7 +57,7 @@ jobs:
           import { pathToFileURL } from "node:url";
 
           const root = process.cwd();
-          const head = "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486";
+          const head = "923a57d63cc1a32324cd0a4d514935db3f2ad264";
           const openclawHead = "6f8c9bad8bd1a8c339f2d61985e637f9e557550d";
           const out = join(process.env.RUNNER_TEMP, "openclaw-sqlite-proof");
           const fixture = join(process.env.RUNNER_TEMP, "openclaw-sqlite-fixture");
@@ -111,10 +111,12 @@ jobs:
             "packages/runtime/src/scr_message.c": "4a95016e2b278140eb5328e75732323338f0b19b334f6b6caca8b58d5788eca7",
             "packages/runtime/src/scr_region.c": "db8dbd71d0f1f4d67dda0f46ad04df07d8aa34fc6b979f20316fa2f0631a5b21",
             "pnpm-lock.yaml": "f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353",
-            "packages/compiler/src/frontend/program.ts": "650b1930e34f06de8c2adb512b5751672eb9aca56f456b0634833b6267fee438",
-            "packages/compiler/src/frontend/resolve.ts": "bd2b2986b0de4d3517b61cbc35bd4044f959ee6bfc26d68fcae2c9578fb52396",
-            "packages/compiler/src/frontend/ts7/program-host.ts": "0103f62c06d1a798c23d339a4e91386d22549c2833c32bbb736e473ee206a322",
+            "packages/compiler/src/frontend/program.ts": "8892f772dc1801fc7465da89de9c479a54cc4a45d6265d5dd4bfe9ae1b154130",
+            "packages/compiler/src/frontend/resolve.ts": "61137787b745444a26ac2f2b2dd9938731b1f902b074351d3460aa9c536bd657",
+            "packages/compiler/src/frontend/ts7/program-host.ts": "adc5a76dcda60708bed553f07e6401ebfb5440492df87497e73a51229d620d5e",
             "packages/compiler/src/frontend/npm-static-type-exports-host.ts": "a85deb5382748ff712e08a494856a12eaaff76f752a08e2effcec26107d0037c",
+            "packages/compiler/src/frontend/program-node.ts": "ffb2931f97266923981eac111f04bfd441099f614fcb02860ef74a56b5c330a5",
+            "packages/compiler/src/frontend/project-sidecars.ts": "89605378de27b0ea05dcf1d43814ce07c0c6f69ca696401223fe1b39ca0b1995"
           };
           const source = () => {
             assert.equal(execute("source-head", "git", ["rev-parse", "HEAD"]), head);
@@ -229,7 +231,7 @@ jobs:
             const head = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 30000, maxBuffer: 65536 });
             const status = spawnSync("git", ["status", "--porcelain"], { encoding: "utf8", timeout: 30000, maxBuffer: 65536 });
             writeFileSync(summary, JSON.stringify({
-              source: "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486",
+              source: "923a57d63cc1a32324cd0a4d514935db3f2ad264",
               openclawSource: "6f8c9bad8bd1a8c339f2d61985e637f9e557550d",
               workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID,
               attempt: process.env.GITHUB_RUN_ATTEMPT, status: "failed",
@@ -237,7 +239,7 @@ jobs:
               scope: "native SQLite admission module using embedded Node builtins",
             probeExecution: "native", libnodePlacement: "beside",
               pureNativeSqlite: false, completeGateway: false, completeSuite: false,
-              sourceVerifiedAfter: head.status === 0 && status.status === 0 && head.stdout.trim() === "4d31e4f1f1d983f4ef6ac2c231e8444613fbd486" && status.stdout.trim() === "",
+              sourceVerifiedAfter: head.status === 0 && status.status === 0 && head.stdout.trim() === "923a57d63cc1a32324cd0a4d514935db3f2ad264" && status.stdout.trim() === "",
               finishedAt: new Date().toISOString(),
             }, null, 2) + "\n");
             console.error("[openclaw-sqlite-island] FAILED (exit 1)");
