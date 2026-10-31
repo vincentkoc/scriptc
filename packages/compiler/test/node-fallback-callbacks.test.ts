@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { expect, test } from "vitest";
 import { compile, deserializeModule } from "../src/index.js";
 import { checkPreflight, loadProgram } from "../src/frontend/program-node.js";
+import type { IrExpr, IrFunction, IrModule } from "../src/ir/ir.js";
+import { everyStmtList } from "../src/ir/traverse.js";
 
 const exactTypes = `
 type Equal<A, B> =
@@ -166,7 +168,7 @@ async function lowered(source: string) {
     }
     const result = await compile(entry, { outDir: directory, outPath, outputKind: "ir" });
     expect(result.ok, JSON.stringify(result.diagnostics)).toBe(true);
-    return JSON.stringify(deserializeModule(readFileSync(outPath, "utf8")).functions);
+    return deserializeModule(readFileSync(outPath, "utf8"));
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -196,7 +198,7 @@ process.${method}("rejectionHandled", (pending) => {
         ),
       )
       .join("\n");
-    const ir = await lowered(imported + source + exceptions);
+    const ir = JSON.stringify((await lowered(imported + source + exceptions)).functions);
     for (const operation of [
       "process.onUnhandledRejection",
       "process.offUnhandledRejection",
@@ -228,6 +230,78 @@ const options: StatOptions = { bigint: process.argv.length > 0 };
 ${calls}
 `,
     );
-    expect(ir).toContain('"fn":"fs.callbackCall"');
+    expect(JSON.stringify(ir.functions)).toContain('"fn":"fs.callbackCall"');
   },
 );
+
+function expressions(fn: IrFunction): IrExpr[] {
+  const result: IrExpr[] = [];
+  everyStmtList(fn.body, {
+    expr: (expr) => {
+      result.push(expr);
+      return true;
+    },
+    stmt: () => true,
+  });
+  return result;
+}
+
+function authoredFunction(mod: IrModule, source: string, name: string): IrFunction {
+  const start = source.indexOf("function " + name + "(");
+  expect(start).toBeGreaterThanOrEqual(0);
+  const functions = mod.functions.filter(
+    (fn) =>
+      fn.loc.file === mod.sourceFile &&
+      fn.loc.start === start &&
+      fn.params.every((param) => param.type.kind !== "jsval"),
+  );
+  expect(functions).toHaveLength(1);
+  return functions[0]!;
+}
+
+test.for(["fs", "node:fs"])(
+  "fallback %s StatOptions aliases keep mutations on the shared option bag",
+  async (specifier) => {
+    const mod = await lowered(`
+import { stat, lstat, fstat, type StatOptions as Options } from "${specifier}";
+type LocalOptions = Options;
+const original: LocalOptions = { bigint: false };
+const alias = original;
+alias.bigint = process.argv.length > 0;
+stat(".", original, (error) => console.log(error === null));
+lstat(".", alias, (error) => console.log(error === null));
+fstat(0, original, (error) => console.log(error === null));
+`);
+    for (const name of ["original", "alias"])
+      expect(mod.globals?.find((global) => global.name === name)?.type).toEqual({ kind: "dyn" });
+    const nodes = mod.functions.flatMap(expressions);
+    expect(
+      nodes.filter((expr) => expr.kind === "libCall" && expr.fn === "fs.callbackCall"),
+    ).toHaveLength(3);
+    expect(nodes).toContainEqual(
+      expect.objectContaining({
+        kind: "libCall",
+        fn: "dyn.keySet",
+        args: expect.arrayContaining([
+          expect.objectContaining({ kind: "strLit", value: "bigint" }),
+        ]),
+      }),
+    );
+  },
+);
+
+test("user StatOptions interfaces keep their native record representation", async () => {
+  const source = `
+interface StatOptions { bigint: number }
+function read(options: StatOptions): number { return options.bigint + 1; }
+console.log(read({ bigint: 41 }));
+`;
+  const mod = await lowered(source);
+  const fn = authoredFunction(mod, source, "read");
+  const type = fn.params[0]!.type;
+  expect(type.kind).toBe("record");
+  if (type.kind !== "record") throw new Error("user StatOptions lost its record type");
+  expect(mod.records?.find((record) => record.id === type.shapeId)?.fields).toContainEqual(
+    expect.objectContaining({ name: "bigint", type: { kind: "f64" } }),
+  );
+});

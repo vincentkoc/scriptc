@@ -4,6 +4,8 @@ All notable changes to scriptc will be documented in this file.
 
 ## Unreleased
 
+- Filesystem stat callbacks accept stored and aliased `StatOptions` bags, including changes to their `bigint` option before a call.
+
 - Bundled Node declarations infer promise payloads for rejection listeners, error origins for uncaught-exception listeners, and numeric or bigint snapshots for filesystem stat callbacks.
 
 - The native event loop delivers `rejectionHandled` after queued ticks and promise callbacks, using the listeners registered at delivery. Handled uncaught exceptions resume pending work through the existing immediate queue.
