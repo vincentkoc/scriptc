@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: efedbfcca3c374eeb119764dc2738e3ff41ecfb1
+  SOURCE_SHA: 26110e638a6ecca9cf46d4bfec635a9d6f29e767
 
 jobs:
   policy:
@@ -166,6 +166,7 @@ jobs:
                   for path in streams:
                       print(path.read_bytes()[-12000:].decode(errors="replace"), flush=True)
                   raise RuntimeError(name + " failed; full streams retained")
+          before = None
           try:
               assert capture(["git", "rev-parse", "HEAD"]) == report["source"]
               assert capture(["git", "status", "--porcelain=v1", "--untracked-files=all"]) == ""
@@ -197,16 +198,24 @@ jobs:
                   assert all(item["status"] == "passed" for item in assertions)
                   report[flavor] = {"passed": len(assertions), "skipped": result["numPendingTests"]}
                   assert report[flavor]["skipped"] == 0
-              report["sourceUnchanged"] = source_inputs() == before
-              assert report["sourceUnchanged"]
-              assert capture(["git", "rev-parse", "HEAD"]) == report["source"]
-              assert capture(["git", "status", "--porcelain=v1", "--untracked-files=all"]) == ""
               assert not cancellation, "cancelled before proof completion"
               report["complete"] = True
           except BaseException as error:
               report["failure"] = str(error)
               print(str(error), file=sys.stderr, flush=True)
           finally:
+              if before is not None:
+                  try:
+                      report["sourceUnchanged"] = source_inputs() == before
+                      assert report["sourceUnchanged"]
+                      assert capture(["git", "rev-parse", "HEAD"]) == report["source"]
+                      assert capture(["git", "status", "--porcelain=v1", "--untracked-files=all"]) == ""
+                  except BaseException as error:
+                      report["complete"] = False
+                      report["identityFailure"] = str(error)
+              if cancellation:
+                  report["complete"] = False
+                  report["cancelledSignal"] = cancellation
               save()
               files = [{"path": p.name, "bytes": p.stat().st_size, "sha256": digest(p.read_bytes())}
                        for p in sorted(out.iterdir()) if p.is_file()]
