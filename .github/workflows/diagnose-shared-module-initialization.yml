@@ -1,4 +1,4 @@
-name: Retry promise subscription order
+name: Diagnose typed promise subscription order
 
 on:
   push:
@@ -45,7 +45,7 @@ jobs:
           target: linux-x64-gnu
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
-      - name: Observe subscription order with its physical Node API dependency
+      - name: Observe typed subscription order with its physical Node API dependency
         run: |
           cat > "$RUNNER_TEMP/shared-module-diagnostic.mjs" <<'PROOF'
           import assert from "node:assert/strict";
@@ -66,15 +66,17 @@ jobs:
           // These fixtures diagnose promise bridges, not module continuation.
           const settledEvidence = {
             repeated: false, usedForQualification: false,
-            runs: ["https://github.com/vincentkoc/scriptc/actions/runs/41205789123"],
-            cases: ["node-island-promise-typed-roundtrip"],
+            runs: ["https://github.com/vincentkoc/scriptc/actions/runs/41205789123",
+              "https://github.com/vincentkoc/scriptc/actions/runs/41206587294"],
+            cases: ["node-island-promise-typed-roundtrip", "node-island-promise-subscription-order"],
           };
           const report = {
             label: process.env.DIAGNOSTIC_LABEL, head, workflow: process.env.GITHUB_SHA,
             runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
             status: "running", diagnosticComplete: false, qualificationComplete: false,
-            completeSuite: false, scope: "promise-subscription-order-retry", settledEvidence,
-            priorAttempt: { runId: "41205789123", workflow: "7a83f24c90b1149feed09a6e083e50cea28bde08", case: "node-island-promise-subscription-order", blocker: "fixture had no physical @scriptc/node package; compiler emitted startup refusal" },
+            completeSuite: false, scope: "promise-typed-subscription-order", settledEvidence,
+            controlEvidence: { runId: "41206587294", workflow: "c4ccc4e53a05a3dc04272323422103437656232e",
+              case: "node-island-promise-subscription-order", repeated: false, usedForQualification: false },
             expectedExecutionAttempts: 2, executionAttempts: 0, startedAt: new Date().toISOString(), steps: [], cases: [],
           };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -147,7 +149,60 @@ jobs:
                 ruleSource: "tests/harness/node-island-order.test.ts:63", pattern: ASAN_SWAP.source, flags: ASAN_SWAP.flags },
             };
           };
+          function verifyTypedPromiseIR(module, entry) {
+            // IR v17 preserves parameter/local IDs and the authored call operands.
+            // Require both routes to share p; a boxed native argument masks the typed path.
+            assert.equal(module.irVersion, 17);
+            const owned = name => {
+              const matches = module.functions.filter(fn => fn.name === name && fn.loc?.file === entry);
+              assert.equal(matches.length, 1, "authored native function is not unique: " + name);
+              assert.ok(matches[0].body.length > 0); return matches[0];
+            };
+            const collect = (value, predicate, found = []) => {
+              if (value && typeof value === "object") {
+                if (predicate(value)) found.push(value);
+                for (const child of Object.values(value)) collect(child, predicate, found);
+              }
+              return found;
+            };
+            const promise = { kind: "promise", inner: { kind: "f64" } };
+            const observer = owned("nativeObserve"), run = owned("run");
+            const parameters = observer.params.filter(param => param.name === "p");
+            assert.equal(parameters.length, 1); const parameter = parameters[0];
+            assert.equal(observer.params[1], parameter); assert.deepEqual(parameter.type, promise);
+            const direct = (value, localId) => {
+              assert.equal(value?.kind, "varRef"); assert.equal(value.localId, localId);
+              assert.deepEqual(value.type, promise);
+              return { kind: value.kind, localId: value.localId, type: value.type };
+            };
+            const awaits = collect(observer.body, node => node.kind === "awaitExpr");
+            assert.equal(awaits.length, 1, "typed observer must directly await p");
+            const awaitValue = direct(awaits[0].value, parameter.localId);
+            assert.deepEqual(awaits[0].type, { kind: "f64" });
+            const locals = run.locals.filter(local => local.name === "p");
+            assert.equal(locals.length, 1); const local = locals[0]; assert.deepEqual(local.type, promise);
+            const nativeCalls = collect(run.body, node => node.kind === "call" && node.callee === observer.name);
+            const islandCalls = collect(run.body, node => node.kind === "dynCall" && node.calleeName === "observe");
+            assert.equal(nativeCalls.length, 2); assert.equal(islandCalls.length, 2);
+            const nativeArguments = nativeCalls.map(call => {
+              assert.equal(call.args.length, 2); return direct(call.args[1], local.id);
+            });
+            const islandArguments = islandCalls.map(call => {
+              assert.equal(call.args.length, 2); const argument = call.args[1];
+              assert.equal(argument.kind, "dynFrom"); assert.deepEqual(argument.type, { kind: "dyn" });
+              return { kind: argument.kind, type: argument.type, value: direct(argument.value, local.id) };
+            });
+            return { status: "passed", parameter: { name: parameter.name, localId: parameter.localId, type: parameter.type },
+              awaitValue, awaitType: awaits[0].type, runPromise: { name: local.name, id: local.id, type: local.type },
+              nativeArguments, islandArguments };
+          }
           const sourceFiles = [
+            "packages/compiler/src/ir/ir.ts",
+            "packages/compiler/src/ir/serialize.ts",
+            "packages/compiler/src/index.ts",
+            "packages/compiler/src/frontend/lowering/lower-exprs.ts",
+            "packages/compiler/src/frontend/lowering/lower-calls.ts",
+            "packages/compiler/src/frontend/lowering/call-arguments.ts",
             "packages/node/package.json",
             "packages/node/index.js",
             "packages/node/index.d.ts",
@@ -197,9 +252,9 @@ jobs:
           });
           const specs = [
             {
-              "id": "node-island-promise-subscription-order",
-              "origin": "tests/corpus/node-island-promise-subscription-order",
-              "entry": "main.mjs",
+              "id": "node-island-promise-typed-subscription-order",
+              "origin": "tests/corpus/node-island-promise-typed-subscription-order",
+              "entry": "main.ts",
               "oracleRoute": "direct",
               "islandNotes": [],
               "shipped": [
@@ -207,7 +262,7 @@ jobs:
               ],
               "files": {
                 "lib.cjs": "\"use strict\";\n\nexports.observe = async function observe(label, p) {\n  console.log(label, \"island\", await p);\n};\n",
-                "main.mjs": "// @requires-libnode\nimport { requireModule } from \"@scriptc/node\";\n\nconst { observe } = requireModule(\"./lib.cjs\");\n\nasync function value() {\n  await null;\n  return 7;\n}\n\nasync function nativeObserve(label, p) {\n  console.log(label, \"native\", await p);\n}\n\nasync function run(label, islandFirst) {\n  const p = value();\n  if (islandFirst) {\n    const island = observe(label, p);\n    const native = nativeObserve(label, p);\n    await native;\n    await island;\n  } else {\n    const native = nativeObserve(label, p);\n    const island = observe(label, p);\n    await native;\n    await island;\n  }\n}\n\nasync function main() {\n  await run(\"native-first\", false);\n  await run(\"island-first\", true);\n}\nmain();\n"
+                "main.ts": "// @requires-libnode\nimport { requireModule } from \"@scriptc/node\";\n\nconst { observe } = requireModule(\"./lib.cjs\");\n\nasync function value(): Promise<number> {\n  await null;\n  return 7;\n}\n\nasync function nativeObserve(label: string, p: Promise<number>): Promise<void> {\n  console.log(label, \"native\", await p);\n}\n\nasync function run(label: string, islandFirst: boolean): Promise<void> {\n  const p: Promise<number> = value();\n  if (islandFirst) {\n    const island = observe(label, p);\n    const native = nativeObserve(label, p);\n    await native;\n    await island;\n  } else {\n    const native = nativeObserve(label, p);\n    const island = observe(label, p);\n    await native;\n    await island;\n  }\n}\n\nasync function main(): Promise<void> {\n  await run(\"native-first\", false);\n  await run(\"island-first\", true);\n}\nmain();\n"
               },
               "expected": "native-first native 7\nnative-first island 7\nisland-first island 7\nisland-first native 7\n"
             }
@@ -215,19 +270,19 @@ jobs:
           const fixtureDependencies = [
             {
               "source": "packages/node/package.json",
-              "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/package.json",
+              "target": "node-island-promise-typed-subscription-order/node_modules/@scriptc/node/package.json",
               "bytes": 725,
               "sha256": "fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947"
             },
             {
               "source": "packages/node/index.js",
-              "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.js",
+              "target": "node-island-promise-typed-subscription-order/node_modules/@scriptc/node/index.js",
               "bytes": 4273,
               "sha256": "3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665"
             },
             {
               "source": "packages/node/index.d.ts",
-              "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.d.ts",
+              "target": "node-island-promise-typed-subscription-order/node_modules/@scriptc/node/index.d.ts",
               "bytes": 2533,
               "sha256": "00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803"
             }
@@ -258,7 +313,7 @@ jobs:
           const recordFile = path => ({ path: relative(out, path), bytes: lstatSync(path).size, sha256: hash(path) });
           save();
           try {
-            assert.equal(report.fixtureDigest, "e2258073a0c23db09b7d2b590068456695b88553148f4ffe92f9aa8ce05dd8eb", "authored fixture bytes changed");
+            assert.equal(report.fixtureDigest, "40ea48a3322f884a2b4a2c9b1b30889e8b0db5ae6bd5cf25092abab41384a634", "authored fixture bytes changed");
             verifyDependencies(); report.dependenciesVerifiedBefore = true;
             report.sourceInputs = source(); report.sourceVerifiedBefore = true;
             assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
@@ -339,6 +394,7 @@ jobs:
                   assert.ok(nativeFunctions.includes(name), "authored function missing from native IR: " + name);
                   assert.ok(module.functions.some(fn => fn.name === name && fn.loc?.file === entry && fn.body.length > 0));
                 }
+                observed.ir.typedPromise = verifyTypedPromiseIR(module, entry);
                 observed.ir.moduleOwnership = { nativeEntryFunctions: nativeFunctions, files: tree.files, links: tree.links };
                 observed.ir.status = "passed";
               } catch (error) { observed.ir.status = "failed"; observed.ir.error = scrub(error.stack ?? error); }
@@ -359,6 +415,7 @@ jobs:
                   result.execution = { status: "blocked-before-execution", attempted: false };
                   assert.equal(observed.ir.status, "passed", "native probe blocked: IR admission failed");
                   assert.equal(observed.ir.startupRefusalAbsent, true, "native probe blocked: IR startup refusal was not excluded");
+                  assert.equal(observed.ir.typedPromise?.status, "passed", "native probe blocked: typed promise admission failed");
                   const beside = readLibnodePack(binary + ".libnode", { verifyHashes: true });
                   assert.deepEqual(beside.manifest, pack.manifest);
                   const modules = join(beside.root, "modules");
@@ -432,7 +489,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: promise-order-current
+          name: promise-typed-order-current
           path: ${{ runner.temp }}/shared-module-proof
           if-no-files-found: error
           retention-days: 3
@@ -448,8 +505,8 @@ jobs:
           node-version: 24.22.1
       - uses: actions/download-artifact@v4
         with:
-          name: promise-order-current
-          path: ${{ runner.temp }}/promise-order-results
+          name: promise-typed-order-current
+          path: ${{ runner.temp }}/promise-typed-order-results
       - name: Verify promise bridge observations
         run: |
           node --input-type=module <<'COMPARE'
@@ -458,10 +515,57 @@ jobs:
           import { readFileSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
           const head = "71a9441c824262150f35acd2b8359f156ed3289c";
-          const expected = {"node-island-promise-subscription-order": {"id": "node-island-promise-subscription-order", "origin": "tests/corpus/node-island-promise-subscription-order", "entry": "main.mjs", "oracleRoute": "direct", "islandNotes": [], "shipped": ["lib.cjs"]}};
-          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, scope: "promise-subscription-order-retry", diagnosticComplete: false, qualificationComplete: false };
+          function verifyTypedPromiseIR(module, entry) {
+            // IR v17 preserves parameter/local IDs and the authored call operands.
+            // Require both routes to share p; a boxed native argument masks the typed path.
+            assert.equal(module.irVersion, 17);
+            const owned = name => {
+              const matches = module.functions.filter(fn => fn.name === name && fn.loc?.file === entry);
+              assert.equal(matches.length, 1, "authored native function is not unique: " + name);
+              assert.ok(matches[0].body.length > 0); return matches[0];
+            };
+            const collect = (value, predicate, found = []) => {
+              if (value && typeof value === "object") {
+                if (predicate(value)) found.push(value);
+                for (const child of Object.values(value)) collect(child, predicate, found);
+              }
+              return found;
+            };
+            const promise = { kind: "promise", inner: { kind: "f64" } };
+            const observer = owned("nativeObserve"), run = owned("run");
+            const parameters = observer.params.filter(param => param.name === "p");
+            assert.equal(parameters.length, 1); const parameter = parameters[0];
+            assert.equal(observer.params[1], parameter); assert.deepEqual(parameter.type, promise);
+            const direct = (value, localId) => {
+              assert.equal(value?.kind, "varRef"); assert.equal(value.localId, localId);
+              assert.deepEqual(value.type, promise);
+              return { kind: value.kind, localId: value.localId, type: value.type };
+            };
+            const awaits = collect(observer.body, node => node.kind === "awaitExpr");
+            assert.equal(awaits.length, 1, "typed observer must directly await p");
+            const awaitValue = direct(awaits[0].value, parameter.localId);
+            assert.deepEqual(awaits[0].type, { kind: "f64" });
+            const locals = run.locals.filter(local => local.name === "p");
+            assert.equal(locals.length, 1); const local = locals[0]; assert.deepEqual(local.type, promise);
+            const nativeCalls = collect(run.body, node => node.kind === "call" && node.callee === observer.name);
+            const islandCalls = collect(run.body, node => node.kind === "dynCall" && node.calleeName === "observe");
+            assert.equal(nativeCalls.length, 2); assert.equal(islandCalls.length, 2);
+            const nativeArguments = nativeCalls.map(call => {
+              assert.equal(call.args.length, 2); return direct(call.args[1], local.id);
+            });
+            const islandArguments = islandCalls.map(call => {
+              assert.equal(call.args.length, 2); const argument = call.args[1];
+              assert.equal(argument.kind, "dynFrom"); assert.deepEqual(argument.type, { kind: "dyn" });
+              return { kind: argument.kind, type: argument.type, value: direct(argument.value, local.id) };
+            });
+            return { status: "passed", parameter: { name: parameter.name, localId: parameter.localId, type: parameter.type },
+              awaitValue, awaitType: awaits[0].type, runPromise: { name: local.name, id: local.id, type: local.type },
+              nativeArguments, islandArguments };
+          }
+          const expected = {"node-island-promise-typed-subscription-order": {"id": "node-island-promise-typed-subscription-order", "origin": "tests/corpus/node-island-promise-typed-subscription-order", "entry": "main.ts", "oracleRoute": "direct", "islandNotes": [], "shipped": ["lib.cjs"]}};
+          const result = { workflow: process.env.GITHUB_SHA, runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, scope: "promise-typed-subscription-order", diagnosticComplete: false, qualificationComplete: false };
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
-          const dir = join(process.env.RUNNER_TEMP, "promise-order-results");
+          const dir = join(process.env.RUNNER_TEMP, "promise-typed-order-results");
           const verifyFile = file => {
             const bytes = readFileSync(join(dir, file.path));
             assert.equal(digest(bytes), file.sha256); assert.equal(bytes.length, file.bytes);
@@ -503,16 +607,19 @@ jobs:
             assert.equal(summary.head, head); assert.equal(summary.label, "current"); assert.equal(summary.scope, result.scope);
             assert.equal(summary.workflow, result.workflow); assert.equal(summary.runId, result.runId); assert.equal(summary.attempt, result.attempt);
             assert.equal(summary.settledEvidence.repeated, false); assert.equal(summary.settledEvidence.usedForQualification, false);
-            assert.equal(summary.fixtureDigest, "e2258073a0c23db09b7d2b590068456695b88553148f4ffe92f9aa8ce05dd8eb");
+            assert.equal(summary.fixtureDigest, "40ea48a3322f884a2b4a2c9b1b30889e8b0db5ae6bd5cf25092abab41384a634");
             assert.equal(digest(JSON.stringify(summary.fixtureManifest)), summary.fixtureDigest);
             assert.deepEqual(summary.tools, { node: "v24.22.1", pnpm: "11.1.3", llvm: "22.1.8", zig: "0.16.0" });
             assert.equal(summary.build.status, "completed"); assert.equal(summary.helper.protocol_version, "1");
             assert.equal(summary.helper.llvm_version, "22.1.8"); assert.match(summary.helperBinarySha256, /^[a-f0-9]{64}$/);
             assert.equal(summary.libnode.manifest.nodeVersion, "24.22.1"); assert.equal(summary.libnode.manifest.bridgeAbi, 10);
             assert.equal(summary.bridgeBuild.currentLibnodeSha256, "15daddf057366cf406653372774250049fe7b9ba3a347c60bebd14f9409c5838");
-            assert.equal(summary.priorAttempt.runId, "41205789123"); assert.equal(summary.priorAttempt.workflow, "7a83f24c90b1149feed09a6e083e50cea28bde08");
+            assert.deepEqual(summary.controlEvidence, { runId: "41206587294", workflow: "c4ccc4e53a05a3dc04272323422103437656232e",
+              case: "node-island-promise-subscription-order", repeated: false, usedForQualification: false });
             assert.equal(summary.dependenciesVerifiedBefore, true); assert.equal(summary.dependenciesVerifiedAfter, true);
-            const expectedDependencies = [{"source": "packages/node/package.json", "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/package.json", "bytes": 725, "sha256": "fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947"}, {"source": "packages/node/index.js", "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.js", "bytes": 4273, "sha256": "3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665"}, {"source": "packages/node/index.d.ts", "target": "node-island-promise-subscription-order/node_modules/@scriptc/node/index.d.ts", "bytes": 2533, "sha256": "00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803"}];
+            const typedAdmissionSources = {"packages/compiler/src/ir/ir.ts":"b7107ae9ee9ac4d390ee74352ce1ff617b705f08871e41a0215491b5aa7536d2","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/frontend/lowering/lower-exprs.ts":"a92993dc990fe5c1e0245119d3642f640519bce8f85a467ac5834d981961f9a2","packages/compiler/src/frontend/lowering/lower-calls.ts":"d9bfd0449fb5a473ea4adc64af96be1c361185d32d9b2329409cc5ef78684c3f","packages/compiler/src/frontend/lowering/call-arguments.ts":"44933f8920ef71842efeb8eb7a4afbf75540b95063f56ff31592397f39d24f9c"};
+            for (const [file, sha256] of Object.entries(typedAdmissionSources)) assert.equal(summary.sourceInputs[file], sha256);
+            const expectedDependencies = [{"source": "packages/node/package.json", "target": "node-island-promise-typed-subscription-order/node_modules/@scriptc/node/package.json", "bytes": 725, "sha256": "fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947"}, {"source": "packages/node/index.js", "target": "node-island-promise-typed-subscription-order/node_modules/@scriptc/node/index.js", "bytes": 4273, "sha256": "3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665"}, {"source": "packages/node/index.d.ts", "target": "node-island-promise-typed-subscription-order/node_modules/@scriptc/node/index.d.ts", "bytes": 2533, "sha256": "00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803"}];
             assert.deepEqual(summary.fixtureDependencies, expectedDependencies);
             for (const dependency of summary.fixtureDependencies) {
               assert.equal(summary.sourceInputs[dependency.source], dependency.sha256);
@@ -564,6 +671,9 @@ jobs:
                   assert.ok(nativeFunctions.includes(name));
                   assert.ok(module.functions.some(fn => fn.name === name && fn.loc?.file?.endsWith("/fixtures/" + spec.id + "/" + spec.entry) && fn.body.length > 0));
                 }
+                const entry = module.functions.find(fn => fn.name === "nativeObserve" &&
+                  fn.loc?.file?.endsWith("/fixtures/" + spec.id + "/" + spec.entry))?.loc.file;
+                assert.ok(entry); assert.deepEqual(item.ir.typedPromise, verifyTypedPromiseIR(module, entry));
                 assert.deepEqual(item.ir.moduleOwnership, { nativeEntryFunctions: nativeFunctions, files: tree.files, links: tree.links });
               }
               for (const flavor of ["plain", "san"]) {
@@ -575,6 +685,7 @@ jobs:
                 if (execution.attempted) {
                   assert.equal(item.ir.status, "passed");
                   assert.equal(item.ir.startupRefusalAbsent, true);
+                  assert.equal(item.ir.typedPromise?.status, "passed");
                   const step = summary.steps.find(step => step.name === item.id + "-" + flavor + "-run");
                   assert.ok(step); assert.equal(step.command, "<temp>/shared-module-work/" + item.id + "-" + flavor + "/program");
                   assert.notEqual(step.status, "tool-error"); assert.equal(step.stdoutSha256, execution.stdoutSha256); assert.equal(step.stderrSha256, execution.stderrSha256);
@@ -601,14 +712,14 @@ jobs:
             assert.equal(summary.qualificationComplete, result.qualificationComplete);
             assert.equal(summary.status, result.qualificationComplete ? "passed" : "failed");
           } catch (error) { result.error = String(error); result.diagnosticComplete = false; result.qualificationComplete = false; }
-          writeFileSync(join(process.env.RUNNER_TEMP, "promise-order-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
+          writeFileSync(join(process.env.RUNNER_TEMP, "promise-typed-order-aggregate.json"), JSON.stringify(result, null, 2) + "\n");
           console.log(JSON.stringify({ diagnosticComplete: result.diagnosticComplete, qualificationComplete: result.qualificationComplete }));
           if (!result.qualificationComplete) { console.error("[shared-module-comparison] FAILED (exit 1)"); process.exitCode = 1; }
           COMPARE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: promise-order-aggregate
-          path: ${{ runner.temp }}/promise-order-aggregate.json
+          name: promise-typed-order-aggregate
+          path: ${{ runner.temp }}/promise-typed-order-aggregate.json
           if-no-files-found: error
           retention-days: 3
