@@ -1,0 +1,845 @@
+name: Diagnose Darwin three debug map
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-darwin-three-debug-map.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diagnose-darwin-three-debug-map
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: macos-15
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 022f251fc38b4c169333f133398ee5150172f2bc
+          path: source
+          persist-credentials: false
+      - name: Verify the frozen source
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = 022f251fc38b4c169333f133398ee5150172f2bc
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+      - name: Authenticate the exact macOS native archive
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'DOWNLOAD'
+          import hashlib, json, os, shutil, stat, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          BASE = Path(os.environ["RUNNER_TEMP"])
+          OUT, WORK = BASE / "darwin-three-debug-map-proof", BASE / "darwin-three-debug-map-work"
+          SOURCE = Path(os.environ["GITHUB_WORKSPACE"]) / "source"
+          ORIGIN = {"workflow": "ffee2a1cd75230aa556294cdac6fabd8d383ffe5", "run": "41219050544", "attempt": "1", "job": 124589635389, "source": "022f251fc38b4c169333f133398ee5150172f2bc"}
+          ARTIFACT = 13049073593
+          ZIP_SHA = "d80e2888047067c37708a156491d92478a455e17b99b5ebbf2e9a96f92b8f517"
+          CONSUMER = {"workflow": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          OUT.mkdir()
+          WORK.mkdir(mode=0o700)
+          with (WORK / "owner.json").open("x") as marker:
+              marker.write(json.dumps(CONSUMER, sort_keys=True) + "\n")
+          receipt = {"origin": ORIGIN, "consumer": CONSUMER, "verified": False}
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+          def safe_name(name):
+              path = PurePosixPath(name)
+              assert name and "\\" not in name and "\0" not in name, "invalid archive path characters"
+              assert not path.is_absolute() and ".." not in path.parts, "absolute or parent archive path"
+              assert path.as_posix() == name.rstrip("/") and path.parts, "noncanonical archive path"
+              return path
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+          stage = "metadata"
+          try:
+              token = os.environ.pop("GH_TOKEN")
+              opener = urllib.request.build_opener(NoRedirect)
+              headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "scriptc-darwin-three-diagnostic"}
+              def api(path):
+                  with opener.open(urllib.request.Request("https://api.github.com/repos/vincentkoc/scriptc/" + path, headers=headers), timeout=120) as response:
+                      raw = response.read(1024**2 + 1)
+                  assert len(raw) <= 1024**2, "API response exceeds budget"
+                  return json.loads(raw)
+              metadata = api(f"actions/artifacts/{ARTIFACT}")
+              assert metadata["id"] == ARTIFACT and metadata["name"] == "native-darwin-arm64" and metadata["expired"] is False, "artifact identity or expiry mismatch"
+              assert metadata["size_in_bytes"] == 82387094 and metadata["digest"] == "sha256:" + ZIP_SHA, "artifact ZIP metadata mismatch"
+              assert str(metadata["workflow_run"]["id"]) == ORIGIN["run"] and metadata["workflow_run"]["head_sha"] == ORIGIN["workflow"], "artifact producer mismatch"
+              stage = "job"
+              job = api(f"actions/jobs/{ORIGIN['job']}")
+              assert job["run_id"] == int(ORIGIN["run"]) and job["head_sha"] == ORIGIN["workflow"], "native job producer mismatch"
+              assert job["conclusion"] == "success" and job["status"] == "completed", "native producer did not complete successfully"
+              assert job["name"] == "build (macOS arm64 native packages)", "native job name mismatch"
+              assert all(step["conclusion"] in ("success", "skipped") for step in job["steps"]), "native job step failed"
+              stage = "download"
+              try:
+                  response = opener.open(urllib.request.Request(f"https://api.github.com/repos/vincentkoc/scriptc/actions/artifacts/{ARTIFACT}/zip", headers=headers), timeout=120)
+              except urllib.error.HTTPError as error:
+                  assert error.code == 302, "artifact redirect refused"
+                  location = error.headers.get("Location", "")
+                  error.close()
+                  parsed = urllib.parse.urlsplit(location)
+                  assert parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password, "invalid artifact storage redirect"
+                  response = opener.open(urllib.request.Request(location), timeout=120)
+              archive = WORK / "native.zip"
+              size = 0
+              with response, archive.open("xb") as output:
+                  while block := response.read(1024 * 1024):
+                      size += len(block)
+                      assert size <= 128 * 1024**2, "ZIP download exceeds budget"
+                      output.write(block)
+              assert size == 82387094 and digest(archive) == ZIP_SHA, "downloaded ZIP identity mismatch"
+              tar_path = WORK / "native-darwin-arm64.tar.gz"
+              stage = "zip"
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  assert len(entries) == 1 and entries[0].filename == tar_path.name, "ZIP member inventory mismatch"
+                  item = entries[0]
+                  assert stat.S_IFMT(item.external_attr >> 16) in (0, stat.S_IFREG) and not item.flag_bits & 1, "unsafe ZIP member type"
+                  assert 0 < item.file_size <= 256 * 1024**2, "ZIP expansion exceeds budget"
+                  with bundle.open(item) as stream, tar_path.open("xb") as output:
+                      shutil.copyfileobj(stream, output, 1024 * 1024)
+                  assert tar_path.stat().st_size == item.file_size, "ZIP entry size mismatch"
+              allowed = ["packages/llvm-darwin-arm64/bin", "packages/runtime-darwin-arm64/artifacts", "packages/runtime-darwin-arm64/runtime-pack.json"]
+              files, seen = [], set()
+              stage = "tar"
+              with tarfile.open(tar_path, "r:gz") as bundle:
+                  members = bundle.getmembers()
+                  assert 0 < len(members) <= 20000 and sum(item.size for item in members) <= 2 * 1024**3, "tar inventory exceeds budget"
+                  for item in members:
+                      name = safe_name(item.name).as_posix()
+                      assert name not in seen, "duplicate tar member"
+                      seen.add(name)
+                      assert any(name == prefix or name.startswith(prefix + "/") for prefix in allowed), "tar member outside native artifact roots"
+                      assert item.isdir() or item.isfile(), "links and special files are not admitted"
+                      assert not item.mode & 0o7000, "unsafe tar permissions"
+                      target = SOURCE / name
+                      assert not target.is_symlink() and not target.exists(), "native artifact would overwrite an existing path"
+                      assert all(not parent.is_symlink() for parent in target.parents if parent != SOURCE.parent), "symlink in extraction parent"
+                  for item in members:
+                      target = SOURCE / item.name
+                      if item.isdir():
+                          target.mkdir(parents=True, exist_ok=True)
+                          continue
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with bundle.extractfile(item) as stream, target.open("xb") as output:
+                          shutil.copyfileobj(stream, output, 1024 * 1024)
+                      target.chmod(item.mode & 0o777)
+                      assert target.stat().st_size == item.size, "tar entry size mismatch"
+                      files.append({"path": item.name, "bytes": item.size, "sha256": digest(target)})
+              receipt.update({"artifact": ARTIFACT, "name": metadata["name"], "zipBytes": size, "zipSha256": ZIP_SHA, "tarSha256": digest(tar_path), "files": sorted(files, key=lambda row: row["path"]), "verified": True})
+              archive.unlink()
+              tar_path.unlink()
+          except Exception as error:
+              # HTTP exception text can contain signed storage URLs; never publish it.
+              receipt["failureType"] = type(error).__name__
+              receipt["failureStage"] = stage
+              if isinstance(error, urllib.error.HTTPError):
+                  receipt["httpStatus"] = error.code
+              if isinstance(error, AssertionError):
+                  receipt["admissionReason"] = str(error)
+              print("[darwin-three-download] FAILED (exit 1)")
+              raise SystemExit(1)
+          finally:
+              (OUT / "native-origin.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          DOWNLOAD
+      - name: Prepare the bounded compile observer
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/darwin-three-debug-map-proof"
+          cat > "$RUNNER_TEMP/darwin-three-debug-map-proof/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { basename, dirname, join, relative, resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+
+          const root = join(process.env.GITHUB_WORKSPACE, "source");
+          const out = join(process.env.RUNNER_TEMP, "darwin-three-debug-map-proof");
+          const work = join(process.env.RUNNER_TEMP, "darwin-three-debug-map-work");
+          const self = resolve(process.argv[1]);
+          const consumerIdentity = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT };
+          const sourceHead = "022f251fc38b4c169333f133398ee5150172f2bc";
+          const sourcePins = {"AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/three.test.ts":"6260fb23d1f98752b201192db3a14e8c01f6c8419c9508a6d311c9962327c86a","tests/fixtures/three/procedural-geometry.mjs":"e6fa26f371d954d0f3473a649646234dfa455534646b319d3293fe979ade9615","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/index.ts":"33d01caceab22072703683256a406c29894f9c1fc87c66d2878703dbec1f691c","packages/compiler/src/backend/debug-symbols.ts":"979ae280386fc98ab75643e925e7067357b31d495b69026e960e2376c280bbb3","packages/compiler/src/backend/native/executable.ts":"3af4b1034b7cb9750720d78c1e803743aeee1e1cf60b57396cf50d351ee33d39","packages/compiler/src/backend/native/driver.ts":"64d65bb08e9d9b97e9f9a48d55b02d8d4f0fd3bdc5eee4ae937b67abc57cd82e","packages/compiler/src/backend/native/session.ts":"b82407816ed96933fee39c9cd5dd7f47bb0be6a4a025bd1841e7c3ca2baf56ce","packages/compiler/src/backend/build-cache.ts":"f4a3dfa56c1063cb1b5fd9642bd30af79e6727e51e6250b2de27b2a2448c33e2","packages/compiler/src/backend/cache-root.ts":"7a9e30aa817aea4b45bf8866d5b53677872885ce5b9f43536ca94f9bb677e628","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/runtime-darwin-arm64/package.json":"955755aff1488955fb3181895559ed72ed9cc2f1103ef7a3fcbbee9dff94ecd0","packages/runtime-darwin-arm64/scripts/verify.mjs":"758b2fef508d2a2ff23ce43a709adb15166461aac66ece808578abea85d2f357","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/llvm-darwin-arm64/package.json":"aa242a8579d99df616078e805e7b7441c94e3867dd8f722ed32929fba4b4e383","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631","packages/compiler/src/backend/native/process.ts":"341c216690b7f5d401786f46e80e5bba3c7f8b5c22896d1d0c047e5f328c75ea","packages/compiler/src/backend/native/runtime-inputs.ts":"261d9462b2464d085d44f1c767e82adbbc3672c787b71c602de1046f3ccf45d8","packages/compiler/src/backend/native/tool-identity.ts":"2d239087986b664aff948f9a8fa18ac2ada65b0102cd65e3fe9472147deb4cb8","packages/compiler/src/backend/native/object-merge.ts":"cf92ea4c8e7bfc8961aa928564ca193d6b81ee735dd74ea33b4b7eb6ae2c0123","packages/compiler/src/backend/native/program-shards.ts":"b01f954a589c3ccbd0d0f2a71bc2fe7b66994db2bdf1378037c3ccec852bc792","packages/compiler/src/backend/native/runtime-objects.ts":"8722f813926a202b4cae5e1dff2829f30542d611fa09cddedaf36481c26ae630","packages/compiler/src/backend/native/vendor.ts":"371db343d518806187218379a64a8446f67773a509f7b65a9fd88425a264816c","tsconfig.base.json":"efc9a98b93b487ec0397287f90c59a89a039443a4eae3d023294a8724d2c22d4","packages/compiler/tsconfig.json":"8465ef2358e3a6fe7c91db8c3ba1b53fec5af62398b827209ded67ed653228d7"};
+          const nativeInputSha256 = "58c107d92ab7198a09742b442ed77d07e88d0ce81d720ea93c88a71b3591db25";
+          const entry = join(root, "tests/fixtures/three/procedural-geometry.mjs");
+          const build = join(work, "compile"), cache = join(work, "cache"), scratch = join(work, "tmp");
+          const compileOptions = { outDir: build, outPath: join(build, "procedural-geometry"), backend: "llvm", npmStatic: ["three"], optimization: "dev", sanitize: true };
+          const CAP = 16 * 1024 * 1024;
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          function capture(command, args = [], cwd = root) {
+            const value = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
+            assert.equal(value.error, undefined, command + " launch failed");
+            assert.equal(value.status, 0, command + " failed: " + value.stderr);
+            return value.stdout.trim();
+          }
+          function fields(error) {
+            const object = error === null || (typeof error !== "object" && typeof error !== "function") ? Object(error) : error;
+            return Object.fromEntries(["name", "message", "stack", "code", "cmd", "killed", "signal", "driver", "stdout", "stderr"].map(key => {
+              const value = { present: key in object, own: Object.hasOwn(object, key) };
+              if (value.present) {
+                const observed = object[key];
+                value.type = Buffer.isBuffer(observed) ? "Buffer" : observed === null ? "null" : typeof observed;
+                if (!["stdout", "stderr"].includes(key) && (observed === null || ["string", "boolean", "number"].includes(typeof observed))) {
+                  if (typeof observed === "string") {
+                    const bytes = Buffer.from(observed, "utf8");
+                    value.bytes = bytes.length; value.sha256 = digest(bytes); value.storageTruncated = bytes.length > CAP;
+                    value.value = value.storageTruncated ? bytes.subarray(0, CAP).toString("utf8") : observed;
+                  } else value.value = observed;
+                }
+              }
+              return [key, value];
+            }));
+          }
+          function exposedStream(error, key) {
+            const object = Object(error);
+            const descriptor = fields(object)[key];
+            if (!descriptor.present) return descriptor;
+            const value = object[key];
+            if (!(typeof value === "string" || Buffer.isBuffer(value))) return { ...descriptor, supported: false };
+            const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+            const path = join(out, "error-" + key + ".raw");
+            writeFileSync(path, bytes.subarray(0, CAP));
+            return { ...descriptor, supported: true, representation: Buffer.isBuffer(value) ? "exposed-buffer-bytes" : "utf8-encoding-of-exposed-js-string",
+              capturedBytes: bytes.length, capturedSha256: digest(bytes), retained: record(path), storageTruncated: bytes.length > CAP };
+          }
+          function classify(attempt, processResult, inputsVerified) {
+            const terminal = ["returned", "thrown"].includes(attempt?.status);
+            const complete = terminal && attempt.compileCalls === 1 && attempt.storageComplete === true &&
+              processResult.status === "exited" && processResult.signal === null && processResult.drained === true &&
+              processResult.storageComplete === true && processResult.streamsClosed === true && !processResult.forcedCleanup && inputsVerified === true &&
+              ((attempt.status === "returned" && processResult.code === (attempt.ok ? 0 : 1)) || (attempt.status === "thrown" && processResult.code === 1));
+            return { diagnosticComplete: complete, compileSucceeded: complete && attempt.status === "returned" && attempt.ok === true,
+              observation: !complete ? "incomplete" : attempt.status === "returned" && attempt.ok ? "not-reproduced" : "compile-failure-observed",
+              runtimeAcceptance: false, attributionEstablished: false };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink(), "unexpected symlink: " + path);
+              if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile(), "unexpected special file: " + path);
+              return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function verifyWorkOwner() {
+            const info = lstatSync(work);
+            assert.ok(info.isDirectory() && !info.isSymbolicLink(), "owned scratch is not a directory");
+            assert.equal(info.mode & 0o777, 0o700, "owned scratch permissions changed");
+            const marker = join(work, "owner.json"), markerInfo = lstatSync(marker);
+            assert.ok(markerInfo.isFile() && !markerInfo.isSymbolicLink(), "scratch owner marker is not a regular file");
+            const owner = json(marker);
+            assert.deepEqual(owner, consumerIdentity, "scratch owner identity mismatch");
+            return owner;
+          }
+          function source() {
+            assert.equal(capture("git", ["rev-parse", "HEAD"]), sourceHead);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const found = Object.fromEntries(Object.keys(sourcePins).map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(found, sourcePins);
+            return { head: sourceHead, clean: true, pins: found };
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const name = row.slice(row.indexOf("\t") + 1);
+              return name.startsWith("native/llvm-codegen/") ||
+                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
+            });
+            assert.equal(rows.length, 1049); assert.equal(digest(rows.join("\n")), nativeInputSha256);
+            const disk = rows.map(row => { const path = row.split("\t")[1]; return { path, sha256: hash(join(root, path)) }; });
+            return { sourceTreeRows: rows, sourceTreeSha256: nativeInputSha256, disk };
+          }
+          function nativeFiles(origin) {
+            assert.equal(origin.verified, true);
+            assert.equal(origin.origin.source, sourceHead);
+            assert.equal(origin.origin.workflow, "ffee2a1cd75230aa556294cdac6fabd8d383ffe5");
+            assert.equal(origin.origin.run, "41219050544");
+            assert.equal(origin.origin.attempt, "1");
+            assert.equal(origin.origin.job, 124589635389);
+            assert.equal(origin.artifact, 13049073593);
+            assert.equal(origin.zipSha256, "d80e2888047067c37708a156491d92478a455e17b99b5ebbf2e9a96f92b8f517");
+            for (const item of origin.files) {
+              assert.ok(/^(packages\/llvm-darwin-arm64\/bin\/|packages\/runtime-darwin-arm64\/artifacts\/|packages\/runtime-darwin-arm64\/runtime-pack\.json$)/.test(item.path));
+              const path = join(root, item.path);
+              assert.ok(lstatSync(path).isFile()); assert.equal(statSync(path).size, item.bytes); assert.equal(hash(path), item.sha256);
+            }
+            return origin.files;
+          }
+          function identity(command, args) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            return { command, path, sha256: hash(path), version: capture(command, args) };
+          }
+          function resolvedAppleTool(name) {
+            const path = realpathSync(capture("xcrun", ["--find", name]));
+            const args = name === "ld" ? ["-v"] : ["--version"];
+            const value = spawnSync(path, args, { encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024 });
+            assert.equal(value.error, undefined); assert.equal(value.signal, null);
+            return { path, sha256: hash(path), versionArgs: args, versionCode: value.status, stdout: value.stdout, stderr: value.stderr };
+          }
+          function tools() {
+            const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+            return {
+              node: identity(process.execPath, ["--version"]), pnpm: identity("pnpm", ["--version"]),
+              clang: identity("clang", ["--version"]), dsymutil: identity("dsymutil", ["--version"]),
+              resolvedApple: { clang: resolvedAppleTool("clang"), ld: resolvedAppleTool("ld"), dsymutil: resolvedAppleTool("dsymutil") },
+              xcrun: identity("xcrun", ["--version"]), clangXcrun: capture("xcrun", ["--find", "clang"]),
+              dsymutilXcrun: capture("xcrun", ["--find", "dsymutil"]),
+              sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]),
+                build: capture("xcrun", ["--sdk", "macosx", "--show-sdk-build-version"]),
+                settings: record(join(sdk, "SDKSettings.json")) },
+              xcode: capture("xcodebuild", ["-version"]), developerDirectory: capture("xcode-select", ["-p"]),
+              swVers: capture("sw_vers"), uname: capture("uname", ["-a"]),
+              imageOS: process.env.ImageOS ?? null, imageVersion: process.env.ImageVersion ?? null,
+            };
+          }
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE"]) delete childEnv[key];
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length; sink.hash.update(bytes);
+              const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+              if (keep.length) { writeSync(sink.fd, keep); sink.retained += keep.length; }
+              if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached Darwin group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function requireSuccess(value) {
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.forcedCleanup, false);
+          }
+          const COPY_SCRIPT = "import hashlib, json, os, pathlib, shutil, stat, sys, time\nspec = json.loads(pathlib.Path(sys.argv[1]).read_text())\ndestination = pathlib.Path(spec[\"destination\"])\nrows = []\ntotal = 0\ntry:\n    destination.mkdir(mode=0o700)\n    assert len(spec[\"files\"]) <= 4096, \"snapshot file budget exceeded\"\n    for item in spec[\"files\"]:\n        source = pathlib.Path(item[\"path\"])\n        before = source.stat(follow_symlinks=False)\n        assert stat.S_ISREG(before.st_mode), \"snapshot input is not a regular file\"\n        assert str(before.st_mtime_ns) == item[\"mtimeNs\"] and before.st_size == item[\"bytes\"], \"live snapshot input changed\"\n        total += before.st_size\n        assert before.st_size <= 512 * 1024**2 and total <= 2 * 1024**3, \"snapshot byte budget exceeded\"\n        assert time.time() * 1000 < spec[\"deadline\"], \"snapshot deadline exceeded\"\n        target = destination / item[\"copy\"]\n        assert not pathlib.PurePosixPath(item[\"copy\"]).is_absolute() and \"..\" not in pathlib.PurePosixPath(item[\"copy\"]).parts\n        target.parent.mkdir(parents=True, exist_ok=True)\n        assert not target.exists()\n        shutil.copy2(source, target)\n        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))\n        def digest(path):\n            value = hashlib.sha256()\n            with path.open(\"rb\") as stream:\n                for block in iter(lambda: stream.read(1024 * 1024), b\"\"):\n                    value.update(block)\n            return value.hexdigest()\n        original_hash, copied_hash = digest(source), digest(target)\n        after = source.stat(follow_symlinks=False)\n        copied = target.stat(follow_symlinks=False)\n        assert original_hash == copied_hash, \"snapshot copy hash mismatch\"\n        assert after.st_ino == before.st_ino and after.st_dev == before.st_dev and after.st_size == before.st_size and after.st_mtime_ns == before.st_mtime_ns, \"snapshot source changed while copying\"\n        assert copied.st_mtime_ns == before.st_mtime_ns, \"snapshot mtime was not preserved\"\n        rows.append({**item, \"sha256\": original_hash, \"copySha256\": copied_hash, \"copyMtimeNs\": str(copied.st_mtime_ns)})\n    report = {\"complete\": True, \"bytes\": total, \"files\": rows}\nexcept BaseException as error:\n    report = {\"complete\": False, \"bytes\": total, \"files\": rows, \"errorType\": type(error).__name__, \"error\": str(error)}\n    raise\nfinally:\n    pathlib.Path(spec[\"receipt\"]).write_text(json.dumps(report, indent=2) + \"\\n\")\n";
+
+          const DEBUG_MAP_HOOK = Symbol.for("scriptc.darwin.debug-map.observer");
+          const debugOut = join(out, "debug-map");
+          const captureLimits = { totalMs: 300_000, commandMs: 30_000, perStreamBytes: 64 * 1024 ** 2,
+            totalStreamBytes: 256 * 1024 ** 2, snapshotBytes: 2 * 1024 ** 3, snapshotFiles: 4096 };
+          const copyScript = join(work, "debug-map-copy.py");
+          const compiledOwner = join(root, "packages/compiler/dist/backend/native/executable.js");
+          function patchCompiledOwner() {
+            const original = readFileSync(compiledOwner, "utf8");
+            const commandNeedle = 'await execFileAsync(driver.argv[0] ?? "clang", [...driver.argv.slice(1), ...args]);';
+            const boundaryPattern = /if \(shardedProgramObject !== null\)\s*await createDarwinDebugSymbols\(privateOut\);/g;
+            assert.equal(original.split(commandNeedle).length - 1, 1, "runClang command hook is not unique");
+            const boundary = [...original.matchAll(boundaryPattern)]; assert.equal(boundary.length, 1, "sharded dsymutil hook is not unique");
+            const commandReplacement = 'globalThis[Symbol.for("scriptc.darwin.debug-map.observer")].command([driver.argv[0] ?? "clang", ...driver.argv.slice(1), ...args]);\n        ' + commandNeedle;
+            const boundaryReplacement = 'if (shardedProgramObject !== null) await globalThis[Symbol.for("scriptc.darwin.debug-map.observer")].around({ buildDir, privateOut, programPath, canonicalPath: opts.cPath, shardedProgramObject, shardNames: programShards.map(shard => shard.name), stagedRuntime: [...(objects ?? new Map())], driver: driver.argv }, () => createDarwinDebugSymbols(privateOut));';
+            const patched = original.replace(commandNeedle, commandReplacement).replace(boundary[0][0], boundaryReplacement);
+            assert.equal(patched.replace(commandReplacement, commandNeedle).replace(boundaryReplacement, boundary[0][0]), original);
+            copyFileSync(compiledOwner, join(debugOut, "executable.original.js"));
+            writeFileSync(join(debugOut, "executable.instrumented.js"), patched);
+            const result = { sourceOwner: "packages/compiler/src/backend/native/executable.ts",
+              compiledOwner: relative(root, compiledOwner), originalSha256: digest(original), patchedSha256: digest(patched),
+              replacements: [{ original: commandNeedle, replacement: commandReplacement, count: 1 },
+                { original: boundary[0][0], replacement: boundaryReplacement, count: 1 }],
+              sourceModified: false, childProcessIntercepted: false, originalDsymutilBufferUnchanged: true };
+            save("debug-map/instrumentation.json", result); writeFileSync(compiledOwner, patched);
+            return result;
+          }
+          function restoreCompiledOwner(report) {
+            const receiptPath = join(debugOut, "instrumentation.json");
+            if (!report.instrumentation && existsSync(receiptPath)) report.instrumentation = json(receiptPath);
+            if (!report.instrumentation) return;
+            if (report.instrumentation.restored) {
+              assert.deepEqual(files(join(root, "packages/compiler/dist")), report.compilerFilesBefore); return;
+            }
+            const target = relative(join(root, "packages/compiler/dist"), compiledOwner);
+            const expected = report.compilerFilesBefore.find(item => item.path === target);
+            assert.equal(expected.sha256, report.instrumentation.originalSha256);
+            const current = files(join(root, "packages/compiler/dist"));
+            assert.deepEqual(current.filter(item => item.path !== target), report.compilerFilesBefore.filter(item => item.path !== target));
+            assert.ok([report.instrumentation.originalSha256, report.instrumentation.patchedSha256].includes(hash(compiledOwner)), "unexpected compiled owner bytes; retain work");
+            assert.equal(hash(join(debugOut, "executable.instrumented.js")), report.instrumentation.patchedSha256);
+            const original = readFileSync(join(debugOut, "executable.original.js"));
+            assert.equal(digest(original), report.instrumentation.originalSha256);
+            writeFileSync(compiledOwner, original);
+            assert.deepEqual(files(join(root, "packages/compiler/dist")), report.compilerFilesBefore);
+            report.instrumentation.restored = true;
+            report.instrumentation.restoredSha256 = hash(compiledOwner);
+          }
+          function liveDebugInputs(context) {
+            const base = realpathSync(context.buildDir);
+            assert.ok(base.startsWith(realpathSync(scratch) + "/"), "debug-map build is outside owned TMPDIR");
+            const all = [];
+            const add = (path, copy) => {
+              const info = lstatSync(path, { bigint: true });
+              assert.ok(info.isFile(), "debug-map input is not a regular file");
+              all.push({ path, copy, bytes: Number(info.size), mtimeNs: String(info.mtimeNs),
+                atimeNs: String(info.atimeNs), inode: String(info.ino), device: String(info.dev), mode: Number(info.mode) });
+              assert.ok(all.length <= captureLimits.snapshotFiles, "debug-map file inventory budget exceeded");
+            };
+            const visit = (directory, prefix = "") => {
+              for (const item of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+                const path = join(directory, item.name), child = prefix + item.name;
+                if (child === basename(context.privateOut) + ".dSYM") continue;
+                if (item.isDirectory()) visit(path, child + "/");
+                else { assert.ok(item.isFile() && !item.isSymbolicLink(), "unsupported staged input"); add(path, "build/" + child); }
+              }
+            };
+            visit(base);
+            const canonical = realpathSync(context.canonicalPath);
+            assert.ok(canonical.startsWith(realpathSync(work) + "/"), "canonical LLVM is outside owned work");
+            add(canonical, "canonical/program.ll");
+            const stem = basename(context.canonicalPath, ".ll");
+            const required = [context.privateOut, context.programPath, context.shardedProgramObject,
+              join(base, "localize-keep.syms"), ...context.shardNames.map(name => join(base, name)),
+              ...context.shardNames.map((_, index) => join(base, stem + ".program-" + String(index).padStart(3, "0") + ".o")),
+              ...context.stagedRuntime.map(([, path]) => path)];
+            for (const path of required) assert.ok(all.some(item => item.path === path), "missing live compiler input: " + path);
+            assert.ok(context.shardNames.length > 1 && context.shardNames.length <= 128, "unexpected shard inventory");
+            return { files: all, required, rawObjects: context.shardNames.map((_, index) => join(base, stem + ".program-" + String(index).padStart(3, "0") + ".o")) };
+          }
+          function installDebugObserver(deadline) {
+            const state = { boundaryCalls: 0, commandCount: 0, complete: false, originalCallCount: 0,
+              originalErrorIdentityPreserved: null, commands: [], inspections: [], streamBytes: 0, captureLimits };
+            const persist = () => { const { originalErrorObject, ...receipt } = state; save("debug-map/observer.json", receipt); };
+            const command = argv => {
+              try {
+                assert.ok(state.commandCount < 256, "command inventory budget exceeded");
+                const row = { sequence: state.commandCount++, argv: [...argv], cwd: root };
+                assert.ok(Buffer.byteLength(JSON.stringify(row)) < 1024 * 1024, "command argument budget exceeded");
+                state.commands.push(row); persist();
+              } catch (error) { state.commandRecordingFailure = fields(error); }
+            };
+            const inspect = async (label, executable, args, expires) => {
+              assert.ok(Date.now() < expires, "inspection deadline exhausted");
+              const destinations = [join(debugOut, label + ".stdout.log"), join(debugOut, label + ".stderr.log")];
+              const sinks = destinations.map(path => ({ fd: openSync(path, "wx"), hash: createHash("sha256"), observed: 0, retained: 0 }));
+              const child = spawn(executable, args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+              const row = { label, executable, args, pid: child.pid ?? null, code: null, signal: null, closed: false, complete: false };
+              let exited = false, reason = null;
+              const closed = new Promise(resolveClose => child.once("close", () => { row.closed = true; resolveClose(); }));
+              child.once("error", error => { row.launchError = fields(error); reason = "launch-error"; exited = true; });
+              child.once("exit", (code, signal) => { row.code = code; row.signal = signal; exited = true; });
+              for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+                const sink = sinks[index];
+                try {
+                  sink.observed += bytes.length; sink.hash.update(bytes);
+                  if (reason === "storage-error") return;
+                  const allowed = Math.max(0, Math.min(captureLimits.perStreamBytes - sink.retained, captureLimits.totalStreamBytes - state.streamBytes));
+                  const keep = bytes.subarray(0, allowed);
+                  if (keep.length) {
+                    const written = writeSync(sink.fd, keep); sink.retained += written; state.streamBytes += written;
+                    assert.equal(written, keep.length, "incomplete inspection sink write");
+                  }
+                  if (keep.length !== bytes.length) reason ??= "capture-limit";
+                } catch (error) { reason = "storage-error"; row.storageError = fields(error); }
+              });
+              state.inspections.push(row);
+              const stop = Math.min(expires, Date.now() + captureLimits.commandMs);
+              try {
+                while (!exited && !reason && Date.now() < stop) await delay(25);
+                if (!exited && !reason) reason = "inspection-timeout";
+              } finally {
+                if (!exited && Number.isInteger(child.pid) && child.pid > 1) {
+                  child.kill("SIGTERM"); await Promise.race([closed, delay(1000)]);
+                  if (!row.closed) { child.kill("SIGKILL"); await Promise.race([closed, delay(1000)]); }
+                }
+                if (!row.closed) await Promise.race([closed, delay(1000)]);
+                for (const [index, sink] of sinks.entries()) {
+                  if (!row.closed) [child.stdout, child.stderr][index].destroy();
+                  closeSync(sink.fd);
+                  row[index ? "stderr" : "stdout"] = { ...record(destinations[index]), observedBytes: sink.observed,
+                    observedSha256: sink.hash.digest("hex"), retainedBytes: sink.retained };
+                }
+                row.reason = reason; row.complete = row.closed && !reason && row.code === 0 && row.signal === null &&
+                  sinks.every(sink => sink.observed === sink.retained);
+                persist();
+              }
+              assert.equal(row.complete, true, "debug-map inspection incomplete: " + label);
+              return row;
+            };
+            const correlate = (context, inputs, originalError) => {
+              const stderr = typeof originalError?.stderr === "string" ? originalError.stderr : "";
+              const matches = [...stderr.matchAll(/could not find symbol '([^'\n]+)' in object file '([^'\n]+)'/g)];
+              const selected = [...new Map(matches.map(match => [match[1], { symbol: match[1], reportedObject: match[2] }])).values()].slice(0, 8);
+              save("debug-map/representative-symbols.json", {
+                capturedWarningCount: matches.length,
+                capturedStderrMayBeTruncated: originalError?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+                selected: selected.map(item => ({ ...item, reportedObjectCaptured: inputs.files.some(file => file.path === item.reportedObject) })),
+                snapshotManifest: "debug-map/snapshot.json",
+                debugMap: state.inspections.find(row => row.label === "live-debug-map")?.stdout.path ?? null,
+                symbolTables: state.inspections.filter(row => row.label.startsWith("symtab-")).map(row => ({ input: row.args.at(-1), output: row.stdout.path })),
+                ownershipConclusion: null,
+                nextAnalysis: "Correlate exact warning symbols with authenticated LLVM, raw/merged/executable symbol tables and the live debug map offline. Names alone do not establish ownership.",
+              });
+            };
+            const partialDsymInputs = context => {
+              const path = context.privateOut + ".dSYM", result = { path, present: false, measured: "after original dsymutil", files: [] };
+              let info;
+              try { info = lstatSync(path); }
+              catch (error) { if (error.code === "ENOENT") return result; throw error; }
+              assert.ok(info.isDirectory() && !info.isSymbolicLink(), "partial dSYM is not an owned directory");
+              result.present = true;
+              const visit = (directory, prefix = "") => {
+                for (const item of readdirSync(directory, { withFileTypes: true })) {
+                  const file = join(directory, item.name), child = prefix + item.name;
+                  if (item.isDirectory()) visit(file, child + "/");
+                  else {
+                    const value = lstatSync(file, { bigint: true }); assert.ok(value.isFile() && !value.isSymbolicLink(), "unsupported partial dSYM input");
+                    result.files.push({ path: file, copy: "partial-dsym/" + child, bytes: Number(value.size),
+                      mtimeNs: String(value.mtimeNs), atimeNs: String(value.atimeNs), inode: String(value.ino), device: String(value.dev), mode: Number(value.mode) });
+                    assert.ok(result.files.length <= captureLimits.snapshotFiles, "partial dSYM file budget exceeded");
+                  }
+                }
+              };
+              visit(path); return result;
+            };
+            const around = async (context, original) => {
+              state.boundaryCalls++; state.context = context; state.boundaryAt = new Date().toISOString();
+              let inputs;
+              try {
+                inputs = liveDebugInputs(context); state.liveInputs = inputs;
+                state.mergeRecipe = { source: "packages/compiler/src/backend/native/object-merge.ts",
+                  observedSubprocess: false, argv: ["ld", "-r", ...inputs.rawObjects, "-o", context.shardedProgramObject, "-exported_symbols_list", join(context.buildDir, "localize-keep.syms")] };
+              }
+              catch (error) { state.inventoryFailure = fields(error); }
+              let returned, originalError, threw = false;
+              state.originalCallCount++;
+              const started = performance.now();
+              try { returned = await original(); state.originalOutcome = "returned"; }
+              catch (error) {
+                originalError = error; threw = true; state.originalOutcome = "thrown";
+                try { state.originalError = fields(error); } catch { state.errorSerializationFailed = true; }
+              }
+              state.originalElapsedMs = performance.now() - started;
+              state.originalErrorObject = originalError;
+              try {
+                assert.equal(state.boundaryCalls, 1); assert.equal(state.originalCallCount, 1);
+                assert.ok(inputs && !state.inventoryFailure && !state.commandRecordingFailure && !state.errorSerializationFailed, "observer preparation incomplete");
+                const expires = Math.min(deadline - 10_000, Date.now() + captureLimits.totalMs);
+                assert.ok(expires > Date.now(), "no capture time remains inside original compile deadline");
+                state.partialDsym = partialDsymInputs(context);
+                const snapshotFiles = [...inputs.files, ...state.partialDsym.files];
+                const request = { destination: join(debugOut, "snapshot"), receipt: join(debugOut, "snapshot.json"), files: snapshotFiles, deadline: expires };
+                save("debug-map/snapshot-request.json", request);
+                assert.equal(hash(copyScript), digest(COPY_SCRIPT));
+                await inspect("snapshot-copy", "python3", [copyScript, join(debugOut, "snapshot-request.json")], expires);
+                const snapshot = json(join(debugOut, "snapshot.json"));
+                assert.equal(snapshot.complete, true); assert.equal(snapshot.files.length, snapshotFiles.length);
+                state.snapshot = record(join(debugOut, "snapshot.json"));
+                const tool = json(join(debugOut, "inspection-tools.json")).dsymutil.path;
+                await inspect("live-debug-map", tool, ["--dump-debug-map", context.privateOut], expires);
+                await inspect("symtab-executable", tool, ["--symtab", context.privateOut], expires);
+                await inspect("symtab-localized", tool, ["--symtab", context.shardedProgramObject], expires);
+                for (const [index, path] of inputs.rawObjects.entries())
+                  await inspect("symtab-raw-" + String(index).padStart(3, "0"), tool, ["--symtab", path], expires);
+                const copiedHashes = new Map(snapshot.files.map(file => [file.path, file.sha256]));
+                state.liveInputReadback = [];
+                for (const file of snapshotFiles) {
+                  const after = lstatSync(file.path, { bigint: true });
+                  assert.equal(String(after.mtimeNs), file.mtimeNs); assert.equal(Number(after.size), file.bytes);
+                  const value = createHash("sha256");
+                  for await (const block of createReadStream(file.path, { highWaterMark: 1024 * 1024 })) {
+                    assert.ok(Date.now() <= expires, "live input readback exceeded capture deadline");
+                    value.update(block);
+                  }
+                  const sha256 = value.digest("hex"); assert.equal(sha256, copiedHashes.get(file.path));
+                  state.liveInputReadback.push({ path: file.path, sha256, mtimeNs: String(after.mtimeNs) });
+                }
+                correlate(context, inputs, originalError);
+                assert.ok(Date.now() <= expires, "capture analysis exceeded the bounded capture deadline");
+                state.complete = true;
+              } catch (error) { state.captureFailure = fields(error); state.complete = false; }
+              finally { try { persist(); } catch { state.complete = false; state.capturePersistenceFailed = true; } }
+              if (threw) throw originalError;
+              return returned;
+            };
+            globalThis[DEBUG_MAP_HOOK] = { command, around, state };
+            persist();
+            return state;
+          }
+          async function childMain() {
+            verifyWorkOwner();
+            writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            if (process.argv[3] !== "compile") {
+              const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+              child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+              child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+              return;
+            }
+            const attempt = { status: "preparing", compileCalls: 0, storageComplete: true, options: compileOptions, entry,
+              captureBoundary: "Only values exposed by compile(); wrappers may discard child fields. Exposed strings are re-encoded as UTF-8. Captured byte counts are not total child-produced output.",
+              runtimeExecuted: false };
+            save("compile-attempt.json", attempt);
+            try {
+              const instrumentation = json(join(debugOut, "instrumentation.json"));
+              assert.equal(hash(compiledOwner), instrumentation.patchedSha256);
+              installDebugObserver(Date.now() + 1190 * 1000);
+              const { compile } = await import(pathToFileURL(join(root, "packages/compiler/dist/index.js")));
+              assert.equal(process.env.SCRIPTC_SAN, "1"); assert.equal(process.env.SCRIPTC_TEST_STABLE_TOOLCHAIN, "1");
+              for (const key of ["SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "NODE_OPTIONS"]) assert.equal(process.env[key], undefined);
+              assert.equal(statSync(cache).mode & 0o777, 0o700);
+              assert.equal(process.env.TMPDIR, scratch); assert.equal(statSync(scratch).mode & 0o777, 0o700);
+              const { prepareBuildCacheRoot } = await import(pathToFileURL(join(root, "packages/compiler/dist/backend/build-cache.js")));
+              assert.equal(await prepareBuildCacheRoot(cache), cache);
+              attempt.compileCalls = 1; attempt.status = "compiling"; attempt.startedAt = new Date().toISOString(); save("compile-attempt.json", attempt);
+              const start = performance.now();
+              let result;
+              try {
+                result = await compile(entry, compileOptions);
+              } catch (error) {
+                const state = globalThis[DEBUG_MAP_HOOK].state;
+                state.originalErrorIdentityPreserved = state.originalErrorObject === error;
+                const { originalErrorObject, ...receipt } = state; save("debug-map/observer.json", receipt);
+                attempt.debugMapCaptureComplete = state.complete === true && state.originalErrorIdentityPreserved === true;
+                attempt.elapsedMs = performance.now() - start; attempt.status = "thrown"; attempt.error = fields(error);
+                attempt.thrownType = error === null ? "null" : typeof error;
+                if (typeof error === "string") attempt.thrownValue = error;
+                attempt.streams = { stdout: exposedStream(error, "stdout"), stderr: exposedStream(error, "stderr") };
+                attempt.storageComplete = Object.values(attempt.error).every(field => !field.storageTruncated) && Object.values(attempt.streams).every(stream => !stream.present || stream.supported && !stream.storageTruncated);
+                attempt.childCaptureMayBeTruncated = attempt.error.code.value === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+                // A wrapped CcCompileError can omit cmd/code. Absence does not identify or exonerate a child.
+                save("compile-attempt.json", attempt); process.exitCode = 1; return;
+              }
+              attempt.debugMapCaptureComplete = globalThis[DEBUG_MAP_HOOK].state.complete === true;
+              attempt.elapsedMs = performance.now() - start; attempt.status = "returned"; attempt.ok = result.ok === true;
+              const bytes = Buffer.from(JSON.stringify(result, null, 2) + "\n");
+              writeFileSync(join(out, "compile-result.json"), bytes.subarray(0, CAP));
+              attempt.result = record(join(out, "compile-result.json")); attempt.storageComplete = bytes.length <= CAP;
+              if (attempt.ok) {
+                assert.ok(statSync(compileOptions.outPath).isFile());
+                attempt.binary = { bytes: statSync(compileOptions.outPath).size, sha256: hash(compileOptions.outPath), executed: false };
+              }
+            } catch (error) { attempt.status = attempt.compileCalls === 0 ? "preparation-failed" : "observer-failed"; attempt.observerError = fields(error); }
+            save("compile-attempt.json", attempt);
+            process.exitCode = attempt.status === "returned" && attempt.ok && attempt.storageComplete ? 0 : 1;
+          }
+          async function main() {
+            const report = { schemaVersion: 1, source: sourceHead, consumer: consumerIdentity,
+              originFailure: { run: "41219050544", elapsedMs: 311945, concurrent: true },
+              priorDiagnostic: { run: "41234438747", artifact: 13057325568,
+                zipSha256: "d7c9e49a208ca25d20bc650af7ae08460ccced5381d1c8d8218436462f05b73b",
+                summarySha256: "5fa8be242957fb5118248322e8d6e77f062a84efee428e12f66722a9a71b036a",
+                observation: "Apple dsymutil stderr capture overflow; no native execution" },
+              runnerSha256: hash(self), expectedCompileCalls: 1, diagnosticComplete: false, runtimeAcceptance: false, attributionEstablished: false,
+              limits: { compileSeconds: 1200, retainedBytesPerStream: CAP, childProcessBuffersUnchanged: true, serialReplayCannotExcludeConcurrency: true } };
+            save("summary.json", report);
+            try {
+              report.workOwner = verifyWorkOwner();
+              assert.equal(process.platform, "darwin"); assert.equal(process.arch, "arm64"); assert.equal(process.version, "v24.22.0");
+              assert.equal(capture("pnpm", ["--version"]), "11.1.3");
+              report.sourceBefore = source(); report.nativeSourceInputs = nativeInputs();
+              save("native-source-inputs.json", report.nativeSourceInputs);
+              report.origin = json(join(out, "native-origin.json")); assert.deepEqual(report.origin.consumer, report.consumer); report.nativeFilesBefore = nativeFiles(report.origin);
+              report.install = await run("install", "pnpm", ["install", "--frozen-lockfile"], 1200); requireSuccess(report.install);
+              report.runtimeVerification = await run("runtime-verification", process.execPath, ["packages/runtime-darwin-arm64/scripts/verify.mjs"], 120); requireSuccess(report.runtimeVerification);
+              report.workspaceBuild = await run("workspace-build", "pnpm", ["build"], 900); requireSuccess(report.workspaceBuild);
+              report.nativeFilesPrepared = nativeFiles(report.origin); assert.deepEqual(report.nativeFilesPrepared, report.nativeFilesBefore);
+              const helper = join(root, "packages/llvm-darwin-arm64/bin/scriptc-llvm-codegen");
+              report.helper = { path: relative(root, helper), sha256: hash(helper), version: JSON.parse(capture(helper, ["version", "--format=json"])) };
+              assert.equal(report.helper.version.ok, true); assert.equal(report.helper.version.protocol_version, "1"); assert.equal(report.helper.version.llvm_version, "22.1.8");
+              assert.equal(report.helper.version.scriptc_package_version, json(join(root, "packages/llvm-darwin-arm64/package.json")).version);
+              assert.ok(report.helper.version.host_triple.startsWith("arm64-apple-") || report.helper.version.host_triple.startsWith("aarch64-apple-"));
+              report.runtimeManifest = { sha256: hash(join(root, "packages/runtime-darwin-arm64/runtime-pack.json")), package: json(join(root, "packages/runtime-darwin-arm64/runtime-pack.json")).package };
+              assert.equal(report.runtimeManifest.package, "@scriptc/runtime-darwin-arm64");
+              report.toolsBefore = tools(); assert.ok(report.toolsBefore.imageOS && report.toolsBefore.imageVersion);
+              mkdirSync(debugOut);
+              save("debug-map/inspection-tools.json", report.toolsBefore.resolvedApple);
+              const help = capture(report.toolsBefore.resolvedApple.dsymutil.path, ["--help"]);
+              writeFileSync(join(debugOut, "dsymutil-help.txt"), help);
+              assert.ok(help.includes("--dump-debug-map") && help.includes("--symtab"), "Apple dsymutil inspection flags unavailable");
+              const threeRoot = realpathSync(join(root, "node_modules/three"));
+              report.dependencies = { three: { root: realpathSync(threeRoot), version: json(join(threeRoot, "package.json")).version, files: files(threeRoot) },
+                typescript: { version: json(join(root, "packages/compiler/node_modules/typescript/package.json")).version, files: files(realpathSync(join(root, "packages/compiler/node_modules/typescript"))) },
+                checker: { version: json(join(root, "packages/compiler/node_modules/tsc-ts/package.json")).version, files: files(realpathSync(join(root, "packages/compiler/node_modules/tsc-ts"))) } };
+              assert.equal(report.dependencies.three.version, "0.186.1");
+              report.compilerFilesBefore = files(join(root, "packages/compiler/dist"));
+              report.sourcePrepared = source(); assert.deepEqual(report.sourcePrepared, report.sourceBefore);
+              mkdirSync(build); mkdirSync(cache, { mode: 0o700 }); mkdirSync(scratch, { mode: 0o700 });
+              report.temporaryDirectory = { path: scratch, mode: statSync(scratch).mode & 0o777, deviation: "Compile worker TMPDIR is confined to owned scratch for timeout cleanup." };
+              assert.equal(report.temporaryDirectory.mode, 0o700);
+              report.cache = { path: cache, mode: statSync(cache).mode & 0o777, initiallyEmpty: readdirSync(cache).length === 0, disabled: false };
+              assert.equal(report.cache.mode, 0o700); assert.equal(report.cache.initiallyEmpty, true);
+              copyFileSync(entry, join(out, "procedural-geometry.mjs")); report.fixture = record(join(out, "procedural-geometry.mjs"));
+              writeFileSync(copyScript, COPY_SCRIPT, { flag: "wx", mode: 0o600 });
+              report.snapshotScript = { sha256: hash(copyScript), bytes: statSync(copyScript).size };
+              report.instrumentation = patchCompiledOwner();
+              report.compilerFilesInstrumented = files(join(root, "packages/compiler/dist"));
+              report.captureLimits = captureLimits;
+              report.observationInstrumented = true; report.compileElapsedIncludesCapture = true;
+              save("summary.json", report);
+              report.compileProcess = await run("compile", "compile", [], 1200, { SCRIPTC_SAN: "1", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1", SCRIPTC_CACHE_DIR: cache, TMPDIR: scratch });
+              report.attempt = json(join(out, "compile-attempt.json"));
+              report.sourceAfter = source(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              assert.deepEqual(nativeInputs(), report.nativeSourceInputs);
+              report.nativeFilesAfter = nativeFiles(report.origin); assert.deepEqual(report.nativeFilesAfter, report.nativeFilesBefore);
+              report.toolsAfter = tools(); assert.deepEqual(report.toolsAfter, report.toolsBefore);
+              assert.equal(report.compileProcess.drained, true, "cannot restore compiled owner while its group remains live");
+              restoreCompiledOwner(report);
+              for (const [name, path] of [["three", threeRoot], ["typescript", join(root, "packages/compiler/node_modules/typescript")], ["checker", join(root, "packages/compiler/node_modules/tsc-ts")]]) assert.deepEqual(files(realpathSync(path)), report.dependencies[name].files);
+              report.inputsVerifiedAfter = true;
+              report.cache.entriesAfter = files(cache).length;
+              Object.assign(report, classify(report.attempt, report.compileProcess, report.inputsVerifiedAfter));
+              report.debugMap = json(join(debugOut, "observer.json"));
+              report.diagnosticComplete &&= report.attempt.debugMapCaptureComplete === true && report.debugMap.complete === true &&
+                report.debugMap.boundaryCalls === 1 && report.debugMap.originalCallCount === 1 &&
+                report.debugMap.commandCount > 0 && report.instrumentation.restored === true;
+              report.attributionEstablished = false;
+            } catch (error) { report.diagnosticComplete = false; report.failure = fields(error); }
+            save("summary.json", report);
+            // A serial replay never clears the original concurrent failure, even when compile succeeds.
+            process.stderr.write("[darwin-three-diagnostic] FAILED (exit 1)\n"); process.exitCode = 1;
+          }
+          function finalize() {
+            const report = existsSync(join(out, "summary.json")) ? json(join(out, "summary.json")) : { schemaVersion: 1, diagnosticComplete: false, runtimeAcceptance: false, attributionEstablished: false };
+            const cleanup = { completed: false, groupChecks: [] };
+            try {
+              cleanup.owner = verifyWorkOwner();
+              for (const name of readdirSync(out).filter(name => name.endsWith(".process.json"))) {
+                const processResult = json(join(out, name));
+                assert.equal(processResult.drained, true, "unresolved process result; retain scratch");
+                if (processResult.pid !== null) assert.ok(existsSync(join(out, name.replace(".process.json", ".owner.json"))));
+              }
+              for (const name of readdirSync(out).filter(name => name.endsWith(".owner.json"))) {
+                const owner = json(join(out, name));
+                const processPath = join(out, name.replace(".owner.json", ".process.json"));
+                assert.ok(existsSync(processPath), "missing terminal process receipt; retain scratch");
+                const processResult = json(processPath);
+                assert.equal(processResult.pid, owner.pid); assert.equal(processResult.drained, true);
+                assert.equal(owner.pid, owner.group); assert.ok(Number.isInteger(owner.group) && owner.group > 1 && owner.group !== process.pid);
+                const members = groupMembers(owner.group); cleanup.groupChecks.push({ owner: name, members });
+                assert.equal(members.length, 0, "owned child group is not drained; retain scratch");
+              }
+              restoreCompiledOwner(report);
+              report.diagnosticComplete &&= report.instrumentation?.restored === true;
+              // Only this workflow's scratch is removed; source and retained proof stay available.
+              assert.equal(dirname(work), process.env.RUNNER_TEMP); assert.equal(work, join(process.env.RUNNER_TEMP, "darwin-three-debug-map-work"));
+              verifyWorkOwner();
+              rmSync(work, { recursive: true });
+              cleanup.completed = !existsSync(work);
+              report.sourceAfterCleanup = source();
+              if (report.sourceBefore) assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
+              if (report.origin?.verified) assert.deepEqual(nativeFiles(report.origin), report.nativeFilesBefore ?? report.origin.files);
+            } catch (error) { cleanup.error = fields(error); report.diagnosticComplete = false; }
+            report.cleanup = cleanup;
+            report.finalPassed = false;
+            report.finalVerdict = report.diagnosticComplete && cleanup.completed ? report.observation : "incomplete";
+            save("summary.json", report);
+            save("proof-manifest.json", files(out).filter(item => item.path !== "proof-manifest.json"));
+            process.stderr.write("[darwin-three-diagnostic] FAILED (exit 1)\n"); process.exitCode = 1;
+          }
+          if (process.argv[2] === "--child") await childMain();
+          else if (process.argv[2] === "--finalize") finalize();
+          else await main();
+          RUNNER
+      - name: Replay the single sanitized dev compile
+        timeout-minutes: 60
+        run: node "$RUNNER_TEMP/darwin-three-debug-map-proof/runner.mjs"
+      - name: Verify child drain and remove owned scratch
+        if: always()
+        timeout-minutes: 3
+        run: node "$RUNNER_TEMP/darwin-three-debug-map-proof/runner.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darwin-three-debug-map
+          path: ${{ runner.temp }}/darwin-three-debug-map-proof
+          if-no-files-found: error
+          retention-days: 1
