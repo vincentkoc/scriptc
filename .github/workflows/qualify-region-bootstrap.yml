@@ -1,0 +1,531 @@
+name: Qualify region native bootstrap
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-region-bootstrap.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: qualify-region-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  executor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha256: ${{ steps.identity.outputs.sha256 }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - name: Prepare the reviewed bootstrap executor
+        id: identity
+        run: |
+          cat > "$RUNNER_TEMP/bootstrap-runner.mjs" <<'BOOTSTRAP'
+          import { spawn } from "node:child_process";
+          import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, statfsSync } from "node:fs";
+          import { join } from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { createHash, randomUUID } from "node:crypto";
+          const operation=process.env.BOOTSTRAP_OPERATION??"";
+          const allowed=["seed-plain","plain-commands","plain-rebuild","seed-san","san-commands","san-rebuild-frontend","san-rebuild-emit"];
+          const root=process.cwd(),head="0e17511aaa44ede74b06d6483a0f802d30e7846e";
+          const seed=operation.startsWith("seed-"),flavor=seed?operation.slice(5):operation.split("-")[0];
+          const phase=seed?"seed":operation.slice(flavor.length+1),sanitize=flavor==="san";
+          const out=join(process.env.RUNNER_TEMP,"region-bootstrap"),directory=join(process.env.RUNNER_TEMP,"native-bootstrap"),archive=join(out,"seed-"+flavor+".tar"),identity=join(out,"seed-"+flavor+".json"),packageDirectory=join(process.env.RUNNER_TEMP,"native-cli-package");
+          const invocation=randomUUID();
+          mkdirSync(out,{recursive:true});
+          const report={head,workflow:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,invocation,operation,flavor,phase,status:"running",completeSuite:false,steps:[],startedAt:new Date().toISOString()};
+          const log=join(out,"operation.log");
+          if(existsSync(log))throw Error("operation log already exists");
+          writeFileSync(log,"");
+          const executionBudgetMinutes=sanitize?185:95;
+          const deadline=Date.now()+executionBudgetMinutes*60_000;
+          report.executionBudgetMinutes=executionBudgetMinutes;
+          report.budgetKind=seed?"operator seed budget":"canonical test budget plus five minutes";
+          let dockerBinary,dockerDirectory,dockerCid;
+          const dockerLabel="scriptc.bootstrap.invocation="+invocation;
+          const save=()=>{
+           const body=JSON.stringify(report,null,2)+"\n";
+           writeFileSync(join(out,"summary.json"),body);
+          };
+          const execute=async(command,args,{capture=false,timeoutMs=deadline-Date.now()}={})=>{
+           const start=Date.now();
+           if(timeoutMs<=0)throw Error("bootstrap operation deadline expired");
+           const result=await new Promise((resolve)=>{
+            let stdout="",stderr="",timedOut=false,cancelled=false,spawnError,forceTimer,completionTimer,closed=false,settled=false,cleanup=Promise.resolve({});
+            const child=spawn(command,args,{cwd:root,env:{...process.env,GITHUB_SHA:head},stdio:["ignore","pipe","pipe"],detached:true});
+            const alive=()=>{if(!Number.isInteger(child.pid)||child.pid<=1)return false;try{process.kill(-child.pid,0);return true;}catch(error){if(error.code==="ESRCH")return false;throw error;}};
+            const kill=signal=>{if(Number.isInteger(child.pid)&&child.pid>1)try{process.kill(-child.pid,signal);}catch(error){if(error.code!=="ESRCH")throw error;}};
+            const cancel=()=>{cancelled=true;kill("SIGTERM");forceTimer=setTimeout(()=>kill("SIGKILL"),1000);};
+            process.once("SIGTERM",cancel);process.once("SIGINT",cancel);
+            const pause=ms=>new Promise(done=>setTimeout(done,ms));
+            const drain=async()=>{
+             await pause(100);
+             const leftoverChildren=alive();
+             if(leftoverChildren){
+              kill("SIGTERM");
+              const until=Date.now()+1000;
+              while(alive()&&Date.now()<until)await pause(100);
+              if(alive())kill("SIGKILL");
+              const forcedUntil=Date.now()+9000;
+              while(alive()&&Date.now()<forcedUntil)await pause(100);
+             }
+             return {leftoverChildren,groupDrained:!alive()};
+            };
+            if(!capture)for(const stream of [child.stdout,child.stderr])stream.on("data",data=>{appendFileSync(log,data);process.stdout.write(data);});
+            if(capture){
+             child.stdout.on("data",data=>{stdout+=data;if(stdout.length>4*1024*1024)kill("SIGKILL");});
+             child.stderr.on("data",data=>{stderr+=data;if(stderr.length>4*1024*1024)kill("SIGKILL");});
+            }
+            const timer=setTimeout(()=>{
+             timedOut=true;kill("SIGTERM");
+             forceTimer=setTimeout(()=>kill("SIGKILL"),1000);
+            },timeoutMs);
+            const finish=(code,signal,group)=>{
+             if(settled)return;settled=true;
+             clearTimeout(timer);clearTimeout(forceTimer);clearTimeout(completionTimer);
+             process.removeListener("SIGTERM",cancel);process.removeListener("SIGINT",cancel);
+             resolve({code,signal,timedOut,cancelled,spawnError,stdout,stderr,...group});
+            };
+            child.once("error",error=>{spawnError=String(error);});
+            // Start at exit, not close: orphaned grandchildren may still hold stdout open.
+            child.once("exit",(code,signal)=>{
+             cleanup=drain().catch(error=>({groupDrained:false,groupError:String(error)}));
+             cleanup.then(group=>{
+              if(closed)return;
+              // A descendant outside the drained group may still hold a captured pipe.
+              // Bound observation too; keep unresolved ownership in the failed receipt.
+              completionTimer=setTimeout(()=>{
+               if(closed)return;
+               child.stdout?.destroy();child.stderr?.destroy();
+               finish(code,signal,{...group,groupDrained:false,pipeDrainIncomplete:true});
+              },1000);
+             });
+            });
+            child.once("close",async(code,signal)=>{
+             closed=true;const group=await cleanup;finish(code,signal,group);
+            });
+           });
+           report.steps.push({command,args,seconds:Math.round((Date.now()-start)/1000),code:result.code,signal:result.signal,timedOut:result.timedOut,cancelled:result.cancelled,leftoverChildren:result.leftoverChildren,groupDrained:result.groupDrained});save();
+           if(result.code!==0||result.signal||result.timedOut||result.cancelled||result.spawnError||result.leftoverChildren||result.groupDrained===false)throw Error(command+" failed: "+JSON.stringify({...result,stdout:result.stdout.slice(-2000),stderr:result.stderr.slice(-2000)}));
+           return result.stdout.trim();
+          };
+          const capture=(command,args,verification=false)=>execute(command,args,{capture:true,timeoutMs:verification?30_000:Math.min(60_000,deadline-Date.now())});
+          const run=(command,args)=>execute(command,args);
+          const source=async(verification=false)=>{
+           if(await capture("git",["rev-parse","HEAD"],verification)!==head)throw Error("source head differs");
+           if(await capture("git",["status","--porcelain"],verification)!=="")throw Error("source changed");
+           const inputs={"packages/runtime/src/scr_region.c":"9f6c6ffac906d79c9c643a043cabdb117c5576cbc85190e174f2d863425fdf30","packages/runtime/src/scr_region.test.c":"a38ae232cab4b0526f65b3d57f6e946bc686d56353286b8e01b3b4839b03be34","packages/runtime/src/scr_region.test.ts":"3328b7dc3d2d80878574770f0fbbd41dbae11c3f09ba4e74a3ecdae1c17dc2a0","packages/compiler/src/backend/native/runtime-inputs.ts":"261d9462b2464d085d44f1c767e82adbbc3672c787b71c602de1046f3ccf45d8"};
+           for(const [file,expected]of Object.entries(inputs))if(createHash("sha256").update(readFileSync(file)).digest("hex")!==expected)throw Error("source input differs: "+file);
+           report.inputs=inputs;
+          };
+          const hash=async file=>(await capture("sha256sum",[file])).split(/\s+/)[0];
+          const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
+          const prepareDocker=async()=>{
+           report.dockerVersion=await capture("docker",["info","--format","{{.ServerVersion}}"]);
+           dockerBinary=await capture("/bin/sh",["-c","command -v docker"]);
+           if(!dockerBinary.startsWith("/"))throw Error("Docker binary must resolve to an absolute path");
+           dockerDirectory=join(out,"docker-"+invocation);dockerCid=join(dockerDirectory,"container.cid");
+           mkdirSync(dockerDirectory);
+           const shim="#!/bin/sh\nif [ \"$1\" = run ]; then\n shift\n exec "+quote(dockerBinary)+" run --label "+quote(dockerLabel)+" --cidfile "+quote(dockerCid)+" \"$@\"\nfi\nexec "+quote(dockerBinary)+" \"$@\"\n";
+           writeFileSync(join(dockerDirectory,"docker"),shim,{mode:0o700});
+           process.env.PATH=dockerDirectory+":"+process.env.PATH;
+           report.docker={label:dockerLabel,cidFile:dockerCid,cleanup:"pending"};
+          };
+          const cleanupDocker=async()=>{
+           if(!dockerDirectory)return;
+           const cleanupDeadline=Date.now()+120_000,seen=new Set();
+           const inspect=args=>execute(dockerBinary,args,{capture:true,timeoutMs:Math.min(20_000,cleanupDeadline-Date.now())});
+           const list=async args=>(await inspect(args)).split(/\s+/).filter(Boolean);
+           const validate=id=>{if(!/^[a-f0-9]{64}$/.test(id))throw Error("invalid Docker container identity");return id;};
+           let cid=existsSync(dockerCid)?validate(readFileSync(dockerCid,"utf8").trim()):undefined;
+           const interrupted=report.bootstrapStarted&&!report.bootstrapSucceeded;
+           const settleUntil=Date.now()+(interrupted&&!cid?20_000:0);
+           // The exact label catches daemon creation before the CID file is written.
+           do{
+            const listed=await list(["ps","--all","--quiet","--no-trunc","--filter","label="+dockerLabel]);
+            cid=existsSync(dockerCid)?validate(readFileSync(dockerCid,"utf8").trim()):cid;
+            if(cid){
+             const all=await list(["ps","--all","--quiet","--no-trunc"]);
+             if(all.includes(cid)&&!listed.includes(cid))listed.push(cid);
+            }
+            for(const item of listed){
+             const id=validate(item);
+             let label;
+             try{label=await inspect(["inspect","--format",'{{ index .Config.Labels "scriptc.bootstrap.invocation" }}',id]);}
+             catch(error){if(!(await list(["ps","--all","--quiet","--no-trunc"])).includes(id)){seen.add(id);continue;}throw error;}
+             if(label!==invocation)throw Error("Docker cleanup label mismatch");
+             seen.add(id);
+             try{await inspect(["rm","--force",id]);}
+             catch(error){if((await list(["ps","--all","--quiet","--no-trunc"])).includes(id))throw error;}
+            }
+            if(Date.now()<settleUntil)await new Promise(done=>setTimeout(done,1000));
+           }while(Date.now()<settleUntil);
+           report.docker.cid=cid;report.docker.discovered=[...seen];
+           if(await inspect(["ps","--all","--quiet","--no-trunc","--filter","label="+dockerLabel]))throw Error("owned Docker container remains");
+           if(cid&&(await list(["ps","--all","--quiet","--no-trunc"])).includes(cid))throw Error("recorded Docker container remains");
+           if(interrupted&&!cid&&seen.size===0)throw Error("Docker creation was interrupted without a CID; absence remains unresolved after the settling window");
+           report.docker.cleanup="verified absent";
+           process.env.PATH=process.env.PATH.split(":").filter(p=>p!==dockerDirectory).join(":");
+           rmSync(dockerDirectory,{recursive:true});
+          };
+          save();
+          try{
+           if(!allowed.includes(operation))throw Error("select one bootstrap operation");
+           if(process.platform!=="linux"||process.arch!=="x64"||process.version!=="v"+readFileSync(".node-version","utf8").trim())throw Error("platform or Node pin differs");
+           await source();report.sourceVerifiedBefore=true;
+           report.runnerSha256=createHash("sha256").update(readFileSync(process.argv[1])).digest("hex");
+           if(report.runnerSha256!==process.env.BOOTSTRAP_RUNNER_SHA)throw Error("executor identity differs");
+           if(process.getuid()===0)throw Error("unprivileged execution required");
+           report.uid=process.getuid();
+           if(await capture("pnpm",["--version"])!=="11.1.3"||await capture("llvm-config",["--version"])!=="22.1.8"||await capture("zig",["version"])!=="0.16.0")throw Error("tool pins differ");
+           process.env.PATH=await capture("llvm-config",["--bindir"])+":"+process.env.PATH;
+           for(const key of ["ASAN_OPTIONS","LSAN_OPTIONS","SCRIPTC_TEST_OPTIMIZATION","NODE_OPTIONS"])delete process.env[key];
+           Object.assign(process.env,{CI:"1",SCRIPTC_SAN:sanitize?"1":"",SCRIPTC_TEST_WORKERS:"1",SCRIPTC_TEST_SHARD:"",SCRIPTC_BOOTSTRAP_PHASE:phase,SCRIPTC_BOOTSTRAP_SEED_DIRECTORY:directory,SCRIPTC_BOOTSTRAP_PACKAGE_DIR:packageDirectory});
+           report.tools={node:process.version,pnpm:await capture("pnpm",["--version"]),llvm:await capture("llvm-config",["--version"]),zig:await capture("zig",["version"])};
+           report.swap=readFileSync("/proc/swaps","utf8");
+           const disk=statfsSync(root);report.freeDiskBytes=disk.bavail*disk.bsize;
+           if(report.freeDiskBytes<20*1024**3)throw Error("bootstrap needs 20 GiB of free working space");
+           if(sanitize&&(seed||phase==="rebuild-emit")){
+            const mem=readFileSync("/proc/meminfo","utf8"),kb=name=>Number(mem.match(new RegExp("^"+name+":\\s+(\\d+)","m"))?.[1]??0);
+            report.availableMemoryAndSwapBytes=(kb("MemAvailable")+kb("SwapFree"))*1024;
+            if(report.availableMemoryAndSwapBytes<24*1024**3)throw Error("sanitized bootstrap needs 24 GiB of available RAM and swap");
+           }
+           if(seed||phase==="commands"){
+            if(!existsSync("packages/runtime-wasm32-wasi/runtime-pack.json"))throw Error("WASI pack is required; missing pack would skip cross-target command proof");
+            await run("node",["packages/runtime-wasm32-wasi/scripts/verify.mjs"]);
+            await run("node",["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]);
+            const native=JSON.parse(readFileSync(join(process.env.RUNNER_TEMP,"region-native","native.json"),"utf8"));
+            if(native.head!==head||native.runId!=="41171675587"||native.workflow!=="85264e5f036dbf93bb7519c2e8aae63f2c51ebc9"||native.sourceVerifiedAfter!==true)throw Error("native artifact identity differs");
+            report.native=native;
+           }
+           if(!seed&&flavor==="plain"&&phase==="commands")await prepareDocker();
+           if(existsSync(directory))throw Error("seed directory already exists; inspect the unfinished operation");
+           const {verifyBootstrapSeed}=await import(pathToFileURL(join(root,"scripts/bootstrap-seed.mjs")));
+           if(seed){
+            if(existsSync(archive)||existsSync(identity))throw Error("seed archive already exists; reuse its recorded identity");
+            await run("node",["scripts/bootstrap-seed.mjs"]);
+            verifyBootstrapSeed(directory,head,sanitize);
+            await run("tar",["-C",process.env.RUNNER_TEMP,"-cf",archive,"native-bootstrap"]);
+            const record={head,workflow:report.workflow,runId:report.runId,runnerSha256:report.runnerSha256,flavor,sanitize,directory,archive,sha256:await hash(archive)};
+            writeFileSync(identity,JSON.stringify(record,null,2)+"\n");report.seed=record;
+            rmSync(directory,{recursive:true});
+           }else{
+            const record=JSON.parse(readFileSync(identity,"utf8"));
+            if(record.head!==head||record.workflow!==report.workflow||record.runId!==report.runId||record.runnerSha256!==report.runnerSha256||record.flavor!==flavor||record.sanitize!==sanitize||record.directory!==directory||record.archive!==archive||record.sha256!==await hash(archive))throw Error("seed archive identity differs");
+            if(phase==="commands"&&!sanitize&&(existsSync(packageDirectory)||existsSync(packageDirectory+".ready")))throw Error("package output already exists; inspect the previous operation");
+            await run("tar",["-C",process.env.RUNNER_TEMP,"-xf",archive]);
+            verifyBootstrapSeed(directory,head,sanitize);report.seed=record;
+            report.bootstrapStarted=true;
+            if(phase==="rebuild-emit")await run("/bin/bash",["-c","ulimit -s unlimited; exec node scripts/ci-native-bootstrap.mjs"]);
+            else await run("node",["scripts/ci-native-bootstrap.mjs"]);
+            report.bootstrapSucceeded=true;
+            if(existsSync(directory))throw Error("canonical bootstrap did not release its seed directory");
+            if(phase==="commands"&&!sanitize){rmSync(packageDirectory,{recursive:true});rmSync(packageDirectory+".ready");}
+           }
+           report.status="passed";
+          }catch(error){report.error=String(error);report.status="failed";process.exitCode=1;}
+          finally{
+           try{await cleanupDocker();}catch(error){report.cleanupError=String(error);if(report.docker)report.docker.cleanup="incomplete";report.status="failed";process.exitCode=1;}
+           try{await source(true);report.sourceVerifiedAfter=true;}catch(error){report.sourceError=String(error);report.status="failed";process.exitCode=1;}
+           report.logSha256=createHash("sha256").update(readFileSync(log)).digest("hex");
+           report.finishedAt=new Date().toISOString();save();console.log("BOOTSTRAP "+JSON.stringify(report));
+           if(process.exitCode)console.error("[scriptc-bootstrap] FAILED (exit 1)");
+          }
+          BOOTSTRAP
+          node --check "$RUNNER_TEMP/bootstrap-runner.mjs"
+          printf 'sha256=%s\n' "$(sha256sum "$RUNNER_TEMP/bootstrap-runner.mjs" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: region-bootstrap-executor
+          path: ${{ runner.temp }}/bootstrap-runner.mjs
+          if-no-files-found: error
+          retention-days: 1
+
+  seed:
+    needs: executor
+    name: ${{ matrix.operation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - operation: seed-plain
+            flavor: plain
+            minutes: 125
+          - operation: seed-san
+            flavor: san
+            minutes: 215
+    env:
+      BOOTSTRAP_OPERATION: ${{ matrix.operation }}
+      BOOTSTRAP_RUNNER_SHA: ${{ needs.executor.outputs.sha256 }}
+    steps:
+      - name: Admit bootstrap disk capacity before restoring caches
+        shell: python
+        run: |
+          import json, os
+          operation = os.environ["BOOTSTRAP_OPERATION"]
+          capacity = {}
+          for name, path in {"workspace": os.environ["GITHUB_WORKSPACE"], "runnerTemp": os.environ["RUNNER_TEMP"], "swapDirectory": "/mnt"}.items():
+              info = os.statvfs(path)
+              capacity[name] = {"device": os.stat(path).st_dev, "availableBytes": info.f_bavail * info.f_frsize, "availableInodes": info.f_favail}
+          # Reserve work space once per device; add swap only where it is allocated.
+          required = {capacity[name]["device"]: 20 * 1024**3 for name in ("workspace", "runnerTemp")}
+          if operation in ("seed-san", "san-rebuild-emit"):
+              device = capacity["swapDirectory"]["device"]
+              required[device] = required.get(device, 0) + 24 * 1024**3
+          print(json.dumps({"operation": operation, "requiredBytesByDevice": required, "filesystems": capacity}), flush=True)
+          assert all(item["availableBytes"] >= required[item["device"]] and item["availableInodes"] > 0 for item in capacity.values() if item["device"] in required), "insufficient bootstrap capacity before cache restore"
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: actions/download-artifact@v4
+        with:
+          name: region-san-native
+          run-id: 41171675587
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/region-native
+      - name: Verify and restore GNU and WASI packages
+        run: |
+          node --input-type=module <<'RESTORE'
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const dir=process.env.RUNNER_TEMP+"/region-native";
+          const receipt=JSON.parse(readFileSync(dir+"/native.json","utf8"));
+          if(receipt.head!=="0e17511aaa44ede74b06d6483a0f802d30e7846e"||receipt.runId!=="41171675587"||receipt.workflow!=="85264e5f036dbf93bb7519c2e8aae63f2c51ebc9"||receipt.sourceVerifiedAfter!==true)throw Error("native artifact identity differs");
+          if(createHash("sha256").update(readFileSync(dir+"/native.tar.gz")).digest("hex")!==receipt.archiveSha256)throw Error("native artifact hash differs");
+          RESTORE
+          tar -xzf "$RUNNER_TEMP/region-native/native.tar.gz"
+          node packages/runtime-linux-x64-gnu/scripts/verify.mjs
+          node packages/runtime-wasm32-wasi/scripts/verify.mjs
+      - run: pnpm build
+      - name: Prepare canonical sanitized bootstrap capacity
+        if: matrix.flavor == 'san'
+        run: |
+          python3 -c 'import os; s=os.statvfs("."); assert s.f_bavail*s.f_frsize >= 44*1024**3, "44 GiB free before swap allocation required"'
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+      - uses: actions/download-artifact@v4
+        with:
+          name: region-bootstrap-executor
+          path: ${{ runner.temp }}/bootstrap-executor
+      - name: Verify executor and run one bootstrap operation
+        run: |
+          printf '%s  %s\n' "$BOOTSTRAP_RUNNER_SHA" "$RUNNER_TEMP/bootstrap-executor/bootstrap-runner.mjs" | sha256sum --check
+          node "$RUNNER_TEMP/bootstrap-executor/bootstrap-runner.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: region-bootstrap-proof-${{ matrix.operation }}
+          path: |
+            ${{ runner.temp }}/region-bootstrap/summary.json
+            ${{ runner.temp }}/region-bootstrap/operation.log
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: region-bootstrap-seed-${{ matrix.flavor }}
+          path: ${{ runner.temp }}/region-bootstrap/seed-${{ matrix.flavor }}.*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  phase:
+    needs: [executor, seed]
+    name: ${{ matrix.operation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.minutes }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - operation: plain-commands
+            flavor: plain
+            phase: commands
+            minutes: 125
+          - operation: plain-rebuild
+            flavor: plain
+            phase: rebuild
+            minutes: 125
+          - operation: san-commands
+            flavor: san
+            phase: commands
+            minutes: 215
+          - operation: san-rebuild-frontend
+            flavor: san
+            phase: rebuild-frontend
+            minutes: 215
+          - operation: san-rebuild-emit
+            flavor: san
+            phase: rebuild-emit
+            minutes: 215
+    env:
+      BOOTSTRAP_OPERATION: ${{ matrix.operation }}
+      BOOTSTRAP_RUNNER_SHA: ${{ needs.executor.outputs.sha256 }}
+    steps:
+      - name: Admit bootstrap disk capacity before restoring caches
+        shell: python
+        run: |
+          import json, os
+          operation = os.environ["BOOTSTRAP_OPERATION"]
+          capacity = {}
+          for name, path in {"workspace": os.environ["GITHUB_WORKSPACE"], "runnerTemp": os.environ["RUNNER_TEMP"], "swapDirectory": "/mnt"}.items():
+              info = os.statvfs(path)
+              capacity[name] = {"device": os.stat(path).st_dev, "availableBytes": info.f_bavail * info.f_frsize, "availableInodes": info.f_favail}
+          # Reserve work space once per device; add swap only where it is allocated.
+          required = {capacity[name]["device"]: 20 * 1024**3 for name in ("workspace", "runnerTemp")}
+          if operation in ("seed-san", "san-rebuild-emit"):
+              device = capacity["swapDirectory"]["device"]
+              required[device] = required.get(device, 0) + 24 * 1024**3
+          print(json.dumps({"operation": operation, "requiredBytesByDevice": required, "filesystems": capacity}), flush=True)
+          assert all(item["availableBytes"] >= required[item["device"]] and item["availableInodes"] > 0 for item in capacity.values() if item["device"] in required), "insufficient bootstrap capacity before cache restore"
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          persist-credentials: false
+      - name: Verify source before setup
+        run: |
+          test "$(git rev-parse HEAD)" = 0e17511aaa44ede74b06d6483a0f802d30e7846e
+          test -z "$(git status --porcelain)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: actions/download-artifact@v4
+        if: matrix.phase == 'commands'
+        with:
+          name: region-san-native
+          run-id: 41171675587
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/region-native
+      - name: Verify and restore GNU and WASI packages
+        if: matrix.phase == 'commands'
+        run: |
+          node --input-type=module <<'RESTORE'
+          import { readFileSync } from "node:fs";
+          import { createHash } from "node:crypto";
+          const dir=process.env.RUNNER_TEMP+"/region-native";
+          const receipt=JSON.parse(readFileSync(dir+"/native.json","utf8"));
+          if(receipt.head!=="0e17511aaa44ede74b06d6483a0f802d30e7846e"||receipt.runId!=="41171675587"||receipt.workflow!=="85264e5f036dbf93bb7519c2e8aae63f2c51ebc9"||receipt.sourceVerifiedAfter!==true)throw Error("native artifact identity differs");
+          if(createHash("sha256").update(readFileSync(dir+"/native.tar.gz")).digest("hex")!==receipt.archiveSha256)throw Error("native artifact hash differs");
+          RESTORE
+          tar -xzf "$RUNNER_TEMP/region-native/native.tar.gz"
+          node packages/runtime-linux-x64-gnu/scripts/verify.mjs
+          node packages/runtime-wasm32-wasi/scripts/verify.mjs
+      - run: pnpm build
+      - uses: actions/download-artifact@v4
+        with:
+          name: region-bootstrap-seed-${{ matrix.flavor }}
+          path: ${{ runner.temp }}/region-bootstrap
+      - name: Prepare canonical sanitized bootstrap capacity
+        if: matrix.phase == 'rebuild-emit'
+        run: |
+          python3 -c 'import os; s=os.statvfs("."); assert s.f_bavail*s.f_frsize >= 44*1024**3, "44 GiB free before swap allocation required"'
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+      - uses: actions/download-artifact@v4
+        with:
+          name: region-bootstrap-executor
+          path: ${{ runner.temp }}/bootstrap-executor
+      - name: Verify executor and run one bootstrap operation
+        run: |
+          printf '%s  %s\n' "$BOOTSTRAP_RUNNER_SHA" "$RUNNER_TEMP/bootstrap-executor/bootstrap-runner.mjs" | sha256sum --check
+          node "$RUNNER_TEMP/bootstrap-executor/bootstrap-runner.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: region-bootstrap-proof-${{ matrix.operation }}
+          path: |
+            ${{ runner.temp }}/region-bootstrap/summary.json
+            ${{ runner.temp }}/region-bootstrap/operation.log
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    needs: [executor, seed, phase]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BOOTSTRAP_RUNNER_SHA: ${{ needs.executor.outputs.sha256 }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: region-bootstrap-proof-*
+          path: ${{ runner.temp }}/bootstrap-results
+      - name: Verify every bootstrap operation and seed identity
+        run: |
+          node --input-type=module <<'AGGREGATE'
+          import {readFileSync,readdirSync,writeFileSync}from"node:fs";
+          import{join}from"node:path";
+          import{createHash}from"node:crypto";
+          const expected=["seed-plain","seed-san","plain-commands","plain-rebuild","san-commands","san-rebuild-frontend","san-rebuild-emit"],head="0e17511aaa44ede74b06d6483a0f802d30e7846e",files=[];
+          function walk(dir){for(const entry of readdirSync(dir,{withFileTypes:true})){const path=join(dir,entry.name);if(entry.isDirectory())walk(path);else if(entry.name==="summary.json")files.push(path);}}
+          walk(process.env.RUNNER_TEMP+"/bootstrap-results");
+          const results=files.map(file=>({file,data:JSON.parse(readFileSync(file,"utf8"))}));
+          if(JSON.stringify(results.map(r=>r.data.operation).sort())!==JSON.stringify([...expected].sort()))throw Error("bootstrap operations incomplete");
+          for(const{file,data}of results){
+           if(data.head!==head||data.workflow!==process.env.GITHUB_SHA||data.runId!==process.env.GITHUB_RUN_ID||data.status!=="passed"||data.sourceVerifiedBefore!==true||data.sourceVerifiedAfter!==true||!data.finishedAt||data.runnerSha256!==process.env.BOOTSTRAP_RUNNER_SHA)throw Error("bootstrap operation failed");
+           if(data.steps.some(step=>step.code!==0||step.signal||step.timedOut||step.cancelled||step.leftoverChildren||step.groupDrained!==true))throw Error("bootstrap child did not complete");
+           if(createHash("sha256").update(readFileSync(join(file,"..","operation.log"))).digest("hex")!==data.logSha256)throw Error("bootstrap log differs");
+           if(!data.operation.startsWith("seed-")&&data.bootstrapSucceeded!==true)throw Error("bootstrap phase missing");
+           if(data.operation==="plain-commands"&&data.docker?.cleanup!=="verified absent")throw Error("installer Docker cleanup incomplete");
+          }
+          for(const flavor of["plain","san"]){
+           const seed=results.find(r=>r.data.operation==="seed-"+flavor).data.seed;
+           for(const{data}of results.filter(r=>r.data.flavor===flavor))if(JSON.stringify(data.seed)!==JSON.stringify(seed))throw Error("bootstrap seed identity differs between operations");
+          }
+          const summary={head,workflow:process.env.GITHUB_SHA,runId:process.env.GITHUB_RUN_ID,status:"passed",completeSuite:false,operations:results.map(({data})=>({operation:data.operation,seedSha256:data.seed.sha256,logSha256:data.logSha256,docker:data.docker?.cleanup??null}))};
+          writeFileSync(process.env.RUNNER_TEMP+"/bootstrap-summary.json",JSON.stringify(summary,null,2)+"\n");
+          console.log(JSON.stringify(summary));
+          AGGREGATE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: region-bootstrap-summary
+          path: ${{ runner.temp }}/bootstrap-summary.json
+          if-no-files-found: error
+          retention-days: 1
