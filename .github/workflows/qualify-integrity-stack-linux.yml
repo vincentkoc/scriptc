@@ -1,0 +1,218 @@
+name: Qualify runtime integrity stack on Linux
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-integrity-stack-linux.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-integrity-stack-linux
+  cancel-in-progress: false
+
+jobs:
+  integrity_stack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 16e10a269eabd82fe42f22d314e87a33ffc16969
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - uses: ./.github/actions/llvm-linux
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - run: pnpm build
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Qualify the combined runtime fixes
+        run: |
+          cat > "$RUNNER_TEMP/integrity-stack-linux.mjs" <<'PROOF'
+          import { spawn } from "node:child_process";
+          import { mkdirSync, readFileSync, writeFileSync, existsSync, statfsSync } from "node:fs";
+          import { join } from "node:path";
+          import { createHash } from "node:crypto";
+          import { pathToFileURL } from "node:url";
+          const selection="stack";
+          const specs={"stack":{"pr":null,"head":"16e10a269eabd82fe42f22d314e87a33ffc16969","abi":49,"units":[{"file":"packages/compiler/src/backend/llvm/expr-containers.test.ts","passed":50},{"file":"packages/runtime/test/array.test.ts","passed":5},{"file":"packages/compiler/src/backend/publication.test.ts","passed":2},{"file":"packages/compiler/src/backend/llvm/publish.test.ts","passed":4},{"file":"packages/compiler/src/frontend/lowering/lower-array-sort.test.ts","passed":9},{"file":"packages/compiler/src/backend/runtime-pack-native.test.ts","passed":23},{"file":"packages/compiler/src/backend/runtime-pack.test.ts","passed":22},{"file":"packages/compiler/src/backend/runtime-pack-targets.test.ts","passed":14},{"file":"packages/compiler/test/llvm-runtime-abi.test.ts","passed":6},{"file":"packages/cli/test/native-link-info.test.ts","passed":1,"pending":5},{"file":"packages/runtime/src/scr_message.test.ts","passed":1},{"file":"packages/runtime/src/scr_region.test.ts","passed":3}],"corpus":["2669-array-copying-methods.ts","2685-array-unshift-reverse.ts","2701-array-sort-snapshot.ts","2703-array-sparse-sort.ts","2704-array-sparse-to-sorted.ts","2705-array-sparse-sort-append.ts","5362-array-sort-comparator-throws.ts","5363-array-sort-comparator-writes.ts","5793-worker-message-channel.ts","5802-broadcast-channel-workers.ts","5803-worker-environment-data.ts","7139-message-typed-records.ts","7360-worker-typed-records.ts","7406-frozen-containers.ts","array-sort-dense-effects.ts","array-sort-holes-published.ts","frozen-sparse-array-noops.ts","native-array-fill-copywithin.js","native-array-frozen-noops.js","native-worker-publish-classes.ts","native-worker-published-graphs.ts","native-worker-published-members.ts","worker-class-instance-clone.ts"]}};
+          if(!Object.hasOwn(specs,selection))throw Error("unknown qualification selection");
+          const spec=specs[selection],root=process.cwd(),head=spec.head;
+          const out=join(process.env.RUNNER_TEMP,"integrity-stack-linux");
+          mkdirSync(out,{recursive:true});
+          const report={head,workflow:process.env.GITHUB_SHA,pr:spec.pr,selection,status:"running",platform:process.platform,arch:process.arch,node:process.version,startedAt:new Date().toISOString(),completeSuite:false,steps:[],groups:[]};
+          const deadline=Date.now()+45*60_000;
+          const scrub=s=>String(s).split(root).join("<repo>").split(process.env.RUNNER_TEMP).join("<temp>");
+          const save=()=>writeFileSync(join(out,"summary.json"),scrub(JSON.stringify(report,null,2))+"\n");
+          const execute=async(command,args,{capture=false,env={},timeoutMs=deadline-Date.now()}={})=>{
+           const start=Date.now();
+           if(timeoutMs<=0)throw Error("qualification deadline expired");
+           const result=await new Promise((resolve)=>{
+            let stdout="",stderr="",timedOut=false,spawnError,forceTimer,completionTimer,closed=false,settled=false,cleanup=Promise.resolve({});
+            const child=spawn(command,args,{cwd:root,env:{...process.env,...env},stdio:capture?["ignore","pipe","pipe"]:"inherit",detached:true});
+            const alive=()=>{if(!child.pid)return false;try{process.kill(-child.pid,0);return true;}catch(error){if(error.code==="ESRCH")return false;throw error;}};
+            const kill=signal=>{if(child.pid)try{process.kill(-child.pid,signal);}catch(error){if(error.code!=="ESRCH")throw error;}};
+            const pause=ms=>new Promise(done=>setTimeout(done,ms));
+            const drain=async()=>{
+             await pause(100);
+             const leftoverChildren=alive();
+             if(leftoverChildren){
+              kill("SIGTERM");
+              const until=Date.now()+1000;
+              while(alive()&&Date.now()<until)await pause(100);
+              if(alive())kill("SIGKILL");
+              const forcedUntil=Date.now()+9000;
+              while(alive()&&Date.now()<forcedUntil)await pause(100);
+             }
+             return {leftoverChildren,groupDrained:!alive()};
+            };
+            if(capture){
+             child.stdout.on("data",data=>{stdout+=data;if(stdout.length>4*1024*1024)kill("SIGKILL");});
+             child.stderr.on("data",data=>{stderr+=data;if(stderr.length>4*1024*1024)kill("SIGKILL");});
+            }
+            const timer=setTimeout(()=>{
+             timedOut=true;kill("SIGTERM");
+             forceTimer=setTimeout(()=>kill("SIGKILL"),1000);
+            },timeoutMs);
+            const finish=(code,signal,group)=>{
+             if(settled)return;settled=true;
+             clearTimeout(timer);clearTimeout(forceTimer);clearTimeout(completionTimer);
+             resolve({code,signal,timedOut,spawnError,stdout,stderr,...group});
+            };
+            child.once("error",error=>{spawnError=String(error);});
+            // Start at exit, not close: orphaned grandchildren may still hold stdout open.
+            child.once("exit",(code,signal)=>{
+             cleanup=drain().catch(error=>({groupDrained:false,groupError:String(error)}));
+             cleanup.then(group=>{
+              if(closed)return;
+              // A descendant outside the drained group may still hold a captured pipe.
+              // Bound observation too; keep unresolved ownership in the failed receipt.
+              completionTimer=setTimeout(()=>{
+               if(closed)return;
+               child.stdout?.destroy();child.stderr?.destroy();
+               finish(code,signal,{...group,groupDrained:false,pipeDrainIncomplete:true});
+              },1000);
+             });
+            });
+            child.once("close",async(code,signal)=>{
+             closed=true;const group=await cleanup;finish(code,signal,group);
+            });
+           });
+           report.steps.push({command,args,seconds:Math.round((Date.now()-start)/1000),code:result.code,signal:result.signal,timedOut:result.timedOut,leftoverChildren:result.leftoverChildren,groupDrained:result.groupDrained});save();
+           if(result.code!==0||result.signal||result.timedOut||result.spawnError||result.leftoverChildren||result.groupDrained===false)throw Error(command+" failed: "+JSON.stringify({...result,stdout:result.stdout.slice(-2000),stderr:result.stderr.slice(-2000)}));
+           return result.stdout.trim();
+          };
+
+          const capture=(command,args)=>execute(command,args,{capture:true,timeoutMs:30_000});
+          const expectedInputs={"docs/content/docs/how-it-works.mdx":"34d8a435a35f9a2065f9f50e27ec23d58223903b6764a3da10a2fcdb94b675b1","examples/native-object/README.md":"c0a1fb7ec68244a554550bf649c4c871e78242277961de68a1dd321e6a443265","packages/cli/test/native-link-info.test.ts":"8605cc246ae0ec3cda576fa0ec59a28a8ba53107141fa43a89328a377e00efa9","packages/compiler/src/backend/llvm/emitter.ts":"1d2fda8a1088605bff5fd144fa1f39baac1dbea10759f523330856baae2d2820","packages/compiler/src/backend/llvm/expr-containers.test.ts":"63b643a8991dee4a62a939f72f79b682cca9b23118dd5a8398e101a13909fa8c","packages/compiler/src/backend/llvm/expr-containers.ts":"63dea67a355dc0ed89827c2a9c82e19a8db91f73056093711f135df2d98811f9","packages/compiler/src/backend/runtime-abi.ts":"8e4d37b4b31b2bc03e93398f340534e8d72b4c6685b71823cd1d172b08116bd0","packages/compiler/src/backend/runtime-pack-native.test.ts":"c5dc498cf5b1c1b7c11aff79e619f4f33c95e4c871e39b23aafe2f75ce3f9c29","packages/compiler/src/backend/runtime-pack-native.ts":"84306fc98259402f166cacca7e2aed22c9382fa89e666edc5cfa17e401b65cc2","packages/compiler/src/backend/runtime-pack-targets.test.ts":"7fd0e174bc5259b8462118003aee5827ffb83b5c86d409709506be67ece43893","packages/compiler/src/backend/runtime-pack.test.ts":"d5ef8779a0ed0fbeecdc18aa6b3c176ee3c1109ff42396e47a9d6b7725e14ba2","packages/compiler/src/frontend/lowering/lower-array-sort.ts":"58ec816e2b4a380308ba8db3e0db44edb551c4ad09414ce20f991794a67cb9ce","packages/compiler/test/native-codegen-integration.test.ts":"96c0781b56a6bc2b0c891c2d39192ed7ed630e20e16cce341bd4da695d77cb41","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/frozen-sparse-array-noops.ts.json":"5b9196eb3d972b7157a06a2a6152cef58af9deb0b0b36f3c510c70f5b66b7ace","packages/runtime-darwin-arm64/scripts/build.mjs":"f4a75ab019909344624d9d4e17acd69aa8b9443dd6bdec8f1123832c7035054b","packages/runtime-pack-common/scripts/build.mjs":"f76ba6c255256a8e5b5157a03f4bfd9c2540555656ce73262c8738765547e2ec","packages/runtime/src/scr_array.c":"7648691ca463e216ab20c9b86b4353e011ae342c0b6101c573f9371d0d71360d","packages/runtime/src/scr_array.h":"3d693edcd2e9d4cfd5d2363e1f529f7750d5db1ab24113f023c292198e59941f","packages/runtime/src/scr_console.c":"7235656a30faddd33d66ddb3013c49be9cde9eaeb7b1e4629f743a9bcc38292c","packages/runtime/src/scr_core.h":"799e8efad0cd6d344b037c12b3cf9d264bdfd5e85dffc2223034dda03fc18bda","packages/runtime/src/scr_publish.c":"bce24719b8a8c7aeefd0224e0309ef9970d0965fa81f65222264952fcbd8dd06","packages/runtime/test/test_array.c":"4c7123698c7682f36752496406bbefd13de47377963523b9deec22f4916ee026","tests/corpus/frozen-sparse-array-noops.ts":"9a24b0ff86ac734c449527beb5303f6a47f3cd65682668aabe3bc86a17947095","tests/harness/corpus-costs/frozen-sparse-array-noops.ts.json":"be2f69f9c459443419c43e9b8d196bb865d4bbc1d7adf84abb5280ddf2661379","packages/runtime/src/scr_region.c":"9f6c6ffac906d79c9c643a043cabdb117c5576cbc85190e174f2d863425fdf30","packages/runtime/src/scr_region.test.c":"a38ae232cab4b0526f65b3d57f6e946bc686d56353286b8e01b3b4839b03be34","packages/runtime/src/scr_region.test.ts":"3328b7dc3d2d80878574770f0fbbd41dbae11c3f09ba4e74a3ecdae1c17dc2a0","packages/compiler/test/ts7/baselines/order-parity/tests/corpus/native-worker-published-members.ts.json":"3b3eecc7c1a9f0773d3dab8ebe7851331e785c264ef10c846a4030ec17166408","packages/runtime/src/scr_message.c":"12b7d3d7f7317cad6f3ee6ae8f5029737bff48961f959f0571d1c3484bb276bf","packages/runtime/src/scr_message.test.c":"440b40ff81d88535df02be5343e0ea9e5654b180a1a24b258c776449b2c5d022","packages/runtime/src/scr_message.test.ts":"55b354dedccd6a16dab664c83cbaed007c0b14c6cefeff2256dd2c5b867b8dcf","tests/corpus/native-worker-published-members.ts":"f8989aef5c614e98a14d5ab2c73ff00b73c1542a6e720f00164c74c1a715f0e0","tests/harness/corpus-costs/native-worker-published-members.ts.json":"0431d1b30da33754034dd4460582cc00b5eb0f2394745abab786b836424687ce"};
+          const source=async()=>{
+           for(const [file,expected] of Object.entries(expectedInputs))if(hash(file)!==expected)throw Error("input hash differs: "+file);
+           report.inputs=expectedInputs;
+           if(await capture("git",["rev-parse","HEAD"])!==head)throw Error("head differs");
+           if(await capture("git",["status","--porcelain"])!=="")throw Error("source changed");
+          };
+          const hash=file=>createHash("sha256").update(readFileSync(file)).digest("hex");
+          const pending=t=>["pending","skipped","todo"].includes(t.status);
+          const escape=s=>s.replace(/[.*+?^{}()|[\]\\$]/g,"\\$&");
+          const suite=async(label,files,options={})=>{
+           const output=join(out,label+".json");
+           if(existsSync(output))throw Error("proof output exists: "+label);
+           console.log("START "+label);
+           let failure;
+           try{
+            await execute("pnpm",["test",...files,...(options.pattern?["-t",options.pattern]:[]),"--reporter=json","--outputFile="+output],{env:{SCRIPTC_SAN:options.san?"1":""}});
+           }catch(error){failure=error;}
+           const data=JSON.parse(readFileSync(output,"utf8"));
+           const active=data.testResults.flatMap(s=>s.assertionResults).filter(t=>!pending(t));
+           const group={label,success:data.success,passed:active.filter(t=>t.status==="passed").length,cases:active.map(t=>({name:t.fullName,status:t.status,failures:t.failureMessages.map(scrub)})),pendingCount:data.testResults.flatMap(s=>s.assertionResults).filter(pending).length,pending:options.units?data.testResults.flatMap(s=>s.assertionResults).filter(pending).map(t=>t.fullName):[]};
+           report.groups.push(group);save();
+           if(failure)throw failure;
+           if(!data.success||active.some(t=>t.status!=="passed"))throw Error(label+" failed");
+           if(options.units){
+            for(const expected of options.units){
+             const suites=data.testResults.filter(s=>s.name.endsWith("/"+expected.file));
+             if(suites.length!==1)throw Error("missing unit file "+expected.file);
+             const tests=suites[0].assertionResults;
+             if(tests.filter(t=>t.status==="passed").length!==expected.passed||tests.filter(pending).length!==(expected.pending??0))throw Error("unit inventory differs: "+expected.file);
+            }
+           }
+           if(options.names){
+            const names=active.map(t=>options.names.find(n=>t.fullName.endsWith(n))).sort();
+            if(JSON.stringify(names)!==JSON.stringify([...options.names].sort()))throw Error("case inventory differs: "+label);
+           }
+           console.log("DONE "+label+" passed="+group.passed);
+          };
+          save();
+          try{
+           await source();
+           if(process.platform!=="linux"||process.arch!=="x64"||process.version!=="v"+readFileSync(".node-version","utf8").trim())throw Error("Linux x64 or Node pin differs");
+           report.uid=process.getuid();
+           if(report.uid===0)throw Error("unprivileged execution required for the permission regression");
+           report.tools={pnpm:await capture("pnpm",["--version"]),clang:await capture("clang",["--version"]),llvm:await capture("llvm-config",["--version"]),zig:await capture("zig",["version"])};
+           if(report.tools.pnpm!=="11.1.3"||report.tools.llvm!=="22.1.8"||report.tools.zig!=="0.16.0")throw Error("tool pin differs");
+           for(const name of ["SCRIPTC_RUNTIME_PACK","SCRIPTC_LLVM_CODEGEN","SCRIPTC_LIBNODE","SCRIPTC_TEST_SHARD","SCRIPTC_TEST_OPTIMIZATION","SCRIPTC_CACHE_DIR","SCRIPTC_TS7_ALL","SCRIPTC_UPDATE_BASELINES"])delete process.env[name];
+           Object.assign(process.env,{CI:"1",NODE_OPTIONS:"--max-old-space-size=4096",SCRIPTC_TEST_WORKERS:"2",SCRIPTC_NO_CACHE:"1",SCRIPTC_SAN:"",SCRIPTC_LLVM_TEST_MODE:"dev",ASAN_OPTIONS:"detect_leaks=0",UBSAN_OPTIONS:"halt_on_error=1",CMAKE_BUILD_PARALLEL_LEVEL:"8"});
+           const disk=statfsSync(root);report.freeDiskBytes=disk.bavail*disk.bsize;
+           if(report.freeDiskBytes<20*1024**3)throw Error("20 GiB free disk required");
+           await execute("node",["packages/runtime-linux-x64-gnu/scripts/verify.mjs"]);
+           const manifestPath="packages/runtime-linux-x64-gnu/runtime-pack.json",manifest=JSON.parse(readFileSync(manifestPath,"utf8"));
+           if(manifest.runtime_abi.version!==spec.abi||manifest.runtime_abi.marker!=="scr_runtime_abi_v"+spec.abi)throw Error("runtime ABI differs");
+           report.runtimePack={abi:manifest.runtime_abi,sha256:hash(manifestPath)};
+           report.helper=JSON.parse(await capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen",["version","--format=json"]));
+           if(report.helper.protocol_version!=="1"||report.helper.llvm_version!=="22.1.8"||report.helper.scriptc_package_version!==JSON.parse(readFileSync("packages/llvm-linux-x64-gnu/package.json","utf8")).version)throw Error("helper identity differs");
+           await source();
+           await suite("units",spec.units.map(x=>x.file),{units:spec.units});
+           await execute("pnpm",["test:ts7","--baselines-only"]);
+           const {allOrderEntries}=await import(pathToFileURL(join(root,"scripts/ts7-order-fixtures.mjs")));
+           const entries=allOrderEntries(root),newFixtures=["tests/corpus/frozen-sparse-array-noops.ts","tests/corpus/native-worker-published-members.ts"];
+           const batches=new Map();
+           for(const fixture of newFixtures){
+            const index=entries.indexOf(join(root,fixture));
+            if(index<0)throw Error("fixture absent from canonical order inventory: "+fixture);
+            const batch=entries.slice(Math.floor(index/20)*20,Math.floor(index/20)*20+20);
+            const first=batch[0].slice(root.length+1),name=first+" … +"+(batch.length-1);
+            batches.set(name,batch.map(p=>p.slice(root.length+1)));
+           }
+           report.orderParityBatches=Object.fromEntries(batches);
+           process.env.SCRIPTC_TS7_ALL="1";
+           try{
+            const names=[...batches.keys()];
+            await suite("order-parity",["packages/compiler/test/ts7/order-parity.test.ts"],{pattern:"("+names.map(escape).join("|")+")$",names});
+           }finally{delete process.env.SCRIPTC_TS7_ALL;}
+           const pattern="("+spec.corpus.map(escape).join("|")+")$";
+           for(const san of [false,true]){
+            for(const mode of ["release","dev"]){
+             await suite((san?"san":"plain")+"-"+mode,[mode==="release"?"tests/harness/differential.test.ts":"tests/harness/llvm-differential.test.ts"],{pattern,names:spec.corpus,san});
+            }
+           }
+           report.status="passed";
+          }catch(error){report.status="failed";report.error=scrub(error);process.exitCode=1;}
+          finally{
+           try{await source();report.sourceVerifiedAfter=true;}catch(error){report.status="failed";report.sourceError=scrub(error);process.exitCode=1;}
+           save();console.log("QUALIFICATION "+JSON.stringify({head,status:report.status,groups:report.groups.length}));
+           if(process.exitCode)console.error("[scriptc-integrity-stack] FAILED (exit 1)");
+          }
+          PROOF
+          ulimit -c 0
+          node "$RUNNER_TEMP/integrity-stack-linux.mjs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-integrity-stack-proof
+          path: ${{ runner.temp }}/integrity-stack-linux/summary.json
+          if-no-files-found: error
+          retention-days: 1
