@@ -8,7 +8,7 @@ import { expect, test } from "vitest";
 const exec = promisify(execFile);
 
 test.each([false, true])(
-  "checked storage and weak metadata preserve ownership (audit=%s)",
+  "checked storage, Error payloads and weak metadata preserve ownership (audit=%s)",
   async (audit) => {
     const scratch = await mkdtemp(join(tmpdir(), "scriptc-weak-map-"));
     const src = import.meta.dirname;
@@ -20,6 +20,7 @@ test.each([false, true])(
         "-Wall",
         "-Wextra",
         "-fsanitize=address,undefined",
+        "-DSCR_CYC_TESTING",
         ...(audit ? ["-DSCR_RC_AUDIT"] : []),
         "-I",
         src,
@@ -63,6 +64,16 @@ test.each([false, true])(
         });
         expect(result.stdout).toBe("checked storage and weak metadata lifetime checks passed\n");
         expect(result.stderr).toBe("");
+        const errors = await exec(binary, ["error-owned-payloads"], {
+          env: {
+            ...process.env,
+            SCR_CYCLE_THRESHOLD: threshold,
+            ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1",
+            UBSAN_OPTIONS: "halt_on_error=1",
+          },
+        });
+        expect(errors.stdout).toBe("native Error owned payload checks passed\n");
+        expect(errors.stderr).toBe("");
       }
     } finally {
       await rm(scratch, { recursive: true, force: true });
