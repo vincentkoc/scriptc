@@ -10,12 +10,15 @@ import {
   cpSync,
   copyFileSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { compile } from "@scriptc/compiler";
@@ -273,5 +276,226 @@ describe.skipIf(skip)("Node island handles", () => {
       const after = await execFileAsync(binary, [], { env, encoding: "utf8" });
       expect(after.stdout).toBe(before.stdout);
     }
+  }, 300_000);
+});
+
+// These fixtures live outside node_modules so Node can strip their TypeScript.
+const foreignErrorModule = `
+let kept = new TypeError('same');
+export function get() { return kept; }
+export function fresh() { return new TypeError('same'); }
+export function same(a, b) { return a === b; }
+export function echo(value) { return value; }
+export function fail() { throw kept; }
+export function rethrow(value) { throw value; }
+export function call(fn) { return fn(kept); }
+export function callWith(fn, value) { return fn(value); }
+export function callNull(fn) { return fn(null); }
+export function fulfill() { return Promise.resolve(kept); }
+export function reject() { return Promise.reject(kept); }
+export function write(value) { kept.code = value; }
+export function code() { return kept.code; }
+export function plain() { return { name: 'TypeError', message: 'same', '%error': true }; }
+export function prototypeOnly() { return Object.create(Error.prototype); }
+export function detach(value) { Object.setPrototypeOf(value, null); }
+let reads = 0;
+export function guarded() {
+  const value = new TypeError('guarded');
+  Object.defineProperty(value, 'name', { get() { reads++; return 'TypeError'; } });
+  Object.defineProperty(value, 'code', { get() { reads++; return 'CODE'; } });
+  return value;
+}
+export function readCount() { return reads; }
+`;
+
+async function withForeignErrors(
+  name: string,
+  source: string,
+  check: (entry: string, binary: string) => Promise<void>,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), `scriptc-${name}-`));
+  try {
+    const entry = join(dir, "main.mts");
+    const island = join(dir, "island.mjs");
+    writeFileSync(entry, `import * as island from './island.mjs';\n${source}`);
+    writeFileSync(island, foreignErrorModule);
+    const result = await compile(entry, {
+      outDir: dir,
+      outPath: join(dir, "program"),
+      sanitize,
+      nodeIslands: { mode: "explicit", islands: [island] },
+    });
+    if (!result.ok)
+      throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    await check(entry, result.binaryPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const foreignErrorEnv = { ...process.env };
+delete foreignErrorEnv["FORCE_COLOR"];
+const contextSwitchWarning =
+  /^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext functions and may produce false positives in some cases!\n/gm;
+
+async function foreignErrorParity(entry: string, binary: string, expected: string): Promise<void> {
+  const node = await execFileAsync(process.execPath, [entry], {
+    env: foreignErrorEnv,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  expect(node.stdout).toBe(expected);
+  expect(node.stderr).toBe("");
+  const native = await execFileAsync(binary, [], {
+    env: foreignErrorEnv,
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  expect(native.stdout).toBe(node.stdout);
+  expect(native.stderr.replace(contextSwitchWarning, "")).toBe(node.stderr);
+}
+
+describe.skipIf(skip)("foreign Error identity", () => {
+  test("returned, caught, callback and promise Errors keep their island identity", async () => {
+    await withForeignErrors(
+      "error-identity",
+      `
+const value: unknown = island.get();
+const other: unknown = island.fresh();
+console.log('returned', value === island.get(), value !== other);
+const typed = value as Error;
+const again = value as Error;
+const nullable = value as Error | null;
+console.log('checked', typed === again, (typed as unknown) === value, (nullable as unknown) === value);
+console.log('echo', island.echo(typed) === value, island.same(typed, typed));
+try { island.fail(); } catch (caught) {
+  console.log('caught', caught === value, caught instanceof Error, caught instanceof TypeError);
+  try { throw caught; } catch (rethrown) { console.log('rethrow', rethrown === value); }
+}
+try { throw value; } catch (caught) {
+  console.log('native-throw', caught === value, caught instanceof Error);
+  try { island.rethrow(caught); } catch (rethrown) { console.log('island-rethrow', rethrown === value); }
+}
+function accept(error: Error): boolean { return (error as unknown) === value; }
+function acceptNullable(error: Error | null): boolean { return error === null || (error as unknown) === value; }
+console.log('callback', island.call(accept), island.call(acceptNullable), island.callNull(acceptNullable));
+const fulfilled = island.fulfill() as Promise<Error>;
+console.log('fulfilled', ((await fulfilled) as unknown) === value);
+const rejected = island.reject() as Promise<Error>;
+try { await rejected; } catch (caught) { console.log('rejected', caught === value, caught instanceof Error); }
+const dynamic: any = value;
+dynamic.code = 'native';
+console.log('write', island.code() === 'native');
+island.write('island');
+console.log('read', dynamic.code === 'island');
+island.detach(typed);
+console.log('typed-prototype', typed instanceof Error, typed instanceof TypeError);
+try { throw typed; } catch (caught) {
+  console.log('caught-prototype', caught === value, caught instanceof Error, caught instanceof TypeError);
+}
+`,
+      (entry, binary) =>
+        foreignErrorParity(
+          entry,
+          binary,
+          "returned true true\nchecked true true true\necho true true\ncaught true true true\nrethrow true\nnative-throw true true\nisland-rethrow true\ncallback true true true\nfulfilled true\nrejected true true\nwrite true\nread true\ntyped-prototype false false\ncaught-prototype true false false\n",
+        ),
+    );
+  }, 300_000);
+
+  test("Error branding and prototype membership do not read island properties", async () => {
+    await withForeignErrors(
+      "error-brand",
+      `
+const value: unknown = island.guarded();
+console.log('brand', Error.isError(value), value instanceof Error, value instanceof TypeError);
+console.log('repeat', value === island.echo(value), island.same(value, value));
+function acceptUnknown(error: unknown): boolean { return Error.isError(error); }
+console.log('callback', island.callWith(acceptUnknown, value));
+const detached: unknown = island.guarded();
+island.detach(detached);
+console.log('detached', Error.isError(detached), detached instanceof Error, detached instanceof TypeError);
+const prototype: unknown = island.prototypeOnly();
+console.log('prototype', Error.isError(prototype), prototype instanceof Error);
+const spoof: unknown = island.plain();
+console.log('spoof', Error.isError(spoof), spoof instanceof Error);
+console.log('calls', island.echo(value) instanceof Error, island.echo(detached) instanceof Error);
+console.log('reads', island.readCount());
+`,
+      (entry, binary) =>
+        foreignErrorParity(
+          entry,
+          binary,
+          "brand true true true\nrepeat true true\ncallback true\ndetached true false false\nprototype false true\nspoof false false\ncalls true false\nreads 0\n",
+        ),
+    );
+  }, 300_000);
+
+  test("checked Error conversions reject non-Error island handles", async () => {
+    await withForeignErrors(
+      "error-reject",
+      `
+function check(value: unknown): void {
+  try { const error = value as Error; console.log('direct', island.same(error, value)); }
+  catch (error) { console.log('direct rejected', error instanceof TypeError); }
+  try { const error = value as Error | null; console.log('union', island.same(error, value)); }
+  catch (error) { console.log('union rejected', error instanceof TypeError); }
+}
+check(island.plain());
+check(island.prototypeOnly());
+check(42);
+`,
+      async (_entry, binary) => {
+        const result = await execFileAsync(binary, [], {
+          env: foreignErrorEnv,
+          encoding: "utf8",
+          timeout: 30_000,
+        });
+        expect(result.stdout).toBe("direct rejected true\nunion rejected true\n".repeat(3));
+        expect(result.stderr.replace(contextSwitchWarning, "")).toBe("");
+      },
+    );
+  }, 300_000);
+
+  test("released typed Error mirrors do not root island handles", async () => {
+    await withForeignErrors(
+      "error-release",
+      `
+function consume(): boolean {
+  const value: unknown = island.fresh();
+  const error = value as Error;
+  return island.same(error, value);
+}
+const count = Number(process.argv[2]);
+let matches = 0;
+for (let i = 0; i < count; i++) if (consume()) matches++;
+console.log('matches', matches);
+`,
+      async (entry, binary) => {
+        const live: number[] = [];
+        for (const count of [200, 2000]) {
+          const node = await execFileAsync(process.execPath, [entry, String(count)], {
+            env: foreignErrorEnv,
+            encoding: "utf8",
+            timeout: 30_000,
+          });
+          const native = await execFileAsync(binary, [String(count)], {
+            env: { ...foreignErrorEnv, SCRIPTC_NODE_ISLANDS_TRACE: "handles" },
+            encoding: "utf8",
+            timeout: 30_000,
+          });
+          expect(node.stdout).toBe(`matches ${count}\n`);
+          expect(node.stderr).toBe("");
+          expect(native.stdout).toBe(node.stdout);
+          const stderr = native.stderr.replace(contextSwitchWarning, "");
+          const rows = [...stderr.matchAll(/^\[node-islands\] live handles (\d+)\n/gm)];
+          expect(rows).toHaveLength(1);
+          expect(stderr.replace(rows[0]![0], "")).toBe("");
+          live.push(Number(rows[0]![1]));
+        }
+        expect(live[1]).toBe(live[0]);
+        expect(live[1]).toBeLessThan(8);
+      },
+    );
   }, 300_000);
 });

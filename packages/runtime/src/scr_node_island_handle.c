@@ -528,17 +528,40 @@ static ScrError *nh_error_of(const ScrNodeValue *v) {
   return e;
 }
 
-/* An argument of a native callback (scr_node_island_export.c): island
- * Errors arrive as their pinned ScrError, as thrown ones do, so typed code
- * sees `instanceof RangeError`, `message` and `code`. +1. */
-ScrDyn *scr_ni_arg_in(const ScrNodeValue *v) {
-  if (v->tag == SCR_NV_HANDLE && (v->flags & SCR_NVF_ERROR)) {
-    ScrError *e = nh_error_of(v);
-    ScrDyn *d = scr_dyn_from_error(e);
-    scr_error_release(e);
-    return d;
-  }
-  return scr_ni_value_in(v);
+/* A brand test must not read name/message/stack/code or allocate a mirror. */
+static bool nh_is_error(const ScrDyn *value) {
+  ScrNodeRef *ref = nh_ref_of(value);
+  return ref != NULL && (ref->flags & SCR_NVF_ERROR) != 0;
+}
+
+static ScrError *nh_dyn_error_of(const ScrDyn *value) {
+  if (!nh_is_error(value)) return NULL;
+  ScrNodeRef *ref = nh_ref_of(value);
+  ScrNodeValue v = {.tag = SCR_NV_HANDLE, .flags = ref->flags, .u.handle = ref->id};
+  return nh_error_of(&v);
+}
+
+/* Reboxing a typed mirror keeps the foreign property owner and identity.
+ * Do not put this pair in errdyn: its strong cache would root the pin. */
+static ScrDyn *nh_error_value(const ScrError *error) {
+  ScrNodeRef *ref = nh_pinned(error, NH_PIN_ERROR);
+  return ref == NULL ? NULL : scr_dyn_new_handle(ref, SCR_DYNH_NODE_ISLAND);
+}
+
+/* Prototype membership is separate from the Error brand: a genuine Error
+ * can lose its prototype, and a plain object can inherit Error.prototype. */
+static bool nh_error_instanceof(const ScrDyn *value, int kind) {
+  static const char *const names[SCR_ERR_COUNT] = {
+      [SCR_ERR_ERROR] = "Error", [SCR_ERR_TYPE] = "TypeError",
+      [SCR_ERR_RANGE] = "RangeError", [SCR_ERR_SYNTAX] = "SyntaxError",
+      [SCR_ERR_REFERENCE] = "ReferenceError", [SCR_ERR_EVAL] = "EvalError",
+      [SCR_ERR_URI] = "URIError", [SCR_ERR_AGGREGATE] = "AggregateError",
+  };
+  if (kind < 0 || kind >= SCR_ERR_COUNT || names[kind] == NULL) return false;
+  ScrStr *name = scr_str_new(names[kind], strlen(names[kind]));
+  bool yes = scr_node_island_instanceof_global((ScrDyn *)value, name);
+  scr_str_release(name);
+  return yes;
 }
 
 /* Leaves a thrown island value pending as a scriptc exception. An Error
@@ -1669,6 +1692,10 @@ static const ScrNiDynOps nh_dyn_ops = {
     .instance_of = scr_ni_instanceof,
     .to_primitive = scr_ni_to_primitive,
     .is_function = scr_ni_is_function,
+    .is_error = nh_is_error,
+    .error_instanceof = nh_error_instanceof,
+    .error_of = nh_dyn_error_of,
+    .error_value = nh_error_value,
 };
 
 __attribute__((constructor)) static void nh_install(void) { scr_ni_dyn_ops = &nh_dyn_ops; }
