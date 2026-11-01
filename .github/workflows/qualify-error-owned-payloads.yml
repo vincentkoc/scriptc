@@ -1,0 +1,479 @@
+name: Qualify Error owned payloads
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-error-owned-payloads.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-error-owned-payloads-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: de76c23436d36ad703fd385a4b8d1fdb98e19efc
+
+jobs:
+  ownership:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    env:
+      SCRIPTC_TEST_WORKERS: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^)" = "8b9f7981e9198831474bbbe2eb47c48407daa380"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - name: Prepare owned proof runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/error-owned-payloads.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { basename, dirname, join, relative } from "node:path";
+          import { fileURLToPath } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self = fileURLToPath(import.meta.url), root = process.cwd();
+          const out = join(process.env.RUNNER_TEMP, "error-owned-payloads-proof");
+          const work = join(process.env.RUNNER_TEMP, "error-owned-payloads-work");
+          const head = process.env.SOURCE_SHA;
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: head, platform: process.platform };
+          const CAP = 16 * 1024 * 1024;
+          const candidate = "de76c23436d36ad703fd385a4b8d1fdb98e19efc";
+          const baseline = "8b9f7981e9198831474bbbe2eb47c48407daa380";
+          const sourcePins = {".oxfmtrc.jsonc":"39e3e80a4b4aaabdac8b12e5a56ebc6f130a99c271d8e0bc1965a68dff0b60fb",".oxlintrc.jsonc":"8b843dbb8fbf3620f77f82c107e5e4834d3b991f4e6b8fdcb2c6d9d078bf5161","CHANGELOG.md":"05ddb5bbc5ab6ce647bafcbb9c11179f4d82b970ca74122789fe833d26b531f9","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/cli-darwin-arm64/package.json":"3ea07e2c43048c6650111a8b0b9d121c0698a97ee2a6001bd70fb2cd6df2f236","packages/cli-darwin-x64/package.json":"9dea6028e370733f40b49c82daaa4e812f8d68d6acceeb6efe87770dc4356b0e","packages/cli-linux-arm64-gnu/package.json":"4cb4f61a0e2f4d84f60045e3233ed3322055cafa3ecd84ea8886abef73108f51","packages/cli-linux-arm64-musl/package.json":"0b6d22292b31d01fa64fadadfc1f89fd11b9201ae4066fecd49058b79eb1c954","packages/cli-linux-x64-gnu/package.json":"02868d45936eb054e7bf55f41617e7ddabc04bae93018ace74282bc11c862913","packages/cli-linux-x64-musl/package.json":"77171bdeca6a3c4a8f2e038485d42303f2a16f5709b6f1a2ffd8944182ad3218","packages/cli-win32-x64-msvc/package.json":"cff68b9e0bc1f869455d8848ec5ab97969019c1471a0878321e075dc697bd3b6","packages/cli/package.json":"2d7017bee223ed95503a3a8f733d17ed88eb6c7b8eb6c054ae32b106ebf69b0f","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/experimental/package.json":"1f9c5354bf9e5841f361a6c94aaafd01bc8059609ace32b21b4e2fa744b035d8","packages/libnode-common/package.json":"1e577ba4e77b9e6006b392e4f5e9950a10d4c6f16a3a0235694027f4b7bceda0","packages/libnode-darwin-arm64/package.json":"da5f882d2fe0559b21d6a16767b4544cb3795e60e3b11a39bee9d2f68b990334","packages/libnode-darwin-x64/package.json":"cf053e0c62891148b09b5e9e1b2c463e045c0fcc58e9a1694166e24808b0b402","packages/libnode-linux-arm64-gnu/package.json":"d2201af62e61ea80623daadf4bd041fc558477d87607d4bf686a462b1a8f1383","packages/libnode-linux-x64-gnu/package.json":"b01c048954b64a235d95d57a2350ff52f74c33c88813b2a6afefbfe024dd910c","packages/llvm-darwin-arm64/package.json":"aa242a8579d99df616078e805e7b7441c94e3867dd8f722ed32929fba4b4e383","packages/llvm-darwin-x64/package.json":"9c02261adb1615190c8cf3d6fc8f7369ef6e54213261f01aa739ad29de5d8cb2","packages/llvm-linux-arm64-gnu/package.json":"c3df0131d133690c6f1392dc36809c617aa9e88ce71789238f62602c4851ba60","packages/llvm-linux-arm64-musl/package.json":"25f0fe4f2900a97ff33254c1008ddb43018bd830640d8ae161c97e2752b4c772","packages/llvm-linux-x64-gnu/package.json":"179560739ae341e62e928208b54eab9086a8b52bcb210b3e291e889fd7a10362","packages/llvm-linux-x64-musl/package.json":"88ffd743282a1cbebc1f3692453ae5ce9a4de2df24f56e95b3f37428aec50a77","packages/llvm-win32-x64-msvc/package.json":"b85543aac07cd4aefef992db3698d3feef2e35294fdd9345f0cbf94c1b5e0352","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/runtime-android-arm64/package.json":"97e552468acc5270072ffc0bf24f020a5f0be81c6cfd787deddb1793511afd14","packages/runtime-darwin-arm64/package.json":"955755aff1488955fb3181895559ed72ed9cc2f1103ef7a3fcbbee9dff94ecd0","packages/runtime-darwin-x64/package.json":"21619bfdfc2f7a3d453318f93f5bf7d03b266dd0529760c9adc0c3f460896a07","packages/runtime-ios-arm64/package.json":"bb84f298416cc09314d54431884f96ca395f8777d3a914f7d526000244605c53","packages/runtime-ios-simulator-arm64/package.json":"286de7b5434ff4de2d42b34fae2a755084f1966fd3f07000ca5d4c356525784b","packages/runtime-linux-arm64-gnu/package.json":"6346a4c0f0be9574df8279e6ef0a9dd8f95ca6836e30a6b1cc582e3d557d803f","packages/runtime-linux-arm64-musl/package.json":"a96f2f9527f5dabb5604d147de34446a4c0e489171a9ac1e7acd502e18041ea6","packages/runtime-linux-x64-gnu/package.json":"ae393bb39954cc7d3dcf87e508e58699dd9d0913f989b313a5a471aa4aed82f0","packages/runtime-linux-x64-musl/package.json":"e024f6c713c2d19ccf05ac78d02111d6532de89012974700e1080841b848ca07","packages/runtime-pack-common/package.json":"bfedbe65b91031c18cfc6dcdb7d68d3fbb5cc55484996c18156da9c63b001e28","packages/runtime-wasm32-wasi/package.json":"ffc40bf5ae75b78cb5335df82723bb2880f950d81e99300e0a9034f419e873d3","packages/runtime-win32-x64-msvc/package.json":"b5a3eb206575c514cec09cee11fc7e4f6e556034fbb6dbd3622ba67f901aa8e7","packages/runtime/package.json":"1679e6104767ed781fd1d8972c7e61a719a88d531091aef88b177e8bb9661b10","packages/runtime/src/scr_alloc.c":"c91710ccf6f749c84386041738c1c9e3c77b3c8787069bdc770e736d177e4a73","packages/runtime/src/scr_arena.c":"ffa068d48aa2f42fdcc93178f564ad2a57419ed9c246abc594f854d68575fea1","packages/runtime/src/scr_arena.h":"7a86a897baa704ebdde50593a7bfaefc79af99babeb65b9d049c8e5dd9f29b91","packages/runtime/src/scr_array.c":"9b0f3372277e8331b6df433a540e2645b2d91eb856d4a84c2d4eca8b276c3ac3","packages/runtime/src/scr_array.h":"0a86942f56d1fc8e2506a36a48a32411387410ef004b046aa22b6e5c6204d2ab","packages/runtime/src/scr_assert.h":"bf6b946a14586aa4b9a7de7522c457cc89368dc5f96852e1c8306ac8e2401e21","packages/runtime/src/scr_async.h":"f0e4e1e93af8746294d39d719d57b7038508ea987a79635f36f7ac44f5d8c321","packages/runtime/src/scr_bigint.c":"a56b1d3c1bc5c19342f11c592c09738aab56bd152cedf44ddbefd1293705bc3f","packages/runtime/src/scr_bigint.h":"dbd0bd16937f39d86a16e1e28c841498f4ee60618eb25f976760c1f3f4d17322","packages/runtime/src/scr_blob.h":"349d93de0fb82d4a823eb928c8f7392dbdaa88e623da3b737a0906116679e34a","packages/runtime/src/scr_bytes.c":"5c49016bef3e37ec3c9ccca98650bf588b2eea69bac9e0fd4f979b55d6325a94","packages/runtime/src/scr_bytes.h":"bbd4eb285e1f481e26baa87b9d0c96e3bd1bf016e964134f721acc4a592fea62","packages/runtime/src/scr_child.h":"a50e8f1cf522f9940e438a04f9236f0ff1264dcb9c0ed1f02c5deab3b73c6255","packages/runtime/src/scr_child_private.h":"0c7d55eef872e069e415f7e295ef254a14db0d5cf291f6641ea60c358fb2f4e1","packages/runtime/src/scr_cipher_info.h":"4155ba0435f4477621da60922c8078483e7394949684e793fef715a86c32158a","packages/runtime/src/scr_cipher_names.h":"968f1fa0c7b5608dac1196fc46b0bfe49a8b619ab13d7a427b8557b5d839e803","packages/runtime/src/scr_closure.c":"8b1cd19529aa758c46d331bf0a01e4114a7a46e0a4ff116b6c7ae1475133a834","packages/runtime/src/scr_closure.h":"707900bb5547d3599e5bf1d3238f7d49e0322bf53f3a9c3254f50f0d5adb8148","packages/runtime/src/scr_collation_data.h":"a967f19d2940de07cebbb19c60789871593d65ceb8ebfd74c09b631caa7813e2","packages/runtime/src/scr_console.c":"2f76b45128cd44f6871b72dc68790f2b23687569fdb00217a49f075a2ccddd90","packages/runtime/src/scr_console.h":"93d3b2ef356b9857f498ebe564c78e3cedc0804a9bf176276707c2c9fca16e6e","packages/runtime/src/scr_core.h":"0c756c48d682025eff7808fee240ccc225e312c075d49a78295b18b4108d40e1","packages/runtime/src/scr_crypto.h":"aa1a1bda423e592ecbd12a3f6882154c78e068c528d434957865f618ca0f6f2b","packages/runtime/src/scr_crypto_args.h":"c772cd002648816c6f71e827db581fa306322894ef1645a29a5e06a197e7cb7b","packages/runtime/src/scr_cycle.c":"99b8293ab6a0de3bb33c2ac46bb6630915967fc3f6e11a3155cb95bd295a8058","packages/runtime/src/scr_dc.h":"8a0f02c8a7085d0b6ee07de19cd6ae3429d703a32de333184232df0994dea13f","packages/runtime/src/scr_dgram.h":"a22f4ec710c5e96c881ca5e898737c63a1898cbff6d65d8b5909b3f564f95ec3","packages/runtime/src/scr_dgram_private.h":"ad5cd4a7a4cd2070edf32e5dda9608b65b1058838fa6b92d62b6427c5559c455","packages/runtime/src/scr_dh_groups.h":"b0c753d3e7179b903264bf7713dc0893aeb5e2bb841d4f832a12935bb1360959","packages/runtime/src/scr_dyn.h":"e85940567d9fa7e7a8ebc781aeab532c4b9d9419b0421d71ea2ecff42aa2d059","packages/runtime/src/scr_dyn_methods.h":"d570d60ac02aa6cb5470e6d2fa06174e6fb897af171d0fc0ec140ca2289a7177","packages/runtime/src/scr_ecdh_names.h":"c054d2410096798686d6bd51b364f83194ba32d07e3d38a03c5a596fd516bdfb","packages/runtime/src/scr_error.c":"217bda2be5bf907120f9c2e432af5ab71040f6e10127ae69139971dd080bf753","packages/runtime/src/scr_error.h":"818184a5db1673ac4ec44d1a6987e2a4d07f87f6e3fecedaaff7c0b0ad6550f1","packages/runtime/src/scr_event_target.h":"7902b7bef57056fe5a1692140771f6a922adf0c608dd4f216464959138a3042f","packages/runtime/src/scr_events.h":"1ca2d51b2e7d0b0022cf6dab61c8beaa1f927997febd5bdf1710c583caba4ca2","packages/runtime/src/scr_events_emitter.h":"f4c63ec2588b1e19284a2b0f3a6e0bc118388a923ea53a11fe93ae7fdffe02cc","packages/runtime/src/scr_exception.c":"fc84356c9286239b6754286a7599534f2209a6625d5c19bcfdff7a63a7cdf884","packages/runtime/src/scr_exception.h":"54b513baa08bc1347e5b5cd61659288d42421ea4ebd7e1f5af6b3a7964097c22","packages/runtime/src/scr_ffi.h":"c6b4745c24b600bbc941a19f587e76cced90a767314e9d5242e0f84f04c6f7bc","packages/runtime/src/scr_file_handle.h":"5d0613a7cc62992b56645f176252dcd441096a970cbd3df217249eb41e523381","packages/runtime/src/scr_fs_cp.h":"a0578364e32a44c8ccb0f0f3103a76917d1fb8ae61168d57e792a945ae8a58f1","packages/runtime/src/scr_generator.h":"4781f0feaaade9faec6703ccc985f8dcb9fec8303b328f621e291f7e82abbe58","packages/runtime/src/scr_generator_private.h":"89f5152f1c327f9a80a6463f15806476dc78fef24bac43d7588f00301e57a0f9","packages/runtime/src/scr_grapheme_data.h":"efc2c2e9e6a6b4280c4660dd28c94dd2b5cabdcbdae8376cd47b6295e4ca95a2","packages/runtime/src/scr_hash.c":"ead08b45d4122af97315272c908400d0d6fd443641dc5f3c3bc538b736ab0256","packages/runtime/src/scr_http.h":"0a7b34a5d4811a47baf8ff2c567d1f33e515fc6e56721f34104c3aa61ce57178","packages/runtime/src/scr_http2.h":"94a436636bc438e4d7729ffb03217e6a0ba18f130aafb94a6a0ccb490ddbe09b","packages/runtime/src/scr_idna_data.h":"20ab6577408d87cec526fd4b573962ed7f5ed67216d7abe2a26874aacfa0ff96","packages/runtime/src/scr_ieee754.h":"242b1eadf72eb9561e92e7ac3ff002bc24b591d58720fc0deeaca3c80c2a9e95","packages/runtime/src/scr_inspect.h":"a078850d794c9ebaad5ceec2ec2a96150d84c4186d5e03986bd54d8dadf3d633","packages/runtime/src/scr_intl.h":"68f0740dda991062e20aa804bfac4b89adebaa436fb66784af1e25d39de50c0d","packages/runtime/src/scr_intl_utf16.h":"4bc0a4c48e847d2868a4092075057aad87fbeb22342442216ece42799a086265","packages/runtime/src/scr_itable.h":"244dd26e44034dc923a5acc36c3f9099df9f844ad127dd69aec4ae735f404db3","packages/runtime/src/scr_js.h":"a6be65091937afe68d9fdd76b17764d8485156528f00d9e12fbb78f3985c3192","packages/runtime/src/scr_json.c":"37ce7f1b0f953ee840427a4b6589a4c50fdffdc232b49972bec35a2e5a792bd3","packages/runtime/src/scr_json.h":"b8b9f6f2f4b39280a50764f2256eb68f19b0d0e5fdc61358f6d0f7da39a11dfd","packages/runtime/src/scr_json.test.c":"c6c81f1b719bd17e3fe2636c6d9cb434016ca7f7191e9a35ca147b01302bedef","packages/runtime/src/scr_json.test.ts":"48dfe224c62fb8bb6fc791c6da5aefb810be83e7637e49dba94957681539a878","packages/runtime/src/scr_key.h":"402273bd1d319b762900ebb9a55aa6f663ce4adaf5a3857dac0964fed684dba0","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_lib.h":"83a688df501afd1115baaeff931c61bcb8973cd505acd8f59bca5a18cadafdbc","packages/runtime/src/scr_mailbox.h":"937ade02ac519f822a76f253c912e7c792613c25d891a0b1f7551496009cdea0","packages/runtime/src/scr_map.c":"3e4a5b78e450391db6d1e5050735c80edbbb4b7ff1440a3dc66b58f287b352e9","packages/runtime/src/scr_map.h":"5c7f8c7669b512c3a9136d8866519fbf0cdc24c72254503a503fc288cc6324f0","packages/runtime/src/scr_message.h":"dfaece614638828a6b96a620116f40109f5ad195f1087684f46d1856526d1d6e","packages/runtime/src/scr_musl_mem.h":"ce95a40b1b4e81f17baae53147efb77596cd1db1eef593b6355c8edb5846051d","packages/runtime/src/scr_net.h":"7fd431a6abbb1ef977addc747d47ae52656c74627369e700dc45de8984f9799d","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","packages/runtime/src/scr_node_island.h":"3583ebbe3b70c36b3488b46603e6833279e269cf927b6592394b2fbd0ab69377","packages/runtime/src/scr_node_island_host.h":"4f453f04467308942ea9d2f182731c3c87a9db4ad48721e39c0fa32bbfa688a4","packages/runtime/src/scr_number.c":"f9e56db54434dfbac7d9dc39881ae564ecdb31fef120b62a7bfd20c49008e7a6","packages/runtime/src/scr_number.h":"3fcdef4c26c815dd91382b5fae2bdc265dfc4c77d5e2f0d32f3e9f2193ec852a","packages/runtime/src/scr_numeric.h":"7ee922b357ad7b9566c74265287f44fe7c214aab5c68c0fe0f023ceef2f35a20","packages/runtime/src/scr_object.c":"fad1ff56eca5fd94db41eb7206147f3cf8cbd7f1bbe3b543beafda4b1c95b038","packages/runtime/src/scr_object.h":"07b0946fc684f74ab7819c33ff2ebb5c6faf5688a6257b708055666558d7d4ee","packages/runtime/src/scr_os.h":"d6fb766559ecd9d5fd2d01d2fe44ec8f2541966d8537cf9f145c36ca27d02518","packages/runtime/src/scr_path.c":"24fc71b2be21c469757976f07088f5e05c27258067a3e18139d4747489d2bf12","packages/runtime/src/scr_path.h":"f5c1f607d145bbaf54edbf13c71fbd17448753e6c64c2b9152841f90371a2085","packages/runtime/src/scr_pki.h":"c2c1b3706e2603dd726a6ff275913e855ddca1610b4f7f8a3a3f72986050b381","packages/runtime/src/scr_platform.h":"47a7cf7fe97d6e5e58f11d8c2d0acd1053c8e99a402715ea75303bab5eb8c210","packages/runtime/src/scr_qs.h":"4f218bcfeed39cce30815d3c9d24887b116d37b6bac74ffdec16bc82fd63369f","packages/runtime/src/scr_rc.h":"98e76b1ee53b494fb633ead04a8b781538cb2f9dca0b70c6e010addcdb786917","packages/runtime/src/scr_readline.h":"c908b236cdd76460d571fdf70fde377f7c1ba41413fe1657ea3a391785752985","packages/runtime/src/scr_readline_internal.h":"e1b4391e73c288af190382eb4629c693ad2f06439942bb43ad532abdb83649fc","packages/runtime/src/scr_readline_width_data.h":"ba46958bd38d29ceac6cb41e1d61b3ce43d6b64b4ddc99137d9001d85776b3ec","packages/runtime/src/scr_regex.h":"3deb5f58aab84c525e6f6016d680d08eaac3f3f77483fa26894427ba9dd46746","packages/runtime/src/scr_regex_native.h":"a70182b0c3b968a7ff51c9b47818a5f91485367ab0b2b87922c6ed6d1bd0c655","packages/runtime/src/scr_region.h":"2a244c1e70df9fbd2b129317d9804455d5527fe848a01bdf757fb04220447285","packages/runtime/src/scr_runtime.h":"6a69244404c3edc8907891187b8e653dc0bfde6712f42195b592b9fec051f093","packages/runtime/src/scr_shared.c":"f55b5ed8e6a428e88d2285f5e8295a7b94b176e3c735d1f3aa63c42edbe2847a","packages/runtime/src/scr_slots.h":"8c50f797bbbfb7e80d6c175753fe0637eb875494f394d32938f8846616540552","packages/runtime/src/scr_stats_private.h":"a762f09b570a7c72b9fe0c6bed29a80067ff4943a93d0b91dfa6b98baf18e503","packages/runtime/src/scr_stream.h":"e898db67d802d1a71b1ca0572e181171f9bcd3a6c3c6ff7d733c622bdf15b582","packages/runtime/src/scr_string.c":"5607d782ef556f5d3f462c825d947ab132a37a6a1d701f5992ac54f7b03d7db4","packages/runtime/src/scr_string.h":"e6645e36b33f7ffe026401774cb067773b75b3f6216afea807c7893f483d3f93","packages/runtime/src/scr_string_methods.h":"0a001523740feed3bd88ef3c441441cba6c65cd043daf494cca45fcbfeeb9a40","packages/runtime/src/scr_symbol.h":"f06133906b56e245532a3a5e63d179b05dd7a8b75db7428c3ce01013cba3e9d1","packages/runtime/src/scr_system_errors.h":"28898a022147247d2f7aef4125ea1a9e256509e321b7a2669b6615fe78c834f6","packages/runtime/src/scr_test.h":"79c364a0fa555aedf263ea1869df62637a7dd770e49dea1f147b19100bfdc9c4","packages/runtime/src/scr_text_decoder_data.h":"a78728757a084208e2bab54adc2d079395d366ad9fff0a0b26afdd4ea286705e","packages/runtime/src/scr_text_decoder_labels.h":"37e17f2ff528e397184c2a0e46fb4179eb6443982edfb90dcf47818ec9c2cd59","packages/runtime/src/scr_timezone_data.h":"93b99b205775b4d8f436334c3d920cd25e111e2047156bf7c8daab9b7208a75a","packages/runtime/src/scr_tls.h":"dadb815830be1ad3bda59d65c4bd2e5ba137e07b5c44a5e9e42b8d8f0d787f43","packages/runtime/src/scr_union.c":"9e771717e9ecc292f1194f40b2436e8b674fa4e0b9672472fff8f4b1f9ce8622","packages/runtime/src/scr_union.h":"e0d56b436d51055c4a7dd79b65313f1978eaa8f940bdcacc26c37dd9e43d5969","packages/runtime/src/scr_url.c":"afe4d4b0c9892db84914ac1065724a22ef831e5934fbead94d7ddaddd4c2cad6","packages/runtime/src/scr_url.h":"929be33cff757673b4860b8763197bdc385351c32d1f5cfa86135e27190dc73c","packages/runtime/src/scr_url_internal.h":"9a661bf1ea1d925adee10acb0ccb252cf0db08878b343df8490f70c644f62c6d","packages/runtime/src/scr_url_params.c":"be7c27103b662c0543d4b45d978f0743dc22f3508a2fef78104eff342b9dcb72","packages/runtime/src/scr_wasm.h":"33214de4bdabd8b76367a958d9b3e325e4e2511293e109e399b3a9bdce506de4","packages/runtime/src/scr_wasm_abi.h":"ab29bd89438389e0a3fab281e172148b89a77c89ccae9331c96b09aaf707fed9","packages/runtime/src/scr_watch.h":"427c2bde7e7a7b243c90a20ae32eec48facd83dd362e2afbd35329fcfcdb4aa1","packages/runtime/src/scr_webcrypto.h":"54c5b43ea40b204e18290e3191183717939460c42ae2faa501a26da509473af2","packages/runtime/src/scr_win_stats.h":"ac7b7497c733ad791c0ce8183edaf815b2ae0db67d39b33f56a83a7bbe0d57f9","packages/runtime/src/scr_worker.h":"a9023811975d008280943318e31f7fb091c58cd379ad26dc601dbc250c615523","packages/runtime/src/scr_zlib.h":"5c6682e0b73c6a1a6cede56b24a75950629a80bb469b06b78c81950f1960b130","packages/threads/package.json":"6e8700d46f14ba241f3a1e2745c138b6c4af1403b4a74f014d7e748bb20d9c9f","packages/types/package.json":"f45cbcea64e6bc76404b12d9f267cccc03be0277a0f196ccc4546db386e3173f","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32"};
+          const treeSha256 = "20f182d3d9b0b778a412518237ee00ad20f6d2aafe94f1154568e772c0794efe";
+          const baselinePins = {"packages/runtime/src/scr_error.c":"c907869d9459963944094f4eaf4f26b0a0400d49f8c64ad2c8394be7c0d2754b","packages/runtime/src/scr_error.h":"83542de9be2c9bb6f374e2345ba90bde79720d8f4c3d7079dac1eb875263b326","packages/runtime/src/scr_exception.c":"84ece59a9e29977a649315ade1f341c064b3d07b61efe04eb3668c4eec33c306","packages/runtime/src/scr_exception.h":"c4401975ef31f5ae5ba4ede0ca56be3e26feaa7c78b904aa31d04c9290dd5746","packages/runtime/src/scr_json.c":"942e69592e8c56d962e07c49dd0202089a31c0cb3c22bd859c8375ee9b9e235f"};
+          const compileFiles = ["scr_json.test.c","scr_json.c","scr_string.c","scr_array.c","scr_arena.c","scr_map.c","scr_exception.c","scr_error.c","scr_number.c","scr_console.c","scr_closure.c","scr_object.c","scr_union.c","scr_cycle.c","scr_alloc.c","scr_lib.c","scr_hash.c","scr_bytes.c","scr_shared.c","scr_bigint.c","scr_url.c","scr_url_params.c","scr_path.c"];
+          const mutations = [{"id":"base-cause-trace","failure":"uncollected-owned-cycle","edits":[{"path":"packages/runtime/src/scr_error.c","before":"  visit(((ScrError *)e)->error_cause, ctx);\n","after":"  (void)e; (void)visit; (void)ctx;\n","sha256":"643a5fab79447602cdf4e9c67eca3940d081ce312537df86b6abd16f8a576982"}]},{"id":"dom-cause-trace","failure":"uncollected-owned-cycle","edits":[{"path":"packages/runtime/src/scr_error.c","before":"  visit(((ScrDomException *)obj)->cause, ctx);\n","after":"","sha256":"96b56f44339f11ca17e1f4ab537e0dd83d083d7f45558150a5a4b62a1ba82711"}]},{"id":"aggregate-errors-trace","failure":"uncollected-owned-cycle","edits":[{"path":"packages/runtime/src/scr_error.c","before":"  visit(((ScrAggregateError *)obj)->errors, ctx);\n","after":"","sha256":"f617d7b14688495f6399d52372ed3aa07dceb064811fa06d14db5ce6c1edd273"}]},{"id":"suppressed-second-trace","failure":"uncollected-owned-cycle","edits":[{"path":"packages/runtime/src/scr_exception.c","before":"    visit((void *)suppressed, ctx);\n","after":"","sha256":"553da3681ecd5aa0cc0007f479f710176c62a9e3ce5a167f0780be7688ac452d"}]},{"id":"suppressed-collected-release","failure":"suppressed-double-release","edits":[{"path":"packages/runtime/src/scr_error.c","before":"  scr_exc_suppressed_unlink(obj);\n","after":"  scr_exc_suppressed_forget(obj);\n","sha256":"383db61ef631a2e7ef5dc8ab2e5a54e6b8ea3060603ac6afb2d099e25ae2f92b"}]},{"id":"cause-publish-order","failure":"stale-owned-slot","edits":[{"path":"packages/runtime/src/scr_json.c","before":"void scr_error_set_cause(ScrError *e, ScrDyn *value) {\n  size_t hit = scr_errdyn_find(e, true);\n  if (hit != SIZE_MAX) {\n    ScrStr *key = scr_str_new(\"cause\", 5);\n    scr_dyn_key_set(scr_errdyn_cache[hit].dyn, key, value);\n    scr_str_release(key);\n    return;\n  }\n  scr_error_install_cause_drop(&scr_error_cause_drop_impl);\n  ScrDyn *replacement = scr_dyn_retain(value);\n  if (!e->error_cause) e->cause_enumerable = true;\n  ScrDyn *previous = e->error_cause;\n  e->error_cause = replacement;\n  scr_dyn_release(previous);\n}\n","after":"void scr_error_set_cause(ScrError *e, ScrDyn *value) {\n  size_t hit = scr_errdyn_find(e, true);\n  if (hit != SIZE_MAX) {\n    ScrStr *key = scr_str_new(\"cause\", 5);\n    scr_dyn_key_set(scr_errdyn_cache[hit].dyn, key, value);\n    scr_str_release(key);\n    return;\n  }\n  scr_error_install_cause_drop(&scr_error_cause_drop_impl);\n  ScrDyn *replacement = scr_dyn_retain(value);\n  if (!e->error_cause) e->cause_enumerable = true;\n  ScrDyn *previous = e->error_cause;\n  scr_dyn_release(previous);\n  e->error_cause = replacement;\n}\n","sha256":"709f0f897feee09f9a2d5945d56a4813c4c18782abc4bc35453ab01f133529a0"}]},{"id":"aggregate-publish-order","failure":"stale-owned-slot","edits":[{"path":"packages/runtime/src/scr_json.c","before":"void scr_aggregate_set_errors(ScrError *e, ScrDyn *errors) {\n  ScrAggregateError *a = (ScrAggregateError *)e;\n  scr_aggregate_install_errors_drop(&scr_aggregate_errors_drop_impl);\n  ScrDyn *replacement = scr_dyn_retain(errors);\n  ScrDyn *previous = a->errors;\n  a->errors = replacement;\n  scr_dyn_release(previous);\n}\n","after":"void scr_aggregate_set_errors(ScrError *e, ScrDyn *errors) {\n  ScrAggregateError *a = (ScrAggregateError *)e;\n  scr_aggregate_install_errors_drop(&scr_aggregate_errors_drop_impl);\n  ScrDyn *replacement = scr_dyn_retain(errors);\n  ScrDyn *previous = a->errors;\n  scr_dyn_release(previous);\n  a->errors = replacement;\n}\n","sha256":"7af5ee166b124c32a099dc02e1ac4b8486b1c0078b97d3a072d3e5eed9246006"}]}];
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          const capture = (command, args = []) => {
+            const value = spawnSync(command, args, { cwd: root, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.error, undefined, command + " launcher failed"); assert.equal(value.status, 0, command + ": " + value.stderr);
+            return value.stdout.trim();
+          };
+          function verifyWorkOwner() {
+            const info = lstatSync(work); assert.ok(info.isDirectory() && !info.isSymbolicLink()); assert.equal(info.mode & 0o777, 0o700);
+            assert.deepEqual(json(join(work, "owner.json")), owner);
+          }
+          function source(expected = sourcePins, changed = []) {
+            assert.equal(head, candidate); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("git", ["rev-parse", "HEAD^"]), baseline);
+            assert.equal(capture("git", ["diff", "--cached", "--name-only"]), "", "index changed");
+            assert.equal(digest(capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"])), treeSha256);
+            const dirty = capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]);
+            const rows = dirty ? dirty.split("\n").map(row => {
+              // capture trims the first leading status space.
+              assert.ok(row.startsWith(" M ") || row.startsWith("M "), "unexpected source/index state");
+              return row.replace(/^ ?M /, "");
+            }).sort() : [];
+            assert.deepEqual(rows, [...changed].sort());
+            const actual = Object.fromEntries(Object.keys(sourcePins).map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(actual, expected);
+            return { head, parent: baseline, treeSha256, files: actual, changed: rows };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a,b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink()); if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile()); return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function tool(command, args = ["--version"]) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            return { path, sha256: hash(path), version: capture(path, args) };
+          }
+          function toolInputs() {
+            const clang = tool("clang"), resource = capture(clang.path, ["-print-resource-dir"]);
+            assert.equal(process.version, "v24.22.1");
+            const pnpm = tool("pnpm"); assert.equal(pnpm.version, "11.1.3");
+            return { node: tool(process.execPath), pnpm, clang, linker: tool("ld"), symbolizer: tool(join(dirname(clang.path), "llvm-symbolizer")),
+              clangResourceDirectory: resource, clangResourceFiles: files(resource),
+              imageOS: process.env.ImageOS ?? null, imageVersion: process.env.ImageVersion ?? null };
+          }
+          function readOutput(step, stream) { return readFileSync(join(out, step[stream].path), "utf8"); }
+          function scrub(value) { return String(value).split(root).join("<source>").split(work).join("<work>").split(out).join("<proof>"); }
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+
+          function terminal(value) {
+            assert.equal(value.status, "exited");
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true);
+            assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+            for (const stream of ["stdout", "stderr"]) {
+              const row = value[stream], path = join(out, row.path);
+              assert.equal(row.complete, true); assert.equal(row.bytes, row.observedBytes); assert.equal(row.sha256, row.observedSha256);
+              assert.equal(hash(path), row.sha256); assert.equal(statSync(path).size, row.bytes);
+            }
+            assert.ok(value.signal === null || value.signal === "SIGABRT", "unexpected native termination");
+            assert.ok(![124,125,126,127,129,130,137,143].includes(value.code), "launcher/timeout exit");
+          }
+          function negativeSignature(value, kind) {
+            terminal(value);
+            const stderr = readOutput(value, "stderr"), stdout = readOutput(value, "stdout");
+            if (stdout !== "") return false;
+            if (kind === "uncollected-owned-cycle" || kind === "stale-owned-slot") {
+              if (value.signal !== "SIGABRT" || value.code !== null) return false;
+              const fn = kind === "uncollected-owned-cycle" ? "error_heap_restored" : "error_witness_release";
+              const assertion = kind === "uncollected-owned-cycle" ? "scr_cyc_live == before" : "*witness->slot == witness->expected";
+              const lines = stderr.trimEnd().split("\n");
+              return lines.length === 1 && lines[0].includes("scr_json.test.c:") && (lines[0].includes(fn + ":") || lines[0].includes("void " + fn + "(")) &&
+                lines[0].includes("Assertion") && lines[0].includes(assertion) && lines[0].endsWith("failed.");
+            }
+            assert.equal(kind, "suppressed-double-release");
+            return value.code === 1 && value.signal === null &&
+              /ERROR: AddressSanitizer: heap-use-after-free/.test(stderr) &&
+              /#0[^\n]*\b(?:scr_caught_release|scr_exc_suppressed_forget)\b/.test(stderr) &&
+              /#\d+[^\n]*\bscr_suppressed_gcfree\b/.test(stderr) &&
+              /SUMMARY: AddressSanitizer: heap-use-after-free/.test(stderr) && /ABORTING\n$/.test(stderr);
+          }
+          function compileArgs(binary, audit) {
+            const src = join(root, "packages/runtime/src");
+            return ["-std=c11", "-O1", "-Wall", "-Wextra", "-fsanitize=address,undefined",
+              ...(audit ? ["-DSCR_RC_AUDIT"] : []), "-I", src, "-o", binary,
+              ...compileFiles.map(file => join(src, file)), "-D_GNU_SOURCE", "-lm"];
+          }
+          function variantChanges(variant) {
+            if (variant.id === "baseline") return Object.fromEntries(Object.entries(baselinePins).map(([path, expected]) => {
+              const result = spawnSync("git", ["show", baseline + ":" + path], { cwd: root, maxBuffer: CAP, timeout: 30000 });
+              assert.equal(result.error, undefined); assert.equal(result.status, 0); assert.equal(digest(result.stdout), expected);
+              return [path, result.stdout];
+            }));
+            return Object.fromEntries(variant.edits.map(edit => {
+              const original = readFileSync(join(root, edit.path), "utf8");
+              assert.equal(original.split(edit.before).length - 1, 1, "mutation anchor is not unique");
+              const changed = Buffer.from(original.replace(edit.before, () => edit.after));
+              assert.equal(digest(changed), edit.sha256); return [edit.path, changed];
+            }));
+          }
+          function restoreActive(report) {
+            const receiptPath = join(work, "active-mutation.json");
+            if (!existsSync(receiptPath)) return;
+            assert.ok(allDrained(), "restoration refused while owned child custody is unresolved");
+            const receipt = json(receiptPath);
+            for (const row of receipt.files) {
+              const current = hash(join(root, row.path));
+              assert.ok(current === row.candidate || current === row.mutant, "unknown intermediate source bytes");
+              const original = readFileSync(join(work, "originals", basename(row.path)));
+              assert.equal(digest(original), row.candidate);
+            }
+            for (const row of receipt.files) copyFileSync(join(work, "originals", basename(row.path)), join(root, row.path));
+            const after = source(); assert.deepEqual(after, report.sourceBefore);
+            report.restorations.push({ variant: receipt.id, source: after, drained: true });
+            rmSync(receiptPath); save("summary.json", report);
+          }
+          function verifyVitest(data) {
+            const assertions = data.testResults.flatMap(suite => suite.assertionResults);
+            assert.equal(data.success, true); assert.equal(data.numTotalTests, 2);
+            assert.equal(data.numPassedTests, 2); assert.equal(data.numFailedTests, 0);
+            assert.equal(data.numPendingTests, 0); assert.equal(data.numTodoTests ?? 0, 0);
+            assert.equal(assertions.length, 2);
+            assert.deepEqual(assertions.map(row => row.fullName).sort(), [false,true].map(audit =>
+              "checked storage, Error payloads and weak metadata preserve ownership (audit=" + audit + ")").sort());
+            for (const row of assertions) { assert.equal(row.status, "passed"); assert.deepEqual(row.failureMessages, []); }
+            return { rows: assertions.map(row => ({ name: row.fullName, status: row.status })), expectedCExecutions: 12,
+              evidence: "Exact pinned wrapper completes original and Error modes for both audit builds at thresholds 1, 7 and 256. Inner subprocess streams are checked by the wrapper, not separately exported." };
+          }
+          async function main() {
+            verifyWorkOwner(); const report = json(join(out, "summary.json"));
+            let active = false;
+            const env = { TMPDIR: join(work, "tmp"), SCRIPTC_CACHE_DIR: join(work, "cache"), SCRIPTC_TEST_WORKERS: "1" };
+            try {
+              assert.deepEqual(source(), report.sourceBefore);
+              report.install = await run("install", "pnpm", ["install", "--frozen-lockfile"], 300, env); requireSuccess(report.install);
+              report.toolsBefore = toolInputs();
+              for (const [id, args] of [
+                ["format", ["exec", "oxfmt", "--check", "packages/runtime/src/scr_json.test.ts"]],
+                ["lint", ["exec", "oxlint", "--deny-warnings", "packages/runtime/src/scr_json.test.ts"]]
+              ]) { report[id] = await run(id, "pnpm", args, 120, env); requireSuccess(report[id]); save("summary.json", report); }
+              assert.deepEqual(source(), report.sourceBefore);
+              const vitestPath = join(out, "candidate.vitest.json");
+              report.candidateRun = await run("candidate", "pnpm", ["test", "packages/runtime/src/scr_json.test.ts",
+                "--reporter=verbose", "--reporter=json", "--outputFile=" + vitestPath], 660, env);
+              save("summary.json", report); requireSuccess(report.candidateRun);
+              report.candidateInventory = verifyVitest(json(vitestPath)); report.candidateJson = record(vitestPath);
+              assert.deepEqual(source(), report.sourceBefore);
+              const variants = [{ id: "baseline", failure: "uncollected-owned-cycle" }, ...mutations];
+              for (const variant of variants) {
+                const row = { id: variant.id, expectedFailure: variant.failure, builds: [], observations: [], restored: false };
+                report.variants.push(row); save("summary.json", report);
+                const changes = variantChanges(variant), changedPaths = Object.keys(changes).sort();
+                const expected = { ...sourcePins, ...Object.fromEntries(changedPaths.map(path => [path, digest(changes[path])])) };
+                const receipt = { id: variant.id, files: changedPaths.map(path => ({ path, candidate: sourcePins[path], mutant: expected[path] })) };
+                writeFileSync(join(work, "active-mutation.json"), JSON.stringify(receipt), { flag: "wx" });
+                active = true;
+                try {
+                  for (const path of changedPaths) writeFileSync(join(root, path), changes[path]);
+                  row.sourceMutated = source(expected, changedPaths);
+                  save(variant.id + ".mutation.json", { ...receipt, edits: variant.edits ?? null, baseline: variant.id === "baseline" ? baseline : null });
+                  for (const audit of [false, true]) {
+                    const label = variant.id + "-audit-" + audit, binary = join(work, label);
+                    const args = compileArgs(binary, audit);
+                    const build = { audit, command: "clang", args, result: await run(label + "-build", "clang", args, 300, env) };
+                    row.builds.push(build); save("summary.json", report); requireSuccess(build.result);
+                    build.binary = { bytes: statSync(binary).size, sha256: hash(binary) };
+                    assert.deepEqual(source(expected, changedPaths), row.sourceMutated);
+                    for (const threshold of ["1", "7", "256"]) {
+                      const result = await run(label + "-threshold-" + threshold, binary, ["error-owned-payloads"], 30, {
+                        ...env, SCR_CYCLE_THRESHOLD: threshold, ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1",
+                        UBSAN_OPTIONS: "halt_on_error=1", ASAN_SYMBOLIZER_PATH: report.toolsBefore.symbolizer.path
+                      });
+                      const observation = { audit, threshold, binarySha256: hash(binary), result, accepted: false };
+                      row.observations.push(observation); save("summary.json", report);
+                      terminal(result); assert.equal(observation.binarySha256, build.binary.sha256);
+                      observation.accepted = negativeSignature(result, variant.failure);
+                      assert.deepEqual(source(expected, changedPaths), row.sourceMutated);
+                      save("summary.json", report);
+                    }
+                    rmSync(binary);
+                  }
+                } finally {
+                  restoreActive(report); active = false; row.restored = true; save("summary.json", report);
+                }
+              }
+              report.toolsAfter = toolInputs(); assert.deepEqual(report.toolsAfter, report.toolsBefore);
+              report.sourceAfter = source(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
+              assert.equal(report.variants.length, 8);
+              const observations = report.variants.flatMap(row => row.observations);
+              assert.equal(observations.length, 48);
+              for (const row of report.variants) {
+                assert.equal(row.builds.length, 2); assert.equal(row.restored, true);
+                assert.deepEqual(row.observations.map(x => [x.audit, x.threshold]), [false,true].flatMap(audit => ["1","7","256"].map(threshold => [audit,threshold])));
+              }
+              report.negativeAccepted = observations.filter(row => row.accepted).length;
+              report.preCleanupComplete = true;
+              report.scopedProofPassed = report.negativeAccepted === 48;
+            } catch (error) {
+              report.failure = scrub(error.stack ?? error);
+              process.stderr.write(report.failure + "\n");
+            } finally {
+              if (active) {
+                try { restoreActive(report); }
+                catch (error) { report.restorationFailure = scrub(error.stack ?? error); }
+              }
+              save("summary.json", report);
+            }
+            assert.equal(report.preCleanupComplete, true, "proof preparation/execution incomplete");
+            assert.equal(report.scopedProofPassed, true, "required mutation failure was not reproduced");
+          }
+          function initialize() {
+            assert.equal(head, candidate); assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
+            mkdirSync(work, { mode: 0o700 }); writeFileSync(join(work, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+            mkdirSync(out, { mode: 0o700 }); copyFileSync(self, join(out, "runner.mjs"));
+            for (const name of ["tmp", "cache", "originals"]) mkdirSync(join(work, name), { mode: 0o700 });
+            for (const path of Object.keys(baselinePins)) copyFileSync(join(root, path), join(work, "originals", basename(path)));
+            copyFileSync(join(root, "packages/runtime/src/scr_json.test.c"), join(out, "scr_json.test.c"));
+            copyFileSync(join(root, "packages/runtime/src/scr_json.test.ts"), join(out, "scr_json.test.ts"));
+            save("summary.json", { schemaVersion: 1, ...owner, runnerSha256: hash(self), sourceBefore: source(),
+              baseline, baselinePins, compileFiles, mutations, variants: [], restorations: [],
+              scope: { candidateVitestRows: 2, candidateCExecutions: 12, negativeVariants: 8, negativeBuilds: 16, negativeExecutions: 48,
+                audits: [false,true], thresholds: ["1","7","256"], sanitizers: ["address","undefined"] },
+              limitations: ["C-only prerequisite proof; no bridge, ABI, Error identity-cache reclamation, generated-subclass or Node-island qualification.",
+                "Traced allocation is selected before Error allocation in a fresh process. This does not qualify switching modes for existing allocations.",
+                "Candidate positive inner streams are asserted by the unchanged wrapper; negative subprocess streams are retained individually.",
+                "Clang is the hosted image compiler, identified by version/hash and resource inventory; no prebuilt runtime objects are reused."],
+              preCleanupComplete: false, diagnosticComplete: false, scopedProofPassed: false, qualificationComplete: false, runtimeAcceptance: false });
+          }
+          function finalize() {
+            const report = json(join(out, "summary.json")), cleanup = { passed: false, retained: true };
+            try {
+              verifyWorkOwner(); assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k => [k, report[k]])), owner);
+              assert.ok(allDrained(), "owned process custody unresolved");
+              restoreActive(report);
+              assert.equal(hash(self), report.runnerSha256);
+              cleanup.source = source(); assert.deepEqual(cleanup.source, report.sourceBefore);
+              if (report.toolsBefore) { cleanup.tools = toolInputs(); assert.deepEqual(cleanup.tools, report.toolsBefore); }
+              rmSync(work, { recursive: true }); cleanup.passed = true; cleanup.retained = false;
+              rmSync(self); cleanup.payloadRemoved = true;
+            } catch (error) { cleanup.error = scrub(error.stack ?? error); }
+            report.cleanup = cleanup;
+            report.diagnosticComplete = report.preCleanupComplete === true && cleanup.passed;
+            report.scopedProofPassed = report.scopedProofPassed === true && report.diagnosticComplete;
+            report.qualificationComplete = false; report.runtimeAcceptance = false;
+            save("summary.json", report); save("artifact-manifest.json", files(out).filter(row => row.path !== "artifact-manifest.json"));
+            assert.equal(report.diagnosticComplete, true, "proof incomplete");
+            assert.equal(report.scopedProofPassed, true, "owned-payload mutation proof failed");
+          }
+          if (process.argv[2] !== "--probe") {
+            try {
+              if (process.argv[2] === "--init") initialize();
+              else if (process.argv[2] === "--finalize") finalize();
+              else if (process.argv[2] === "--child") await childMain();
+              else await main();
+            } catch (error) {
+              process.stderr.write(scrub(error.stack ?? error) + "\n[error-owned-payloads] FAILED (exit 1)\n"); process.exitCode = 1;
+            }
+          }
+          RUNNER
+          node "$RUNNER_TEMP/error-owned-payloads.mjs" --init
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Run candidate, baseline and scoped mutations
+        run: |
+          ulimit -c 0
+          node "$RUNNER_TEMP/error-owned-payloads.mjs"
+      - name: Verify restoration and remove owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/error-owned-payloads.mjs"
+          node "$RUNNER_TEMP/error-owned-payloads.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: error-owned-payloads
+          path: ${{ runner.temp }}/error-owned-payloads-proof
+          if-no-files-found: error
+          retention-days: 1
