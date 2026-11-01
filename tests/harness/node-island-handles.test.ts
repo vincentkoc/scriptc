@@ -372,8 +372,8 @@ async function foreignErrorParity(entry: string, binary: string, expected: strin
     encoding: "utf8",
     timeout: 30_000,
   });
-  expect(native.stdout).toBe(node.stdout);
   expect(native.stderr.replace(contextSwitchWarning, "")).toBe(node.stderr);
+  expect(native.stdout, "native stdout").toBe(node.stdout);
 }
 
 describe.skipIf(skip)("foreign Error identity", () => {
