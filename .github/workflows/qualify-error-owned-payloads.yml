@@ -272,6 +272,73 @@ jobs:
             return new RegExp("^[^\\n]+: [^\\n]*scr_json\\.test\\.c:\\d+: " + owner +
               ": Assertion ['\x60]" + escape(expression) + "' failed\\.$").test(line);
           }
+          // Releasing traced snapshots can requeue a white object before settle frees it.
+          // Bind the next pass's header-color UAF to this exact mutation and complete logs.
+          function suppressedCollectedSignature(value, variant, audit, threshold) {
+            terminal(value);
+            if (variant.id !== "suppressed-collected-release" ||
+                variant.failure !== "suppressed-double-release" ||
+                typeof audit !== "boolean" || !["1", "7", "256"].includes(threshold)) return false;
+            if (JSON.stringify(variant.edits) !== JSON.stringify([{
+              path: "packages/runtime/src/scr_error.c",
+              before: "  scr_exc_suppressed_unlink(obj);\n",
+              after: "  scr_exc_suppressed_forget(obj);\n",
+              sha256: "383db61ef631a2e7ef5dc8ab2e5a54e6b8ea3060603ac6afb2d099e25ae2f92b"
+            }])) return false;
+            const stderr = readOutput(value, "stderr");
+            if (value.code !== 1 || value.signal !== null || readOutput(value, "stdout") !== "") return false;
+            const sections = stderr.split("\n\n");
+            if (sections.length !== 4) return false;
+            const first = sections[0].split("\n");
+            if (first.length !== 9 || first[0] !== "=".repeat(65)) return false;
+            const header = /^==([1-9]\d*)==ERROR: AddressSanitizer: heap-use-after-free on address (0x[0-9a-f]+) at pc 0x[0-9a-f]+ bp 0x[0-9a-f]+ sp 0x[0-9a-f]+$/.exec(first[1]);
+            const read = /^READ of size 1 at (0x[0-9a-f]+) thread T0$/.exec(first[2]);
+            if (!header || !read || header[2] !== read[1]) return false;
+            const address = BigInt(read[1]), label = "suppressed-collected-release-audit-" + audit;
+            const prefix = label + "-threshold-" + threshold;
+            if (value.stdout.path !== prefix + ".stdout.log" || value.stderr.path !== prefix + ".stderr.log") return false;
+            const frame = (line, n, name, file) => new RegExp("^    #" + n + " 0x[0-9a-f]+ in " + name + " " + file + "$").test(line);
+            if (!frame(first[3], 0, "scr_cyc_pass", "scr_cycle\\.c")) return false;
+            const executableFrame = (line, n, name) => {
+              const m = new RegExp("^    #" + n + " 0x[0-9a-f]+ in " + name +
+                " \\(([^()\\n]+)\\+0x[0-9a-f]+\\) \\(BuildId: ([0-9a-f]+)\\)$").exec(line);
+              return m && m[1].endsWith("/" + label) ? { path: m[1], buildId: m[2] } : null;
+            };
+            const collect = executableFrame(first[4], 1, "scr_collect_cycles");
+            const main = executableFrame(first[5], 2, "main");
+            const start = executableFrame(first[8], 5, "_start");
+            if (!collect || !main || !start ||
+                JSON.stringify(main) !== JSON.stringify(collect) ||
+                JSON.stringify(start) !== JSON.stringify(collect) ||
+                !/^    #3 0x[0-9a-f]+  \([^()\n]+\/libc\.so\.6\+0x[0-9a-f]+\) \(BuildId: [0-9a-f]+\)$/.test(first[6]) ||
+                !/^    #4 0x[0-9a-f]+ in __libc_start_main \([^()\n]+\/libc\.so\.6\+0x[0-9a-f]+\) \(BuildId: [0-9a-f]+\)$/.test(first[7])) return false;
+            const freed = sections[1].split("\n"), allocated = sections[2].split("\n");
+            if (freed.length !== 4 || allocated.length !== 3) return false;
+            const geometry = /^(0x[0-9a-f]+) is located 2 bytes inside of 72-byte region \[(0x[0-9a-f]+),(0x[0-9a-f]+)\)$/.exec(freed[0]);
+            if (!geometry || BigInt(geometry[1]) !== address ||
+                BigInt(geometry[2]) + 2n !== address ||
+                BigInt(geometry[3]) - BigInt(geometry[2]) !== 72n ||
+                freed[1] !== "freed by thread T0 here:" ||
+                !frame(freed[3], 1, "scr_cyc_settle", "scr_cycle\\.c") ||
+                allocated[0] !== "previously allocated by thread T0 here:") return false;
+            const release = executableFrame(freed[2], 0, "free");
+            const calloc = executableFrame(allocated[1], 0, "calloc");
+            const alloc = executableFrame(allocated[2], 1, "scr_cyc_alloc");
+            if ([release, calloc, alloc].some(row => !row || JSON.stringify(row) !== JSON.stringify(collect))) return false;
+            const tail = sections[3].split("\n");
+            if (tail[0] !== "SUMMARY: AddressSanitizer: heap-use-after-free scr_cycle.c in scr_cyc_pass" ||
+                tail[1] !== "Shadow bytes around the buggy address:" ||
+                tail.at(-2) !== "==" + header[1] + "==ABORTING" || tail.at(-1) !== "" ||
+                stderr.split("ERROR: AddressSanitizer:").length !== 2 ||
+                stderr.split("SUMMARY: AddressSanitizer:").length !== 2 ||
+                stderr.split("ABORTING").length !== 2) return false;
+            const legend = tail.indexOf("Shadow byte legend (one shadow byte represents 8 application bytes):");
+            if (legend !== 13 || !tail.slice(2, 13).every(line =>
+                /^(?:  |=>)0x[0-9a-f]+: [0-9a-f \[\]]+$/.test(line))) return false;
+            const marked = tail.slice(2, 13).filter(line => line.startsWith("=>"));
+            if (marked.length !== 1 || !marked[0].includes("[fd]")) return false;
+            return true;
+          }
           function negativeSignature(value, variant, audit, threshold) {
             terminal(value);
             const kind = variant.failure, stderr = readOutput(value, "stderr"), stdout = readOutput(value, "stdout");
@@ -299,12 +366,7 @@ jobs:
               return lines.length === 1 && assertionLine(lines[0], "error_witness_release", "void *",
                 "*witness->slot == witness->expected");
             }
-            assert.equal(kind, "suppressed-double-release");
-            return value.code === 1 && value.signal === null &&
-              /ERROR: AddressSanitizer: heap-use-after-free/.test(stderr) &&
-              /#0[^\n]*\b(?:scr_caught_release|scr_exc_suppressed_forget)\b/.test(stderr) &&
-              /#\d+[^\n]*\bscr_suppressed_gcfree\b/.test(stderr) &&
-              /SUMMARY: AddressSanitizer: heap-use-after-free/.test(stderr) && /ABORTING\n$/.test(stderr);
+            return suppressedCollectedSignature(value, variant, audit, threshold);
           }
           function compileArgs(binary, audit) {
             const src = join(root, "packages/runtime/src");
