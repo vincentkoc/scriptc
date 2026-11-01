@@ -1,4 +1,4 @@
-name: Qualify shared initialization zero cost
+name: Qualify focused native emitter linkage
 
 on:
   push:
@@ -12,745 +12,370 @@ concurrency:
   group: qualify-typed-local-js-zero-cost
   cancel-in-progress: false
 
-defaults:
-  run:
-    shell: /bin/bash --noprofile --norc -eo pipefail {0}
-
 env:
-  BASE_SHA: 71a9441c824262150f35acd2b8359f156ed3289c
-  CAND_SHA: 022f251fc38b4c169333f133398ee5150172f2bc
-  NODE_OPTIONS: --max-old-space-size=4096
+  BASE_SHA: e4216c59314a0fce020a7a1a6ed869455bdfa595
+  CAND_SHA: fc969f8a010359a920b2111b71188dc1c184ad34
 
 jobs:
-  native:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      ZC_JOB: native
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: vincentkoc/scriptc
-          ref: 022f251fc38b4c169333f133398ee5150172f2bc
-          persist-credentials: false
-      - name: Write the qualification runner
-        run: |
-          mkdir -p "$RUNNER_TEMP/zero-cost-assets" "$RUNNER_TEMP/zero-cost-native"
-          cat > "$RUNNER_TEMP/zero-cost-assets/runner.mjs" <<'RUNNER'
-          import assert from "node:assert/strict";
-          import { spawn, spawnSync } from "node:child_process";
-          import { createHash } from "node:crypto";
-          import {
-            closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync,
-            readdirSync, readlinkSync, realpathSync, renameSync, statfsSync, statSync, writeFileSync, writeSync,
-          } from "node:fs";
-          import { availableParallelism, totalmem } from "node:os";
-          import { basename, dirname, join, relative, resolve } from "node:path";
-          import { fileURLToPath, pathToFileURL } from "node:url";
-
-          const BASE = "71a9441c824262150f35acd2b8359f156ed3289c";
-          const CAND = "022f251fc38b4c169333f133398ee5150172f2bc";
-          const pins = {
-            "scripts/zero-cost-gate.mjs": "8c46165ba1a95338b010efcb425a6c03971fa883b0a2a7a57a077726c1f4a8f0",
-            "scripts/zero-cost-merge.mjs": "5ac0841a88b96575e62b8af12a195d654406096ac27eae4e5fbd3ca78c0eda08",
-            "scripts/zero-cost-compare.mjs": "5fbc96898aeec0cac4d10a6d8899600925910c81b8cdd78bd560deb1da9dfc14",
-            "benchmarks/runtime/workloads.mjs": "de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c",
-          };
-          const GiB = 1024 ** 3;
-          const task = process.env.ZC_JOB;
-          assert.ok(task === "native" || task === "merge" || /^(self|[1-8])$/.test(task ?? ""));
-          const mode = process.argv[2];
-          const modeDeadline = Date.now() + ({ prepare: 8, "install-native": 20, package: 22,
-            initialize: 8, build: 65, gate: 120, merge: 8, finish: 3 }[mode] ?? 1) * 60_000;
-          const workspace = process.env.GITHUB_WORKSPACE;
-          const temp = process.env.RUNNER_TEMP;
-          const assets = join(temp, "zero-cost-assets");
-          const out = join(temp, "zero-cost-" + task);
-          const candidate = task === "native" ? workspace : join(workspace, "candidate");
-          const baseline = join(workspace, "baseline");
-          const pack = join(temp, "zero-cost-libnode");
-          mkdirSync(out, { recursive: true });
-          const summaryPath = join(out, "summary.json");
-          const report = existsSync(summaryPath) ? JSON.parse(readFileSync(summaryPath, "utf8")) : {
-            schema: 1, task, baseline: BASE, candidate: CAND, workflow: process.env.GITHUB_SHA,
-            run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
-            status: "running", complete: false, startedAt: new Date().toISOString(), steps: [],
-          };
-          assert.equal(report.workflow, process.env.GITHUB_SHA);
-          assert.equal(report.run, process.env.GITHUB_RUN_ID);
-          assert.equal(report.attempt, process.env.GITHUB_RUN_ATTEMPT);
-          const sha = data => createHash("sha256").update(data).digest("hex");
-          const hash = file => sha(readFileSync(file));
-          const scrub = value => String(value).replaceAll(workspace, "<workspace>").replaceAll(temp, "<temp>");
-          const save = () => writeFileSync(summaryPath, JSON.stringify(report, null, 2) + "\n");
-          const pause = ms => new Promise(done => setTimeout(done, ms));
-          const capture = (command, args, cwd = candidate) => {
-            const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 60_000, maxBuffer: 32 * 1024 ** 2 });
-            assert.equal(result.error, undefined, command + ": " + String(result.error));
-            assert.equal(result.status, 0, command + ": " + (result.stderr ?? "").slice(-4000));
-            return result.stdout.trim();
-          };
-          let active;
-          let interrupted;
-          for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => {
-            interrupted = signal;
-            active?.stop();
-          });
-
-          // Each subprocess owns one detached group. Drain at leader exit,
-          // not pipe closure; descendants can otherwise keep the runner alive.
-          async function execute(label, command, args, cwd, minutes = 15, env = {}) {
-            assert.equal(interrupted, undefined, "runner interrupted");
-            const timeoutMs = Math.min(minutes * 60_000, modeDeadline - Date.now());
-            assert.ok(timeoutMs > 0, "qualification phase deadline expired");
-            const step = { label, command, args: args.map(scrub), cwd: scrub(cwd), startedAt: new Date().toISOString() };
-            report.steps.push(step); save();
-            const log = openSync(join(out, label + ".log"), "wx");
-            const started = Date.now();
-            const result = await new Promise(resolveResult => {
-              let timedOut = false, overflow = false, closed = false, settled = false, exited = false;
-              let force, pipeDeadline, hardDeadline;
-              let code = null, signal = null, error;
-              let bytes = 0;
-              const child = spawn(command, args, {
-                cwd, env: { ...process.env, ...env }, detached: true, stdio: ["ignore", "pipe", "pipe"],
-              });
-              const alive = () => {
-                if (!child.pid) return false;
-                assert.ok(child.pid > 1, "invalid owned process group");
-                try { process.kill(-child.pid, 0); return true; }
-                catch (failure) { if (failure.code === "ESRCH") return false; throw failure; }
-              };
-              const kill = sig => {
-                if (!child.pid) return;
-                assert.ok(child.pid > 1, "invalid owned process group");
-                try { process.kill(-child.pid, sig); }
-                catch (failure) { if (failure.code !== "ESRCH") throw failure; }
-              };
-              const finish = group => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer); clearTimeout(force); clearTimeout(pipeDeadline); clearTimeout(hardDeadline);
-                active = undefined;
-                child.stdout.destroy(); child.stderr.destroy();
-                child.unref();
-                closeSync(log);
-                resolveResult({ code, signal, error, timedOut, overflow, ...group, elapsedMs: Date.now() - started });
-              };
-              const stop = () => {
-                kill("SIGTERM");
-                if (!force) force = setTimeout(() => kill("SIGKILL"), 1000);
-                if (!hardDeadline) hardDeadline = setTimeout(() => finish({ groupDrained: false, cleanupDeadline: true }), 15_000);
-              };
-              active = { stop };
-              const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
-              const output = data => {
-                if (settled) return;
-                bytes += data.length;
-                if (bytes > 128 * 1024 ** 2) { overflow = true; stop(); return; }
-                writeSync(log, data);
-              };
-              child.stdout.on("data", output); child.stderr.on("data", output);
-              child.once("error", failure => {
-                error = String(failure);
-                if (!child.pid) finish({ groupDrained: true });
-              });
-              let drained;
-              child.once("exit", (exitCode, exitSignal) => {
-                exited = true; code = exitCode; signal = exitSignal;
-                drained = (async () => {
-                  await pause(100);
-                  const leftoverChildren = alive();
-                  if (leftoverChildren) {
-                    kill("SIGTERM");
-                    const gentle = Date.now() + 1000;
-                    while (alive() && Date.now() < gentle) await pause(100);
-                    if (alive()) kill("SIGKILL");
-                    const deadline = Date.now() + 9000;
-                    while (alive() && Date.now() < deadline) await pause(100);
-                  }
-                  return { leftoverChildren, groupDrained: !alive() };
-                })().catch(failure => ({ groupDrained: false, cleanupError: String(failure) }));
-                drained.then(group => {
-                  if (closed) finish(group);
-                  else pipeDeadline = setTimeout(() => finish({ ...group, groupDrained: false, unresolvedPipe: true }), 1000);
-                });
-              });
-              child.once("close", () => {
-                closed = true;
-                if (exited) drained.then(finish);
-                else if (error) finish({ groupDrained: !child.pid });
-              });
-            });
-            Object.assign(step, result, { finishedAt: new Date().toISOString() }); save();
-            assert.equal(interrupted, undefined, "runner interrupted");
-            assert.ok(result.groupDrained && !result.leftoverChildren && !result.timedOut &&
-              !result.overflow && !result.error && result.signal === null, label + ": incomplete subprocess " + JSON.stringify(result));
-            return result.code;
-          }
-          async function checked(label, command, args, cwd, minutes = 15, env = {}) {
-            assert.equal(await execute(label, command, args, cwd, minutes, env), 0, label + " failed");
-          }
-          function source(root, expected) {
-            assert.equal(capture("git", ["rev-parse", "HEAD"], root), expected);
-            assert.equal(capture("git", ["status", "--porcelain", "--untracked-files=all"], root), "", "dirty source");
-            const files = capture("git", ["ls-files", "-s", "-z"], root).split("\0").filter(Boolean);
-            const content = createHash("sha256");
-            for (const row of files) {
-              const tab = row.indexOf("\t"), name = row.slice(tab + 1), mode = row.slice(0, 6);
-              assert.ok(tab > 0 && !name.startsWith("/") && !name.split("/").includes(".."));
-              const path = join(root, name), info = lstatSync(path);
-              const bytes = info.isSymbolicLink() ? Buffer.from(readlinkSync(path)) : readFileSync(path);
-              content.update(mode + "\0" + name + "\0" + sha(bytes) + "\0");
-            }
-            for (const [name, expectedHash] of Object.entries(pins)) assert.equal(hash(join(root, name)), expectedHash, name);
-            return { head: expected, tree: capture("git", ["rev-parse", "HEAD^{tree}"], root), files: files.length, contentSha256: content.digest("hex") };
-          }
-          function sources() {
-            return task === "native" ? { candidate: source(candidate, CAND) }
-              : { baseline: source(baseline, BASE), candidate: source(candidate, CAND) };
-          }
-          function nativeInputs(root, ref) {
-            const rows = capture("git", ["ls-tree", "-r", "--full-tree", ref], root).split("\n");
-            return rows.filter(row => {
-              const name = row.slice(row.indexOf("\t") + 1);
-              return name.startsWith("native/llvm-codegen/") ||
-                /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(name) ||
-                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(name) ||
-                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
-                  "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(name);
-            });
-          }
-          function memory() {
-            const fields = Object.fromEntries(readFileSync("/proc/meminfo", "utf8").trim().split("\n").map(line => {
-              const [name, amount] = line.split(/:\s*/); return [name, Number(amount.split(/\s/)[0]) * 1024];
-            }));
-            const disk = statfsSync(temp);
-            return { total: totalmem(), available: fields.MemAvailable, swapTotal: fields.SwapTotal,
-              swapFree: fields.SwapFree, diskFree: Number(disk.bavail) * Number(disk.bsize),
-              cores: availableParallelism(), swaps: readFileSync("/proc/swaps", "utf8") };
-          }
-          function admit(createSwap) {
-            const before = memory();
-            const minimum = task === "self" && before.total >= 40 * GiB ? 40 : 28;
-            const missing = Math.max(0, Math.ceil(((minimum + 2) * GiB - before.available - before.swapFree) / GiB));
-            const capacity = { phase: mode, createSwap, before, minimumGiB: minimum,
-              missingSwapGiB: missing, requiredDiskBytes: (missing + 16) * GiB, admitted: false };
-            (report.capacity ??= []).push(capacity); save();
-            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64");
-            assert.ok(before.total >= 12 * GiB && before.available >= 8 * GiB && before.cores >= 2, "insufficient physical runner capacity");
-            if (createSwap && missing > 0) {
-              assert.ok(missing <= 24, "swap requirement exceeds the task budget");
-              assert.ok(before.diskFree >= (missing + 16) * GiB, "insufficient disk for swap and builds");
-              const path = join(temp, "zero-cost-" + process.env.GITHUB_RUN_ID + "-" + task + ".swap");
-              assert.ok(!existsSync(path), "owned swap path already exists");
-              report.swap = { path, bytes: missing * GiB, originalSwaps: before.swaps, active: false }; save();
-              capture("sudo", ["fallocate", "-l", String(missing * GiB), path]);
-              capture("sudo", ["chmod", "600", path]);
-              capture("sudo", ["mkswap", path]);
-              capture("sudo", ["swapon", path]);
-              report.swap.active = true; save();
-            }
-            const after = memory(); capacity.after = after; save();
-            assert.ok(after.available + after.swapFree >= minimum * GiB, "compiler heaps lack RAM/swap headroom");
-            assert.ok(after.diskFree >= (createSwap ? 16 : 12) * GiB, "insufficient remaining disk");
-            capacity.admitted = true; save();
-          }
-          function cleanupSwap() {
-            if (!report.swap) return;
-            const swap = report.swap;
-            assert.equal(swap.path, join(temp, "zero-cost-" + process.env.GITHUB_RUN_ID + "-" + task + ".swap"));
-            const live = () => readFileSync("/proc/swaps", "utf8").split("\n").slice(1).some(line => line.split(/\s+/)[0] === swap.path);
-            if (live()) capture("sudo", ["swapoff", swap.path]);
-            assert.equal(live(), false, "owned swap remains active");
-            if (existsSync(swap.path)) capture("sudo", ["rm", "--", swap.path]);
-            swap.active = false; swap.removed = true; save();
-          }
-          function filesUnder(root, prefix = "") {
-            const files = [];
-            for (const name of readdirSync(join(root, prefix)).sort()) {
-              const path = prefix ? prefix + "/" + name : name;
-              const info = lstatSync(join(root, path));
-              if (info.isDirectory()) files.push(...filesUnder(root, path));
-              else { assert.ok(info.isFile(), "artifact must be a regular file: " + path); files.push(path); }
-            }
-            return files;
-          }
-          const fileFacts = (root, paths) => paths.map(path => {
-            const info = lstatSync(join(root, path));
-            assert.ok(info.isFile(), "not a regular artifact: " + path);
-            return { path, size: info.size, mode: info.mode & 0o777, sha256: hash(join(root, path)) };
-          });
-          function checkFacts(root, expected) { assert.deepEqual(fileFacts(root, expected.map(file => file.path)), expected); }
-          function libnode(root) {
-            const manifest = JSON.parse(readFileSync(join(root, "manifest.json"), "utf8"));
-            assert.equal(manifest.schema, "scriptc.libnode-pack.v1");
-            assert.equal(manifest.platform, "linux"); assert.equal(manifest.arch, "x64");
-            assert.equal(manifest.moduleVersion, 137); assert.equal(manifest.bridgeAbi, 10);
-            assert.ok(["24.22.0", "24.22.1"].includes(manifest.nodeVersion));
-            for (const name of [manifest.libnode, manifest.bridge]) {
-              assert.ok(typeof name === "string" && basename(name) === name && name !== "." && name !== "..");
-              assert.ok(lstatSync(join(root, name)).isFile());
-              assert.equal(statSync(join(root, name)).size, manifest.files[name].size);
-              assert.equal(hash(join(root, name)), manifest.files[name].sha256);
-            }
-            return { manifest, manifestSha256: hash(join(root, "manifest.json")),
-              files: fileFacts(root, ["manifest.json", manifest.libnode, manifest.bridge,
-                ...(existsSync(join(root, "LICENSE")) ? ["LICENSE"] : [])]) };
-          }
-          function tools() {
-            const node = process.version, pnpm = capture("pnpm", ["--version"]);
-            const llvm = capture("llvm-config", ["--version"]);
-            assert.equal(node, "v24.22.0"); assert.equal(pnpm, "11.1.3"); assert.equal(llvm, "22.1.8");
-            return { node, pnpm, llvm, clang: capture("clang", ["--version"]), nm: capture("nm", ["--version"]),
-              executables: Object.fromEntries(["node", "pnpm", "llvm-config", "clang", "g++", "nm", "strip"].map(name => [name, executable(name)])),
-              imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion, platform: process.platform, arch: process.arch };
-          }
-          function executable(name) {
-            const path = realpathSync(capture("which", [name]));
-            assert.ok(lstatSync(path).isFile());
-            return { path: scrub(path), size: statSync(path).size, sha256: hash(path) };
-          }
-          function readAssetManifest() {
-            const manifest = JSON.parse(readFileSync(join(assets, "inputs.json"), "utf8"));
-            assert.equal(manifest.baseline, BASE); assert.equal(manifest.candidate, CAND);
-            assert.equal(manifest.workflow, process.env.GITHUB_SHA);
-            assert.equal(manifest.run, process.env.GITHUB_RUN_ID); assert.equal(manifest.attempt, process.env.GITHUB_RUN_ATTEMPT);
-            assert.equal(manifest.runnerSha256, hash(fileURLToPath(import.meta.url)));
-            assert.equal(manifest.libnodePath, pack); assert.equal(pack, resolve(pack));
-            assert.equal(hash(join(assets, "native.tar.gz")), manifest.nativeArchiveSha256);
-            assert.equal(hash(join(assets, "libnode.tar.gz")), manifest.libnodeArchiveSha256);
-            return manifest;
-          }
-          async function inventories() {
-            const text = readFileSync(join(candidate, "scripts/zero-cost-gate.mjs"), "utf8");
-            assert.equal(sha(text), pins["scripts/zero-cost-gate.mjs"]);
-            const start = "const FIXTURE_PROGRAMS =", end = "/* ── builds ";
-            assert.equal(text.split(start).length, 2); assert.equal(text.split(end).length, 2);
-            const block = text.slice(text.indexOf(start), text.indexOf(end));
-            assert.ok(block.includes("function goodCodeSet()"));
-            const { readWorkloads } = await import(pathToFileURL(join(candidate, "benchmarks/runtime/workloads.mjs")).href);
-            // Run only the pinned collector declarations. Importing the gate
-            // itself would allocate its work directory and start compiling.
-            const collect = new Function("assert", "readWorkloads", "join", "relative", "existsSync",
-              "readdirSync", "statSync", "readFileSync", "resolve", "dirname", "programsRoot", "sets",
-              "values", "only", block + "\nreturn goodCodeSet();");
-            const select = (set, shard) => collect(assert, readWorkloads, join, relative, existsSync,
-              readdirSync, statSync, readFileSync, resolve, dirname, baseline, new Set(set.split(",")),
-              { corpus: "ts", shard }, null).map(program => ({
-                id: program.id, entry: relative(baseline, program.entry), kind: program.kind,
-                optimization: program.kind === "exe" ? program.optimization ?? "release" : null,
-                ...(program.workload ? { workload: program.workload } : {}),
-              }));
-            const full = select("bench,corpus,self"), shards = {};
-            for (let index = 1; index <= 8; index++) shards[String(index)] = select("bench,corpus", index + "/8");
-            shards.self = select("self");
-            const ids = rows => rows.map(row => row.id).sort();
-            assert.equal(new Set(ids(full)).size, full.length);
-            assert.deepEqual(ids(Object.values(shards).flat()), ids(full));
-            for (const rows of Object.values(shards)) assert.ok(rows.length > 0);
-            assert.deepEqual(ids(shards.self), ["fixture/llvm-emitter", "fixture/llvm-layouts", "self/cli"]);
-            return { schema: 1, baseline: BASE, programsRoot: baseline, pins, full, shards };
-          }
-          function validateGate(data, expected, roots) {
-            assert.equal(data.schema, 1);
-            for (const [label, head] of [["baseline", BASE], ["candidate", CAND]]) {
-              assert.equal(data.trees[label].root, roots[label]);
-              assert.equal(data.trees[label].revision, capture("git", ["rev-parse", "--short", head], roots[label]));
-            }
-            assert.equal(data.programsRoot, roots.baseline);
-            assert.equal(data.host.platform, "linux"); assert.equal(data.host.arch, "x64"); assert.equal(data.host.node, "v24.22.0");
-            assert.equal(data.allow, null); assert.equal(data.strict, false); assert.equal(data.baselineCache, null);
-            assert.equal(data.runtime, null, "shared native runtime differs");
-            assert.ok(Array.isArray(data.failures) && Array.isArray(data.globalFailures));
-            assert.ok(data.globalFailures.every(value => data.failures.includes(value)));
-            assert.equal(data.verdict, data.failures.length ? "fail" : "pass");
-            assert.ok(Number.isFinite(data.elapsedMs) && data.elapsedMs > 0);
-            const actualIds = data.programs.map(row => row.id).sort(), wantedIds = expected.map(row => row.id).sort();
-            assert.deepEqual(actualIds, wantedIds, "incomplete program inventory");
-            assert.equal(new Set(actualIds).size, actualIds.length);
-            const counts = {};
-            for (const row of data.programs) {
-              assert.ok(["identical", "runtime-only", "nondeterministic", "both-fail", "differs", "build-error"].includes(row.verdict));
-              assert.equal(row.allowed, false);
-              counts[row.verdict] = (counts[row.verdict] ?? 0) + 1;
-              if (row.verdict === "both-fail") {
-                assert.ok(typeof row.baselineError === "string" && row.baselineError.length > 0);
-                assert.equal(row.baselineError, row.candidateError);
-              } else if (!["build-error"].includes(row.verdict)) {
-                const kinds = expected.find(program => program.id === row.id).kind === "exe" ? ["ir", "llvm", "exe"] : ["llvm"];
-                assert.deepEqual(Object.keys(row.artifacts).sort(), kinds.sort());
-                for (const side of ["baseline", "candidate"]) assert.ok(Number.isFinite(row.buildMs[side]) && row.buildMs[side] > 0);
-              }
-              assert.notEqual(row.cachedBaseline, true);
-            }
-            assert.deepEqual(data.counts, counts);
-            assert.equal(data.timing.runs, 5); assert.equal(data.timing.maxGrowth, 0.02);
-            const timed = expected.filter(row => !row.id.startsWith("corpus/"));
-            assert.deepEqual(data.timing.rows.map(row => row.id).sort(), timed.map(row => row.id).sort(), "incomplete timing inventory");
-            for (const row of data.timing.rows) {
-              const count = row.id.startsWith("bench/") ? 5 : row.id === "self/cli" ? 1 : 2;
-              for (const field of ["baselineMs", "candidateMs", "ratios"]) {
-                assert.equal(row[field].length, count, "missing timing samples: " + row.id);
-                assert.ok(row[field].every(value => Number.isFinite(value) && value > 0));
-              }
-            }
-            if (expected.some(row => row.id === "self/cli")) {
-              assert.equal(data.candidateSelf.ok, true, "candidate self-host source failed");
-              assert.ok(Number.isFinite(data.candidateSelf.buildMs) && data.candidateSelf.buildMs > 0);
-            } else assert.equal(data.candidateSelf, undefined);
-          }
-          save();
-          try {
-            if (mode === "prepare") {
-              assert.equal(task, "native");
-              report.sourceBefore = sources();
-              assert.ok(!existsSync(join(candidate, ".libnode-cache")), "unexpected existing native build cache");
-              // An additive exact-commit fetch supplies comparison objects
-              // only. The candidate checkout and index stay unchanged.
-              await checked("baseline-objects", "git", ["-c", "maintenance.auto=false", "-c", "gc.auto=0",
-                "fetch", "--no-tags", "--depth=1", "https://github.com/vincentkoc/scriptc.git", BASE], candidate, 5);
-              const before = nativeInputs(candidate, BASE), after = nativeInputs(candidate, CAND);
-              assert.ok(before.length > 0); assert.deepEqual(after, before, "native source inputs changed");
-              report.nativeInputs = after; report.nativeInputSha256 = sha(after.join("\n"));
-              admit(true);
-            } else if (mode === "install-native") {
-              await checked("install", "pnpm", ["install", "--frozen-lockfile"], candidate, 20);
-            } else if (mode === "package") {
-              report.tools = tools();
-              assert.equal(capture("zig", ["version"]), "0.16.0");
-              report.tools.zig = "0.16.0";
-              report.tools.zigExecutable = executable("zig");
-              await checked("verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], candidate, 5);
-              const nativePaths = ["packages/llvm-linux-x64-gnu/bin", "packages/runtime-linux-x64-gnu/artifacts"];
-              const nativeFiles = fileFacts(candidate, [
-                ...nativePaths.flatMap(path => filesUnder(join(candidate, path)).map(file => path + "/" + file)),
-                "packages/runtime-linux-x64-gnu/runtime-pack.json",
-              ]);
-              const nodePack = libnode(process.env.SCRIPTC_LIBNODE);
-              await checked("pack-native", "tar", ["-czf", join(assets, "native.tar.gz"),
-                ...nativePaths, "packages/runtime-linux-x64-gnu/runtime-pack.json"], candidate, 10);
-              await checked("pack-libnode", "tar", ["-czf", join(assets, "libnode.tar.gz"),
-                ...nodePack.files.map(file => file.path)], process.env.SCRIPTC_LIBNODE, 10);
-              // The canonical action restores its cache below the checkout.
-              // Keep that task-created cache outside the clean source boundary.
-              const cache = join(candidate, ".libnode-cache"), movedCache = join(temp, "zero-cost-libnode-build-cache");
-              if (existsSync(cache)) {
-                assert.ok(lstatSync(cache).isDirectory()); assert.ok(!existsSync(movedCache));
-                renameSync(cache, movedCache); report.relocatedLibnodeCache = scrub(movedCache);
-              }
-              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
-              const manifest = {
-                baseline: BASE, candidate: CAND, workflow: report.workflow, run: report.run, attempt: report.attempt,
-                runnerSha256: hash(fileURLToPath(import.meta.url)), nativeInputs: report.nativeInputs,
-                nativeInputSha256: report.nativeInputSha256, nativeFiles, libnode: nodePack, libnodePath: pack,
-                nativeArchiveSha256: hash(join(assets, "native.tar.gz")), libnodeArchiveSha256: hash(join(assets, "libnode.tar.gz")),
-                source: report.sourceAfter.candidate, tools: report.tools,
-              };
-              writeFileSync(join(assets, "inputs.json"), JSON.stringify(manifest, null, 2) + "\n");
-              report.complete = true; report.status = "complete";
-            } else if (mode === "initialize") {
-              assert.ok(/^(self|[1-8])$/.test(task));
-              report.sourceBefore = sources();
-              const manifest = readAssetManifest();
-              const baseInputs = nativeInputs(baseline, BASE), candInputs = nativeInputs(candidate, CAND);
-              assert.deepEqual(baseInputs, manifest.nativeInputs); assert.deepEqual(candInputs, baseInputs);
-              report.assetsSha256 = hash(join(assets, "inputs.json"));
-              report.nativeInputSha256 = manifest.nativeInputSha256;
-              admit(true);
-              const inventory = await inventories();
-              writeFileSync(join(out, "inventory.json"), JSON.stringify(inventory, null, 2) + "\n");
-              report.inventorySha256 = hash(join(out, "inventory.json"));
-            } else if (mode === "build") {
-              const manifest = readAssetManifest();
-              report.tools = tools();
-              for (const [name, value] of Object.entries(report.tools)) assert.deepEqual(value, manifest.tools[name], "native toolchain differs: " + name);
-              for (const [name, root] of [["baseline", baseline], ["candidate", candidate]]) {
-                await checked(name + "-install", "pnpm", ["install", "--frozen-lockfile"], root, 20);
-                const listing = capture("tar", ["-tzf", join(assets, "native.tar.gz")], root).split("\n");
-                assert.ok(listing.every(path => /^(packages\/llvm-linux-x64-gnu\/bin\/|packages\/runtime-linux-x64-gnu\/artifacts\/|packages\/runtime-linux-x64-gnu\/runtime-pack\.json$)/.test(path) && !path.split("/").includes("..")));
-                await checked(name + "-unpack", "tar", ["-xzf", join(assets, "native.tar.gz")], root, 10);
-                checkFacts(root, manifest.nativeFiles);
-                await checked(name + "-verify-runtime", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], root, 5);
-                await checked(name + "-build", "pnpm", ["build"], root, 25);
-              }
-              assert.ok(!existsSync(pack)); mkdirSync(pack);
-              const listed = capture("tar", ["-tzf", join(assets, "libnode.tar.gz")]).split("\n").sort();
-              assert.deepEqual(listed, manifest.libnode.files.map(file => file.path).sort());
-              await checked("unpack-libnode", "tar", ["-xzf", join(assets, "libnode.tar.gz")], pack, 10);
-              assert.deepEqual(libnode(pack), manifest.libnode);
-              report.libnode = manifest.libnode; report.libnodePath = pack;
-              report.nativeIdentity = { helper: manifest.nativeFiles.find(file => file.path.endsWith("/scriptc-llvm-codegen")),
-                runtimeManifest: manifest.nativeFiles.find(file => file.path.endsWith("/runtime-pack.json")) };
-              report.sourcePreGate = sources(); assert.deepEqual(report.sourcePreGate, report.sourceBefore);
-              admit(false);
-            } else if (mode === "gate") {
-              const manifest = readAssetManifest();
-              const inventory = JSON.parse(readFileSync(join(out, "inventory.json"), "utf8"));
-              assert.equal(hash(join(out, "inventory.json")), report.inventorySha256);
-              const args = [join(candidate, "scripts/zero-cost-gate.mjs"), "--baseline=" + baseline,
-                "--candidate=" + candidate, "--programs=baseline", "--set=" + (task === "self" ? "self" : "bench,corpus"),
-                "--corpus=ts", "--jobs=1", "--timing-runs=5", "--self-timing-runs=0",
-                "--fixture-timing-runs=1", "--max-time-growth=2", "--max-size-growth=0",
-                "--json=" + join(out, "gate.json"), ...(task === "self" ? [] : ["--shard=" + task + "/8"])];
-              assert.ok(!existsSync(join(out, "gate.json")), "stale gate report");
-              report.gateArguments = args.map(scrub); save();
-              const code = await execute("gate", process.execPath, args, candidate, 120, { SCRIPTC_LIBNODE: pack });
-              assert.ok(code === 0 || code === 1, "gate did not finish");
-              const data = JSON.parse(readFileSync(join(out, "gate.json"), "utf8"));
-              validateGate(data, inventory.shards[task], { baseline, candidate });
-              assert.equal(code, data.verdict === "pass" ? 0 : 1);
-              checkFacts(candidate, manifest.nativeFiles); checkFacts(baseline, manifest.nativeFiles);
-              assert.deepEqual(libnode(pack), manifest.libnode);
-              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
-              report.complete = true; report.status = "complete"; report.gateVerdict = data.verdict;
-              report.counts = data.counts; report.globalFailures = data.globalFailures; report.runtime = data.runtime;
-              report.nonGlobalFailures = data.failures.filter(failure => !data.globalFailures.includes(failure));
-              report.gateSha256 = hash(join(out, "gate.json"));
-              // Canonical merge recomputes global timing over all shards.
-              // Program/build failures remain failures in both receipts.
-              if (report.nonGlobalFailures.length > 0) {
-                report.failureKind = "program-verdict";
-                throw Error("gate has program failures");
-              }
-            } else if (mode === "merge") {
-              readAssetManifest();
-              report.sourceBefore = sources();
-              const inventory = await inventories(), expectedJobs = ["1", "2", "3", "4", "5", "6", "7", "8", "self"];
-              const files = [], summaries = [];
-              let common;
-              for (const job of expectedJobs) {
-                const dir = join(temp, "zero-cost-results", "zero-cost-result-" + job);
-                const summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8"));
-                assert.equal(summary.task, job); assert.equal(summary.complete, true);
-                assert.ok(summary.status === "complete" ||
-                  (summary.status === "failed" && summary.failureKind === "program-verdict"));
-                for (const [field, expected] of [["baseline", BASE], ["candidate", CAND], ["workflow", report.workflow],
-                  ["run", report.run], ["attempt", report.attempt]]) assert.equal(summary[field], expected);
-                assert.deepEqual(summary.sourceAfter, summary.sourceBefore);
-                assert.deepEqual(summary.sourceAfterCleanup, summary.sourceBefore);
-                assert.deepEqual(summary.sourceBefore, report.sourceBefore);
-                assert.equal(summary.swap?.active ?? false, false); assert.equal(summary.cleanupPassed, true);
-                assert.equal(hash(join(dir, "inventory.json")), summary.inventorySha256);
-                assert.deepEqual(JSON.parse(readFileSync(join(dir, "inventory.json"), "utf8")), inventory);
-                assert.equal(hash(join(dir, "gate.json")), summary.gateSha256);
-                assert.equal(summary.libnodePath, pack); assert.equal(summary.runtime, null);
-                const identity = { tools: summary.tools, native: summary.nativeIdentity, libnode: summary.libnode,
-                  libnodePath: summary.libnodePath,
-                  assets: summary.assetsSha256, nativeInputs: summary.nativeInputSha256 };
-                if (common === undefined) common = identity; else assert.deepEqual(identity, common);
-                const data = JSON.parse(readFileSync(join(dir, "gate.json"), "utf8"));
-                validateGate(data, inventory.shards[job], { baseline, candidate });
-                assert.deepEqual(summary.nonGlobalFailures, data.failures.filter(failure => !data.globalFailures.includes(failure)));
-                if (summary.status === "failed") assert.ok(summary.nonGlobalFailures.length > 0);
-                files.push(join(dir, "gate.json")); summaries.push(summary);
-              }
-              const code = await execute("merge", process.execPath, [join(candidate, "scripts/zero-cost-merge.mjs"),
-                "--json=" + join(out, "merged.json"), ...files], candidate, 5);
-              assert.ok(code === 0 || code === 1);
-              const merged = JSON.parse(readFileSync(join(out, "merged.json"), "utf8"));
-              validateGate(merged, inventory.full, { baseline, candidate });
-              assert.equal(merged.shards, 9); assert.equal(code, merged.verdict === "pass" ? 0 : 1);
-              const { timingVerdict, timingGroups } = await import(pathToFileURL(join(candidate, "scripts/zero-cost-compare.mjs")).href);
-              report.timing = Object.fromEntries(Object.entries(timingGroups(merged.timing.rows))
-                .map(([name, rows]) => [name, timingVerdict(name, rows, 0.02)]));
-              report.counts = merged.counts; report.verdict = merged.verdict; report.identity = common; report.runtime = merged.runtime;
-              report.inventorySha256 = sha(JSON.stringify(inventory));
-              report.programCount = inventory.full.length; report.shardCount = summaries.length;
-              report.sourceAfter = sources(); assert.deepEqual(report.sourceAfter, report.sourceBefore);
-              report.complete = true; report.status = "complete";
-              assert.equal(code, 0, "canonical zero-cost gate failed");
-            } else if (mode === "finish") {
-              try { cleanupSwap(); report.cleanupPassed = true; }
-              finally {
-                report.sourceAfterCleanup = sources();
-                assert.deepEqual(report.sourceAfterCleanup, report.sourceBefore);
-              }
-              assert.equal(report.complete, true, "setup or qualification incomplete");
-              assert.equal(report.status, "complete");
-            } else throw Error("unknown mode: " + mode);
-          } catch (error) {
-            report.status = "failed";
-            (report.errors ??= []).push({ phase: mode, error: scrub(error.stack ?? error) });
-            process.exitCode = 1;
-          } finally {
-            if (interrupted) { report.status = "failed"; report.interrupted = interrupted; process.exitCode = 1; }
-            if (mode !== "finish" && report.status === "failed") {
-              try { report.sourceAfterFailure = sources(); }
-              catch (error) { report.sourceError = scrub(error.stack ?? error); }
-            }
-            report.updatedAt = new Date().toISOString(); save();
-            console.log(JSON.stringify({ task, mode, status: report.status, complete: report.complete }));
-            if (process.exitCode) console.error("[typed-local-js-zero-cost] FAILED (exit 1)");
-          }
-          RUNNER
-          node --check "$RUNNER_TEMP/zero-cost-assets/runner.mjs"
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - name: Verify native input equality and admit runner capacity
-        timeout-minutes: 10
-        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" prepare
-      - uses: ./.github/actions/llvm-linux
-      - name: Install frozen dependencies
-        timeout-minutes: 22
-        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" install-native
-      - uses: ./.github/actions/zig
-      - uses: ./.github/actions/native-packages
-        with:
-          target: linux-x64-gnu
-      - uses: ./.github/actions/libnode
-      - name: Verify and package shared native inputs
-        timeout-minutes: 25
-        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" package
-      - name: Finalize source and owned swap
-        if: always()
-        timeout-minutes: 5
-        run: |
-          if test -f "$RUNNER_TEMP/zero-cost-assets/runner.mjs"; then
-            node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" finish
-          else
-            mkdir -p "$RUNNER_TEMP/zero-cost-native"
-            printf '%s\n' '{"complete":false,"status":"failed","error":"runner setup failed"}' > "$RUNNER_TEMP/zero-cost-native/summary.json"
-            echo '[typed-local-js-zero-cost] FAILED (exit 1)' >&2
-            exit 1
-          fi
-      - uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: zero-cost-native-assets
-          path: ${{ runner.temp }}/zero-cost-assets
-          if-no-files-found: error
-          retention-days: 1
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: zero-cost-native-evidence
-          path: ${{ runner.temp }}/zero-cost-native
-          if-no-files-found: error
-          retention-days: 1
-
   compare:
-    needs: native
+    if: github.repository == 'vincentkoc/scriptc'
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        part: ["1", "2", "3", "4", "5", "6", "7", "8", self]
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        working-directory: candidate
     env:
-      ZC_JOB: ${{ matrix.part }}
+      PROOF_CAPACITY_NAME: emitter-linkage-capacity
+      DIAGNOSTIC_SOURCE: fc969f8a010359a920b2111b71188dc1c184ad34
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 71a9441c824262150f35acd2b8359f156ed3289c
+          ref: ${{ env.BASE_SHA }}
           path: baseline
           persist-credentials: false
+          fetch-depth: 1
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
-          ref: 022f251fc38b4c169333f133398ee5150172f2bc
+          ref: ${{ env.CAND_SHA }}
           path: candidate
           persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: zero-cost-native-assets
-          path: ${{ runner.temp }}/zero-cost-assets
+          fetch-depth: 3
       - uses: pnpm/action-setup@v4
         with:
           version: 11.1.3
       - uses: actions/setup-node@v4
         with:
-          node-version-file: candidate/.node-version
+          node-version: 24.22.1
           cache: pnpm
           cache-dependency-path: |
             baseline/pnpm-lock.yaml
             candidate/pnpm-lock.yaml
-      - name: Verify source and exact inventory; admit paired-build capacity
-        timeout-minutes: 10
-        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" initialize
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
       - uses: ./candidate/.github/actions/llvm-linux
-      - name: Build each checkout with its own frozen dependencies
-        timeout-minutes: 70
-        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" build
-      - name: Compare the selected canonical programs
-        timeout-minutes: 123
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - uses: ./candidate/.github/actions/zig
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Prepare owned paired runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/emitter-linkage.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, statfsSync, writeFileSync, writeSync, chmodSync } from "node:fs";
+          import { join, relative, dirname, resolve, basename } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self=fileURLToPath(import.meta.url),root=process.cwd();
+          const out=join(process.env.RUNNER_TEMP,"emitter-linkage-proof"),work=join(process.env.RUNNER_TEMP,"emitter-linkage-work");
+          const trees={baseline:resolve(root,"../baseline"),candidate:root};
+          const owner={workflow:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,baseline:process.env.BASE_SHA,candidate:process.env.CAND_SHA,platform:process.platform};
+          const CAP=16*1024*1024;
+          const identities={"baseline":{"head":"e4216c59314a0fce020a7a1a6ed869455bdfa595","treeSha256":"5bfa45ae9430c52f64aa3f2b6272000ef5571dd8c2bf55b1448c528ce94534fa","pins":{".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c","CONTRIBUTING.md":"d2893ad8866f976b26eeb4463cb1eae046dc059ac4d140c27ee039d3ee9d8e7a","benchmarks/runtime/workloads.mjs":"de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c","benchmarks/runtime/workloads/numeric-kernels.json":"f46a7516c0e8acd961985c7c436a34c7dd0f3a8d12802825a3b37173fa57023e","benchmarks/runtime/workloads/numeric-kernels.ts":"c369d9f88cf3b13507f1beb0b28fc4f9ef955be8dea740981028d4b65a3ed4e0","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/cli/src/bootstrap.ts":"fa7b2cc599e1f2a70648c83edb14b05fbd2fc2aaae782afd254ddd4a5dce0978","packages/cli/src/command.ts":"08ba3dc7dc8a9f05030990a1179929dac3abf356c0570f0c8fea53a59e407354","packages/cli/src/host.ts":"0c529290766628127daa494044e11125446602ee8cbd19851075d769976c42a2","packages/cli/src/main.ts":"accd2800c78abeda565fcf3e3d1a9a40c9caf6399d734494a3d927b020530ae9","packages/cli/src/output-options.ts":"c50131883b4a854dec99316a2ea079bfe7a013b020874ae53e43a578dc614c1b","packages/cli/src/paths.ts":"98f003cf5f99d96d175d9d93771556abd8410f6bdb992c79d14ee0bb7e832437","packages/cli/src/usage.ts":"bc841adad8ecd19173a69034c4d5ed0cd0317c6a6311a3825b44fc03a317a226","packages/cli/src/wasi-runner.ts":"f90e793d7cfa977bb0e6536534f69a1d017503accceaa191739ecbc274f372ad","packages/compiler/src/backend/native/executable.ts":"3a6fe5c8bfaefe6978bddac84c6495efc1df5cabbc0c3b7c6af75a6d791b9d1a","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","scripts/zero-cost-compare.mjs":"5fbc96898aeec0cac4d10a6d8899600925910c81b8cdd78bd560deb1da9dfc14","scripts/zero-cost-gate.mjs":"8c46165ba1a95338b010efcb425a6c03971fa883b0a2a7a57a077726c1f4a8f0","tests/corpus/1644-ee-basics.ts":"5bd8a93356eb8ab763d6fd63f5d23e06c4e793f389b933fde92e7f43678ecc2a","tests/corpus/5134-events-error-monitor.ts":"9d7f1f6fd9d336bc61510642660a352792d6fc9fb9fc8c2eb796dbd794acd5c0","packages/compiler/src/native/toolchain.ts":"eb53dc69446c4ec17cd15953d3de446a06eb829d1f238e29869c8bdd50039fa1"},"native":{"count":1053,"sha256":"bbe0fd6d413373d19fbf5277a654f089fc4676887986bae408270a6011b18f31"},"helper":{"count":45,"sha256":"a143567224583f15475ff8c0c46a453879ad6edce78fa9a59074c9ac68d04eae"}},"candidate":{"head":"fc969f8a010359a920b2111b71188dc1c184ad34","treeSha256":"5a018057bf61f4ad8f6b98c2c2051e6d58830777f69ba95a0ba9df05ef89cc4f","pins":{".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c","CONTRIBUTING.md":"d2893ad8866f976b26eeb4463cb1eae046dc059ac4d140c27ee039d3ee9d8e7a","benchmarks/runtime/workloads.mjs":"de03ed1a7cf334a70e7b2acddace6a3878cd74ac669bdbcea61e4891ddc7ee2c","benchmarks/runtime/workloads/numeric-kernels.json":"f46a7516c0e8acd961985c7c436a34c7dd0f3a8d12802825a3b37173fa57023e","benchmarks/runtime/workloads/numeric-kernels.ts":"c369d9f88cf3b13507f1beb0b28fc4f9ef955be8dea740981028d4b65a3ed4e0","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/cli/src/bootstrap.ts":"fa7b2cc599e1f2a70648c83edb14b05fbd2fc2aaae782afd254ddd4a5dce0978","packages/cli/src/command.ts":"08ba3dc7dc8a9f05030990a1179929dac3abf356c0570f0c8fea53a59e407354","packages/cli/src/host.ts":"0c529290766628127daa494044e11125446602ee8cbd19851075d769976c42a2","packages/cli/src/main.ts":"accd2800c78abeda565fcf3e3d1a9a40c9caf6399d734494a3d927b020530ae9","packages/cli/src/output-options.ts":"c50131883b4a854dec99316a2ea079bfe7a013b020874ae53e43a578dc614c1b","packages/cli/src/paths.ts":"98f003cf5f99d96d175d9d93771556abd8410f6bdb992c79d14ee0bb7e832437","packages/cli/src/usage.ts":"bc841adad8ecd19173a69034c4d5ed0cd0317c6a6311a3825b44fc03a317a226","packages/cli/src/wasi-runner.ts":"f90e793d7cfa977bb0e6536534f69a1d017503accceaa191739ecbc274f372ad","packages/compiler/src/backend/native/executable.ts":"3a6fe5c8bfaefe6978bddac84c6495efc1df5cabbc0c3b7c6af75a6d791b9d1a","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","scripts/zero-cost-compare.mjs":"5fbc96898aeec0cac4d10a6d8899600925910c81b8cdd78bd560deb1da9dfc14","scripts/zero-cost-gate.mjs":"8c46165ba1a95338b010efcb425a6c03971fa883b0a2a7a57a077726c1f4a8f0","tests/corpus/1644-ee-basics.ts":"5bd8a93356eb8ab763d6fd63f5d23e06c4e793f389b933fde92e7f43678ecc2a","tests/corpus/5134-events-error-monitor.ts":"9d7f1f6fd9d336bc61510642660a352792d6fc9fb9fc8c2eb796dbd794acd5c0","packages/compiler/src/native/toolchain.ts":"eb53dc69446c4ec17cd15953d3de446a06eb829d1f238e29869c8bdd50039fa1"},"native":{"count":1055,"sha256":"732f95d8adf00abf7e4d7b0d30ededab519e879a1bca06cf00a71d38014d0e96"},"helper":{"count":45,"sha256":"a143567224583f15475ff8c0c46a453879ad6edce78fa9a59074c9ac68d04eae"}}};
+          const controls=[{"id":"bench/numeric-kernels","entry":"benchmarks/runtime/workloads/numeric-kernels.ts","key":"bench_numeric-kernels","sha256":"c369d9f88cf3b13507f1beb0b28fc4f9ef955be8dea740981028d4b65a3ed4e0"},{"id":"corpus/1644-ee-basics.ts","entry":"tests/corpus/1644-ee-basics.ts","key":"corpus_1644-ee-basics.ts","sha256":"5bd8a93356eb8ab763d6fd63f5d23e06c4e793f389b933fde92e7f43678ecc2a"},{"id":"corpus/5134-events-error-monitor.ts","entry":"tests/corpus/5134-events-error-monitor.ts","key":"corpus_5134-events-error-monitor.ts","sha256":"9d7f1f6fd9d336bc61510642660a352792d6fc9fb9fc8c2eb796dbd794acd5c0"}];
+
+          const digest=bytes=>createHash("sha256").update(bytes).digest("hex"),hash=path=>digest(readFileSync(path));
+          const json=path=>JSON.parse(readFileSync(path,"utf8"));
+          const save=(name,value)=>writeFileSync(join(out,name),JSON.stringify(value,null,2)+"\n");
+          const record=path=>({path:relative(out,path),bytes:statSync(path).size,sha256:hash(path)});
+          const scrub=value=>String(value).split(root).join("<candidate>").split(trees.baseline).join("<baseline>").split(process.env.RUNNER_TEMP).join("<runner-temp>");
+          const capture=(command,args=[],cwd=root)=>{const r=spawnSync(command,args,{cwd,encoding:"utf8",timeout:30000,maxBuffer:CAP});assert.equal(r.error,undefined);assert.equal(r.status,0,command+": "+r.stderr);return r.stdout.trim();};
+          function verifyWorkOwner(){const st=lstatSync(work);assert.ok(st.isDirectory()&&!st.isSymbolicLink());assert.equal(st.mode&0o777,0o700);assert.deepEqual(json(join(work,"owner.json")),owner);}
+          function nativePath(path){return path.startsWith("native/llvm-codegen/")||/^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(path)||/^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(path)||[".node-version","package.json","pnpm-lock.yaml","pnpm-workspace.yaml","packages/compiler/package.json","packages/compiler/src/backend/runtime-abi.ts"].includes(path);}
+          function helperPath(path){return path.startsWith("native/llvm-codegen/")||/^packages\/llvm-[^/]+\/(package.json|scripts\/)/.test(path)||[".node-version",".github/actions/native-packages/action.yml",".github/actions/llvm-linux/action.yml"].includes(path);}
+          function source(label){const dir=trees[label],expected=identities[label];assert.equal(capture("git",["rev-parse","HEAD"],dir),expected.head);assert.equal(capture("git",["status","--porcelain=v1","--untracked-files=all"],dir),"");const tree=capture("git",["ls-tree","-r","--full-tree","HEAD"],dir);assert.equal(digest(tree),expected.treeSha256);const pins=Object.fromEntries(Object.keys(expected.pins).map(p=>[p,hash(join(dir,p))]));assert.deepEqual(pins,expected.pins);const rows=tree.split("\n"),nativeRows=rows.filter(r=>nativePath(r.split("\t")[1])),helperRows=rows.filter(r=>helperPath(r.split("\t")[1]));for(const [kind,values]of [["native",nativeRows],["helper",helperRows]])assert.deepEqual({count:values.length,sha256:digest(values.join("\n"))},expected[kind]);return {head:expected.head,treeSha256:digest(tree),pins,native:expected.native,helper:expected.helper,nativeDisk:nativeRows.map(row=>{const path=row.split("\t")[1];return {path,sha256:hash(join(dir,path))};})};}
+          function sources(){return Object.fromEntries(Object.keys(trees).map(label=>[label,source(label)]));}
+          function files(base,prefix=""){return readdirSync(base,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name)).flatMap(item=>{const p=join(base,item.name),name=prefix+item.name,st=lstatSync(p);assert.ok(!st.isSymbolicLink());if(st.isDirectory())return files(p,name+"/");assert.ok(st.isFile());return [{path:name,bytes:st.size,sha256:hash(p)}];});}
+          function tool(command,args=["--version"]){const path=realpathSync(capture("/bin/sh",["-c",'command -v "$1"',"identity",command]));return {path,sha256:hash(path),version:capture(command,args)};}
+          function tools(){return {node:tool(process.execPath),pnpm:tool("pnpm"),llvm:tool("llvm-config"),zig:tool("zig",["version"]),clang:tool("clang"),cxx:tool("g++"),ld:tool("ld"),lld:tool("ld.lld"),nm:tool("nm"),strip:tool("strip"),readelf:tool("readelf"),objdump:tool("llvm-objdump"),cmake:tool("cmake"),ninja:tool("ninja"),imageOS:process.env.ImageOS,imageVersion:process.env.ImageVersion};}
+          function resources(label){const devices={};for(const [name,path]of Object.entries({root:"/",workspace:process.env.GITHUB_WORKSPACE,runnerTemp:process.env.RUNNER_TEMP})){const st=statSync(path),fs=statfsSync(path),key=String(st.dev),row=devices[key]??={device:key,paths:[],measurements:[]};row.paths.push(name);row.measurements.push({path:name,availableBytes:Number(fs.bavail)*Number(fs.bsize),availableInodes:Number(fs.ffree)});}for(const row of Object.values(devices)){row.availableBytes=Math.min(...row.measurements.map(x=>x.availableBytes));row.availableInodes=Math.min(...row.measurements.map(x=>x.availableInodes));row.admitted=row.availableBytes>=16*1024**3&&row.availableInodes>=250000;}const fields=Object.fromEntries(readFileSync("/proc/meminfo","utf8").trim().split("\n").map(line=>{const [k,v]=line.split(/:\s*/);return [k,Number(v.split(/\s/)[0])*1024];}));const value={...owner,label,minimumBytes:16*1024**3,minimumInodes:250000,devices:Object.values(devices),memory:{total:fields.MemTotal,available:fields.MemAvailable,swapFree:fields.SwapFree},memoryAdmission:"telemetry only; no invented memory threshold",maxReleasePairConcurrency:2,toolsRemoved:false,swapChanged:false,admitted:Object.values(devices).every(x=>x.admitted)};console.log(JSON.stringify(value));save(label+".resources.json",value);assert.equal(value.admitted,true,"capacity refused");return value;}
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function readOutput(step,stream){return readFileSync(join(out,step[stream].path),"utf8");}
+          let deadline;
+          function commandBudget(seconds,now=Date.now()){assert.ok(Number.isInteger(seconds)&&seconds>0);const remaining=Math.floor((deadline-now-120000)/1000);assert.ok(remaining>0,"reserved drain/readback budget reached");return Math.min(seconds,remaining);}
+          async function checked(label,command,args,seconds,env={}){const row=await run(label,command,args,commandBudget(seconds),env);requireSuccess(row);return row;}
+          function headArgs(label,command,args){return ["-c",'cd "$1" && shift && exec "$@"',"owned-head",trees[label],command,...args];}
+          async function headRun(label,id,command,args,seconds,env={}){return checked(label+"-"+id,"/bin/sh",headArgs(label,command,args),seconds,env);}
+          function environment(id){const dir=join(work,id);mkdirSync(dir,{mode:0o700});for(const n of ["tmp","cache","xdg"])mkdirSync(join(dir,n),{mode:0o700});return {TMPDIR:join(dir,"tmp"),XDG_CACHE_HOME:join(dir,"xdg"),SCRIPTC_CACHE_DIR:join(dir,"cache"),SCRIPTC_TEST_STABLE_TOOLCHAIN:"1"};}
+          function clearBuildOverrides(env){const removed=[];for(const key of Object.keys(env)){if(/^SCRIPTC_(?:SAN|RUNTIME_PROFILE|NATIVE_PROFILE|NATIVE_LAYOUT|LLVM_CODEGEN|LLVM_PACKAGE|LLVM_PROFILE|LLVM_THINLTO|RUNTIME_BITCODE|RUNTIME_PACK|CPU_DISPATCH|TEST_RUNTIME_SRC_DIR|LINKER|DSYMUTIL|CHECKER)(?:_|$)/.test(key)){delete env[key];removed.push(key);}}return {removed:removed.sort(),runtimePack:"default per-source resolution only",helper:"same exact admitted input and binary only",profiles:"canonical committed profiles; no environment override",valuesRetained:false};}
+          function regularInside(base,path){const rel=relative(base,path);assert.ok(rel&&!rel.startsWith("../")&&!rel.startsWith("/")&&!rel.split("/").includes(".."));let at=base;for(const part of rel.split("/")){at=join(at,part);assert.ok(!lstatSync(at).isSymbolicLink());}assert.ok(lstatSync(path).isFile());return path;}
+          function packFacts(label){const dir=join(trees[label],"packages/runtime-linux-x64-gnu"),manifest=json(join(dir,"runtime-pack.json"));assert.equal(manifest.schema,"scriptc.runtime-pack.v1");assert.equal(manifest.format,1);assert.equal(manifest.package,"@scriptc/runtime-linux-x64-gnu");assert.equal(manifest.version,json(join(dir,"package.json")).version);assert.equal(manifest.compiler.speed_codegen,"scriptc-llvm-codegen 22.1.8");for(const mode of ["release","speed"]){assert.ok(manifest.flavors[mode]);assert.ok(manifest.flavors[mode].runtime_units.length>0);}const artifacts=[...Object.values(manifest.flavors).flatMap(f=>f.runtime_units.flatMap(u=>u.variants)),...manifest.archives,...(manifest.data??[]),...(manifest.headers??[])];for(const a of artifacts){const path=regularInside(dir,join(dir,a.path));assert.equal(statSync(path).size,a.size);assert.equal(hash(path),a.sha256);}const target=join(out,label+"-runtime-pack.json");copyFileSync(join(dir,"runtime-pack.json"),target);return {manifest,manifestFile:record(target),files:files(join(dir,"artifacts")),helper:helperFacts(label)};}
+          function helperFacts(label){const path=join(trees[label],"packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen");assert.ok(lstatSync(path).isFile()&&!lstatSync(path).isSymbolicLink());return {bytes:statSync(path).size,sha256:hash(path),mode:statSync(path).mode&0o777};}
+          const dynamicRoots=["scr_ee_dyn_ops","scr_ee_dyn_error_arg","scr_ee_dyn_emit_meta","scr_ee_dyn_removed","scr_ee_entry_dyn"];
+          const conversionRoots=["scr_error_from_dyn","scr_dyn_ref_is_error"];
+          const normalized=name=>name.replace(/\.scrunit\.[A-Za-z0-9_]+$/,"");
+          function rootMatch(name,rootName){const value=normalized(name);return value===rootName||value.startsWith(rootName+".");}
+          function classify(names,comparison){const normalizedNames=names.map(normalized);return {dynamic:comparison.dynamicTierSymbols(normalizedNames),node:comparison.nodeIslandSymbols(normalizedNames),icu:comparison.icuSymbols(normalizedNames),adapter:names.filter(n=>dynamicRoots.some(r=>rootMatch(n,r))).sort(),conversion:names.filter(n=>conversionRoots.some(r=>rootMatch(n,r))).map(normalized).sort()};}
+          async function symbols(label,path,comparison){const row=await checked(label+"-nm","nm",["-S",path],60);const text=readOutput(row,"stdout"),parsed=comparison.parseNm(text);assert.ok(parsed.length>0,"missing defined symbols");const names=[...new Set(parsed.filter(s=>s.type!=="U").map(s=>s.name))].sort();return {process:row,definedCount:names.length,names,classifiers:classify(names,comparison)};}
+          async function objectRoots(label,facts,comparison){const result={};for(const mode of ["release","speed"]){const unit=facts.manifest.flavors[mode].runtime_units.find(u=>u.source==="scr_events_emitter.c");assert.ok(unit);const variant=unit.variants.find(v=>v.id==="default");assert.ok(variant);const path=join(trees[label],"packages/runtime-linux-x64-gnu",variant.path);const row=await symbols(label+"-"+mode+"-emitter-object",path,comparison);const ops=row.names.filter(n=>rootMatch(n,"scr_ee_dyn_ops"));assert.equal(ops.length,1);if(mode==="speed")assert.ok(ops[0].endsWith(".scrunit.scr_events_emitter"),"speed emitter unit was not promoted by the admitted helper");result[mode]={source:"scr_events_emitter.c",variant,objectSha256:hash(path),raw:row.process,adapterNames:row.classifiers.adapter,conversionNames:row.classifiers.conversion};}return result;}
+          function scratchPath(stdout,before){const lines=stdout.split("\n").filter(x=>x.startsWith("artifacts kept in "));assert.equal(lines.length,1,"canonical kept path absent or ambiguous");const path=lines[0].slice("artifacts kept in ".length);assert.match(path,/^\/tmp\/scriptc-zero-cost-[A-Za-z0-9]{6}$/);assert.ok(!before.includes(path),"canonical path predated the invocation");return path;}
+          function scratchInventory(path){assert.equal(realpathSync(path),path);const st=lstatSync(path);assert.ok(st.isDirectory()&&!st.isSymbolicLink());assert.equal(st.uid,process.getuid());assert.equal(st.mode&0o777,0o700);const inventory=files(path);assert.ok(inventory.length>0&&inventory.length<=150);assert.ok(inventory.reduce((n,r)=>n+r.bytes,0)<=2*1024**3,"canonical snapshot storage budget exceeded");for(const row of inventory){const parts=row.path.split("/");assert.ok(["baseline","candidate","recheck"].includes(parts[0]));assert.ok(controls.some(c=>c.key===parts[1]));assert.ok(parts.length>=3);}return {path,device:st.dev,inode:st.ino,uid:st.uid,files:inventory};}
+          function verifyCanonicalCopy(scratch,retained){assert.equal(retained?.complete,true,"canonical retained copy incomplete; retain original");assert.equal(retained.path,"canonical-artifacts");assert.deepEqual(retained.files,scratch.files);const path=join(out,retained.path),st=lstatSync(path);assert.ok(st.isDirectory()&&!st.isSymbolicLink());assert.equal(realpathSync(path),path);assert.equal(st.mode&0o777,0o700);assert.equal(st.uid,process.getuid());assert.deepEqual(files(path),scratch.files,"canonical retained copy changed; retain original");return path;}
+          function retainCanonical(scratch,copy=copyFileSync){assert.deepEqual(scratchInventory(scratch.path),scratch);const path=join(out,"canonical-artifacts");mkdirSync(path,{mode:0o700});for(const row of scratch.files){const source=regularInside(scratch.path,join(scratch.path,row.path)),target=join(path,row.path);mkdirSync(dirname(target),{recursive:true,mode:0o700});copy(source,target);}assert.deepEqual(scratchInventory(scratch.path),scratch);const retained={complete:true,path:"canonical-artifacts",files:scratch.files};verifyCanonicalCopy(scratch,retained);return retained;}
+          function removeCanonicalScratch(scratch,retained){const current=scratchInventory(scratch.path);assert.deepEqual(current,scratch);verifyCanonicalCopy(scratch,retained);rmSync(current.path,{recursive:true});return {removed:true,originalPath:current.path,retainedPath:retained.path,retainedFiles:retained.files.length};}
+          function validateRelease(data){assert.equal(data.schema,1);assert.deepEqual(data.host,{platform:"linux",arch:"x64",node:"v24.22.1"});assert.equal(data.strict,false);assert.equal(data.allow,null);assert.equal(data.baselineCache,null);assert.equal(data.timing,null);assert.deepEqual(data.programs.map(p=>p.id).sort(),controls.map(c=>c.id).sort());for(const label of Object.keys(trees)){assert.equal(data.trees[label].root,trees[label]);const revision=data.trees[label].revision;assert.match(revision,/^[0-9a-f]{7,40}$/);assert.ok(identities[label].head.startsWith(revision));}assert.equal(data.programsRoot,trees.baseline);for(const row of data.programs){assert.equal(row.allowed,false);assert.equal(row.baselineError,undefined);assert.equal(row.candidateError,undefined);assert.equal(row.cachedBaseline,undefined);assert.ok(["identical","runtime-only","nondeterministic"].includes(row.verdict),"required release cell did not build or compare");if(row.verdict==="runtime-only"){assert.equal(data.runtime?.pack,"runtime-linux-x64-gnu");assert.equal(data.runtime.helperSame,true);assert.ok(Array.isArray(row.runtime?.changed)&&Array.isArray(row.runtime?.added));}assert.deepEqual(Object.keys(row.artifacts).sort(),["exe","ir","llvm"]);assert.ok(row.artifacts.exe.bytes.baseline>0&&row.artifacts.exe.bytes.candidate>0);for(const label of Object.keys(trees))assert.ok(Number.isFinite(row.buildMs[label])&&row.buildMs[label]>0);}const counts={};for(const row of data.programs)counts[row.verdict]=(counts[row.verdict]??0)+1;assert.deepEqual(data.counts,counts);assert.equal(data.verdict,"pass");assert.deepEqual(data.failures,[]);assert.deepEqual(data.globalFailures,[]);return {verdict:data.verdict,programs:data.programs,counts:data.counts,runtime:data.runtime};}
+          function releaseAdmission(local,canonical,inventory){assert.equal(local.id,canonical.id);assert.ok(["identical","runtime-only","nondeterministic"].includes(canonical.verdict));const evidence={verdict:canonical.verdict,localVerdict:local.verdict,localFails:local.fails,passed:true};if(canonical.verdict==="nondeterministic"){assert.ok(Array.isArray(canonical.nondeterministic)&&canonical.nondeterministic.length>0);assert.ok(canonical.nondeterministic.every(k=>["ir","llvm","exe"].includes(k)));const control=controls.find(c=>c.id===canonical.id);const files=inventory.files.filter(row=>row.path.startsWith("recheck/"+control.key+"/"));for(const kind of canonical.nondeterministic){const suffix=kind==="exe"?"/program":kind==="ir"?".ir.json":".ll";assert.equal(files.filter(row=>row.path.endsWith(suffix)).length,1,"canonical baseline recheck evidence missing");}evidence.reason="canonical gate observed the baseline's own rebuild differ in the named artifacts";evidence.baselineRecheck={root:inventory.path,artifacts:canonical.nondeterministic,files};}else{assert.equal(local.fails,false,"local comparison contradicts canonical non-recheck acceptance");evidence.reason=canonical.verdict==="runtime-only"?"canonical gate and local comparison attribute executable-only differences to changed runtime objects":"canonical and local comparisons admit the same artifacts";if(canonical.runtime)evidence.runtime=canonical.runtime;}return evidence;}
+          async function cell(label,mode,control,dir,comparison){const paths={exe:regularInside(dir,join(dir,"program"))};for(const [kind,suffix]of [["ir",".ir.json"],["llvm",".ll"]]){const candidates=readdirSync(dir).filter(n=>n.endsWith(suffix));assert.equal(candidates.length,1,"missing or ambiguous "+kind);paths[kind]=regularInside(dir,join(dir,candidates[0]));}assert.deepEqual(readFileSync(paths.exe).subarray(0,4),Buffer.from([127,69,76,70]));const id=label+"-"+mode+"-"+control.key,artifacts={};if(mode==="release"){for(const [kind,path]of Object.entries(paths))artifacts[kind]=record(regularInside(join(out,"canonical-artifacts"),path));}else{const kept=join(out,"binaries",id);mkdirSync(kept,{recursive:true});for(const [kind,path]of Object.entries(paths)){const destination=join(kept,kind==="exe"?"program":kind==="ir"?"program.ir.json":"program.ll");copyFileSync(path,destination);artifacts[kind]=record(destination);}}const symbol=await symbols(id,paths.exe,comparison);const dynamic=await checked(id+"-readelf","readelf",["-d",paths.exe],60);const dependencies=[...readOutput(dynamic,"stdout").matchAll(/\(NEEDED\).*\[([^\]]+)\]/g)].map(m=>m[1]).sort();const checks=symbol.classifiers;assert.deepEqual(checks.node,[],"Node linkage");assert.deepEqual(checks.icu,[],"ICU linkage");assert.deepEqual(checks.adapter,[],"dynamic emitter ops/converter retained");assert.ok(dependencies.every(n=>!/^lib(?:node|icu)/i.test(n)));if(control.id==="bench/numeric-kernels"){assert.deepEqual(checks.dynamic,[]);assert.deepEqual(checks.conversion,[]);}return {label,mode,id:control.id,compiled:true,artifacts,symbols:{...symbol,names:undefined},dependencies,readelf:dynamic};}
+          async function runtimeSymbols(report,comparison){const delta=comparison.runtimePackDiff(report.packs.baseline.manifest,report.packs.candidate.manifest),paths=comparison.linkedRuntimeFiles(delta),names=new Set(),raw=[];for(const label of Object.keys(trees)){const selected=paths.map(p=>join(trees[label],"packages/runtime-linux-x64-gnu",p)).filter(p=>existsSync(p));if(!selected.length)continue;const result=await checked(label+"-changed-runtime-nm","nm",["-S",...selected],120);raw.push(result);for(const symbol of comparison.parseNm(readOutput(result,"stdout")))names.add(symbol.name);}return {delta,names,raw};}
+          function comparePair(before,after,comparison,runtime){const result={id:before.id,mode:before.mode,artifacts:{}};for(const kind of ["ir","llvm"]){result.artifacts[kind]=comparison.compareArtifact(kind,readFileSync(join(out,before.artifacts[kind].path)),readFileSync(join(out,after.artifacts[kind].path)));}result.artifacts.exe=comparison.compareExecutables(readFileSync(join(out,before.artifacts.exe.path)),readFileSync(join(out,after.artifacts.exe.path)),readOutput(before.symbols.process,"stdout"),readOutput(after.symbols.process,"stdout"));for(const key of ["dynamic","conversion"]){const added=after.symbols.classifiers[key].filter(n=>!before.symbols.classifiers[key].includes(n));assert.deepEqual(added,[],"newly reachable "+key+" roots");}assert.deepEqual(after.dependencies.filter(n=>!before.dependencies.includes(n)),[],"new dynamic dependency");const runtimeOnly=!result.artifacts.exe.identical&&comparison.confinedToRuntime(result.artifacts.exe,runtime.names);const verdict=comparison.programVerdict({baseline:{ok:true},candidate:{ok:true},artifacts:result.artifacts,allowed:false,required:true,runtimeOnly});return {...result,...verdict,runtimeObjectExplanation:runtimeOnly};}
+          async function main(){const report=json(join(out,"summary.json"));verifyWorkOwner();deadline=Date.now()+65*60*1000;report.runnerDeadline=new Date(deadline).toISOString();let prepared=false;try{
+            assert.equal(process.version,"v24.22.1");assert.deepEqual(sources(),report.sourceBefore);report.toolsBefore=tools();assert.equal(report.toolsBefore.pnpm.version,"11.1.3");assert.equal(report.toolsBefore.llvm.version,"22.1.8");assert.equal(report.toolsBefore.zig.version,"0.16.0");
+            report.environmentPolicy=clearBuildOverrides(process.env);delete process.env.FORCE_COLOR;
+            const env=environment("build-environment");report.preparation=[];
+            for(const label of Object.keys(trees)){report.preparation.push(await headRun(label,"install","pnpm",["install","--frozen-lockfile"],300,env));report.preparation.push(await headRun(label,"build","pnpm",["build"],600,env));}
+            assert.deepEqual(sources(),report.sourceBefore);assert.deepEqual(identities.baseline.helper,identities.candidate.helper);
+            const helperRelative="packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen";for(const label of Object.keys(trees)){assert.equal(existsSync(join(trees[label],helperRelative)),false);assert.equal(existsSync(join(trees[label],"packages/runtime-linux-x64-gnu/runtime-pack.json")),false);}
+            report.resources.push(resources("before-helper"));report.preparation.push(await headRun("candidate","helper-build","pnpm",["--filter","@scriptc/llvm-linux-x64-gnu","build:native"],600,env));
+            mkdirSync(dirname(join(trees.baseline,helperRelative)),{recursive:true});copyFileSync(join(root,helperRelative),join(trees.baseline,helperRelative));chmodSync(join(trees.baseline,helperRelative),statSync(join(root,helperRelative)).mode&0o777);assert.deepEqual(helperFacts("baseline"),helperFacts("candidate"));
+            report.helper={input:identities.candidate.helper,binary:helperFacts("candidate"),sharedAfterExactInputAndToolAdmission:true};const version=await checked("helper-version",join(root,helperRelative),["version","--format=json"],30);report.helper.version=JSON.parse(readOutput(version,"stdout"));assert.equal(report.helper.version.ok,true);assert.equal(report.helper.version.llvm_version,"22.1.8");assert.equal(report.helper.version.protocol_version,"1");assert.ok(report.helper.version.features.includes("runtime-unit-profile"));
+            report.packs={};for(const label of Object.keys(trees)){report.resources.push(resources(label+"-before-pack"));const build=await headRun(label,"runtime-build","env",["CC=zig","AR=zig","pnpm","--filter","@scriptc/runtime-linux-x64-gnu","build:native"],1200,env);report.preparation.push(build);report.preparation.push(await headRun(label,"verify-pack",process.execPath,["packages/runtime-linux-x64-gnu/scripts/verify.mjs"],120,env));report.packs[label]=packFacts(label);save("summary.json",report);}
+            report.dist=Object.fromEntries(Object.entries(trees).map(([label,dir])=>[label,["packages/compiler/dist","packages/cli/dist"].flatMap(p=>files(join(dir,p)).map(row=>({...row,path:p+"/"+row.path})))]));report.locks=Object.fromEntries(Object.entries(trees).map(([label,dir])=>[label,hash(join(dir,"node_modules/.pnpm/lock.yaml"))]));prepared=true;
+            const comparison=await import(pathToFileURL(join(root,"scripts/zero-cost-compare.mjs")));report.emitterObjects={};for(const label of Object.keys(trees))report.emitterObjects[label]=await objectRoots(label,report.packs[label],comparison);
+            report.resources.push(resources("before-release-comparison"));const releaseBudget=commandBudget(600);const before=readdirSync("/tmp").filter(n=>n.startsWith("scriptc-zero-cost-")).map(n=>join("/tmp",n));report.releaseBudgetSeconds=releaseBudget;report.canonicalStarted=true;save("summary.json",report);
+            const gatePath=join(out,"release.json"),only="^(bench/numeric-kernels|corpus/(1644-ee-basics|5134-events-error-monitor)\\.ts)$";const args=[join(root,"scripts/zero-cost-gate.mjs"),"--baseline="+trees.baseline,"--candidate="+root,"--programs=baseline","--set=bench,corpus","--only="+only,"--jobs=1","--timing-runs=0","--keep","--json="+gatePath];report.releaseCommand={command:process.execPath,args};
+            report.releaseProcess=await run("release-gate",process.execPath,args,releaseBudget,environment("release-environment"));requireSuccess({...report.releaseProcess,code:0});assert.ok([0,1].includes(report.releaseProcess.code));assert.ok(allDrained());report.canonicalScratch=scratchInventory(scratchPath(readOutput(report.releaseProcess,"stdout"),before));save("canonical-scratch.json",report.canonicalScratch);save("summary.json",report);report.canonicalRetained=retainCanonical(report.canonicalScratch);save("canonical-retained.json",report.canonicalRetained);save("summary.json",report);report.releaseRaw=record(gatePath);report.release=validateRelease(json(gatePath));assert.equal(report.releaseProcess.code,0);
+            report.cells=[];for(const control of controls)for(const label of Object.keys(trees)){report.cells.push(await cell(label,"release",control,join(out,report.canonicalRetained.path,label,control.key),comparison));save("summary.json",report);}
+            for(const control of controls)for(const label of Object.keys(trees)){report.resources.push(resources(label+"-speed-"+control.key));const dir=join(work,label+"-speed-"+control.key);mkdirSync(dir,{mode:0o700});const args=["SCRIPTC_NO_CACHE=1",process.execPath,"--max-old-space-size=8192",join(trees[label],"packages/cli/dist/bootstrap.js"),"build",join(trees.baseline,control.entry),"--optimization=speed","--keep-llvm","--emit-ir","-o",join(dir,"program")];const build=await checked(label+"-speed-"+control.key+"-build","/bin/sh",headArgs("baseline","env",args),180,environment(label+"-speed-env-"+control.key));const value=await cell(label,"speed",control,dir,comparison);value.build=build;report.cells.push(value);save("summary.json",report);}
+            assert.equal(report.cells.length,12);assert.equal(new Set(report.cells.map(c=>c.label+"/"+c.mode+"/"+c.id)).size,12);const runtime=await runtimeSymbols(report,comparison);report.runtimeExplanation={delta:runtime.delta,raw:runtime.raw,symbolCount:runtime.names.size};report.comparisons=[];
+            for(const mode of ["release","speed"]){report.resources.push(resources("before-"+mode+"-artifact-comparison"));for(const control of controls){const pair=Object.keys(trees).map(label=>report.cells.find(c=>c.label===label&&c.mode===mode&&c.id===control.id));const result=comparePair(...pair,comparison,runtime);result.admission=mode==="release"?releaseAdmission(result,report.release.programs.find(p=>p.id===control.id),report.canonicalRetained):{passed:!result.fails,reason:"local speed artifact comparison",verdict:result.verdict};report.comparisons.push(result);}}
+            assert.ok(report.comparisons.every(p=>p.admission.passed),"focused artifact comparison failed");report.preCleanupComplete=true;
+           }catch(error){report.error=scrub(error.stack??error);}finally{try{assert.ok(allDrained());assert.deepEqual(sources(),report.sourceBefore);assert.ok(prepared,"native preparation incomplete");for(const label of Object.keys(trees)){await headRun(label,"verify-pack-after",process.execPath,["packages/runtime-linux-x64-gnu/scripts/verify.mjs"],120);assert.deepEqual(packFacts(label),report.packs[label]);assert.equal(hash(join(trees[label],"node_modules/.pnpm/lock.yaml")),report.locks[label]);assert.deepEqual(["packages/compiler/dist","packages/cli/dist"].flatMap(p=>files(join(trees[label],p)).map(row=>({...row,path:p+"/"+row.path}))),report.dist[label]);}assert.deepEqual(tools(),report.toolsBefore);report.sourceAfter=sources();report.inputsVerifiedAfter=true;}catch(error){report.readbackError=scrub(error.stack??error);}save("summary.json",report);}assert.equal(report.preCleanupComplete,true);assert.equal(report.inputsVerifiedAfter,true);}
+          function initialize(){assert.equal(process.platform,"linux");assert.equal(process.arch,"x64");assert.equal(process.version,"v24.22.1");assert.equal(owner.baseline,identities.baseline.head);assert.equal(owner.candidate,identities.candidate.head);mkdirSync(work,{mode:0o700});writeFileSync(join(work,"owner.json"),JSON.stringify(owner),{flag:"wx",mode:0o600});mkdirSync(out,{mode:0o700});copyFileSync(self,join(out,"runner.mjs"));const report={schemaVersion:1,...owner,runnerSha256:hash(self),focusedLinkageComplete:false,fullZeroCostQualification:false,runtimePerformanceQualified:false,productionAdoption:false,scope:{controls:controls.map(c=>c.id),heads:2,modes:["release","speed"],requiredSuccessfulBinaryCells:12,maxReleasePairConcurrency:2,binaryExecution:false,canonicalBaselineRecheckPossible:true},resources:[],limitations:["Focused artifact/linkage comparison only. No runtime-performance, full zero-cost, library-mode, functional or adoption claim.","The canonical release gate builds pairs concurrently with jobs1 and may recheck the baseline. Twelve is the required successful matrix, not an exact subprocess count. Both-fail and missing cells are rejected.","Each source builds and verifies its own runtime pack. Only the LLVM helper is shared after exact source/tool/binary admission; no libnode pack or runtime-pack substitution.","Every executable receives all-defined-symbol checks and readelf dependency inspection, including identical binaries and speed-promoted emitter roots. Existing scr_ee_dyn pointer storage is distinct from forbidden dynamic ops/converter roots.","Runtime-only and observed canonical nondeterministic classifications retain their qualifications. No zero size/time cost is inferred.","The bounded admitted canonical tree is copied and hash-verified before verdict admission, including failure artifacts and baseline rechecks. Release cells reference that retained tree without duplicate binaries. Failed copy/readback retains the original scratch and marks cleanup incomplete.","An early canonical-gate failure without an admitted kept path leaves unknown /tmp scratch retained; cleanup never sweeps a name prefix. Memory is recorded, not fabricated into a minimum threshold."]};save("summary.json",report);try{report.sourceBefore=sources();save("summary.json",report);}catch(error){report.initializationError=scrub(error.stack??error);save("summary.json",report);throw error;}}
+          function finalize(){const report=json(join(out,"summary.json")),cleanup={passed:false,retained:true};try{verifyWorkOwner();assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k=>[k,report[k]])),owner);assert.ok(allDrained());assert.equal(hash(self),report.runnerSha256);assert.deepEqual(sources(),report.sourceBefore);if(report.canonicalScratch){cleanup.canonicalRetained=true;cleanup.canonical=removeCanonicalScratch(report.canonicalScratch,report.canonicalRetained);cleanup.canonicalRemoved=true;cleanup.canonicalRetained=false;}else if(report.canonicalStarted){cleanup.unknownCanonicalScratchRetained=true;throw Error("canonical scratch custody was not established");}rmSync(work,{recursive:true});cleanup.passed=true;cleanup.retained=false;rmSync(self);}catch(error){cleanup.error=scrub(error.stack??error);}report.cleanup=cleanup;report.focusedLinkageComplete=report.preCleanupComplete===true&&report.inputsVerifiedAfter===true&&cleanup.passed;save("summary.json",report);save("artifact-manifest.json",files(out).filter(row=>row.path!=="artifact-manifest.json"));assert.equal(report.focusedLinkageComplete,true,"focused paired linkage proof incomplete");}
+          if(process.argv[2]!=="--probe"){try{if(process.argv[2]==="--init")initialize();else if(process.argv[2]==="--finalize")finalize();else if(process.argv[2]==="--child")await childMain();else await main();}catch(error){process.stderr.write(scrub(error.stack??error)+"\n[emitter-linkage] FAILED (exit 1)\n");process.exitCode=1;}}
+          RUNNER
+          node "$RUNNER_TEMP/emitter-linkage.mjs" --init
+      - name: Build each source and compare the focused matrix
         run: |
           ulimit -c 0
-          sudo sysctl -w kernel.core_pattern=core
-          node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" gate
-      - name: Finalize source and owned swap
+          node "$RUNNER_TEMP/emitter-linkage.mjs"
+      - name: Verify custody and remove admitted scratch
         if: always()
-        timeout-minutes: 5
         run: |
-          if test -f "$RUNNER_TEMP/zero-cost-assets/runner.mjs"; then
-            node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" finish
-          else
-            mkdir -p "$RUNNER_TEMP/zero-cost-$ZC_JOB"
-            printf '%s\n' '{"complete":false,"status":"failed","error":"setup failed before runner download"}' > "$RUNNER_TEMP/zero-cost-$ZC_JOB/summary.json"
-            echo '[typed-local-js-zero-cost] FAILED (exit 1)' >&2
-            exit 1
-          fi
+          test -f "$RUNNER_TEMP/emitter-linkage.mjs"
+          node "$RUNNER_TEMP/emitter-linkage.mjs" --finalize
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zero-cost-result-${{ matrix.part }}
-          path: ${{ runner.temp }}/zero-cost-${{ matrix.part }}
+          name: native-emitter-paired-linkage
+          path: ${{ runner.temp }}/emitter-linkage-proof
           if-no-files-found: error
           retention-days: 1
-
-  aggregate:
-    needs: [native, compare]
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      ZC_JOB: merge
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: vincentkoc/scriptc
-          ref: 71a9441c824262150f35acd2b8359f156ed3289c
-          path: baseline
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: vincentkoc/scriptc
-          ref: 022f251fc38b4c169333f133398ee5150172f2bc
-          path: candidate
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: candidate/.node-version
-      - uses: actions/download-artifact@v4
-        with:
-          name: zero-cost-native-assets
-          path: ${{ runner.temp }}/zero-cost-assets
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: zero-cost-result-*
-          path: ${{ runner.temp }}/zero-cost-results
-      - name: Verify all nine inventories and merge the canonical reports
-        run: node "$RUNNER_TEMP/zero-cost-assets/runner.mjs" merge
-      - name: Retain a setup failure receipt
-        if: always()
-        run: |
-          if ! test -f "$RUNNER_TEMP/zero-cost-merge/summary.json"; then
-            mkdir -p "$RUNNER_TEMP/zero-cost-merge"
-            printf '%s\n' '{"complete":false,"status":"failed","error":"aggregate setup failed or required artifact missing"}' > "$RUNNER_TEMP/zero-cost-merge/summary.json"
-            echo '[typed-local-js-zero-cost] FAILED (exit 1)' >&2
-            exit 1
-          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zero-cost-merged-evidence
-          path: ${{ runner.temp }}/zero-cost-merge
+          name: native-emitter-paired-capacity
+          path: ${{ runner.temp }}/emitter-linkage-capacity
           if-no-files-found: error
           retention-days: 1
