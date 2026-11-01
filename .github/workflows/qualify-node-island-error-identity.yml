@@ -1,4 +1,4 @@
-name: Qualify direct emitter owner supplement
+name: Diagnose typed emitter Error prototype policy
 
 on:
   push:
@@ -9,14 +9,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: qualify-native-emitter-error-identity-${{ github.ref }}
+  group: qualify-typed-emitter-error-policy-baseline-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: fc969f8a010359a920b2111b71188dc1c184ad34
+  SOURCE_SHA: ad0aa8c88262c11b1353922068db77eed8599c52
 
 jobs:
-  qualify:
+  diagnose:
     if: github.repository == 'vincentkoc/scriptc'
     runs-on: ubuntu-24.04
     timeout-minutes: 80
@@ -24,15 +24,15 @@ jobs:
       run:
         shell: /bin/bash --noprofile --norc -eo pipefail {0}
     env:
-      PROOF_CAPACITY_NAME: native-emitter-error-identity-capacity
-      DIAGNOSTIC_SOURCE: fc969f8a010359a920b2111b71188dc1c184ad34
+      PROOF_CAPACITY_NAME: typed-emitter-error-policy-baseline-capacity
+      DIAGNOSTIC_SOURCE: ad0aa8c88262c11b1353922068db77eed8599c52
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vincentkoc/scriptc
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - name: Verify immutable source
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
@@ -127,34 +127,37 @@ jobs:
           test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
           python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
       - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
       - name: Disable piped core dumps
         run: sudo sysctl -w kernel.core_pattern=core
       - name: Prepare owned qualification runner
         run: |
           umask 077
           set -C
-          cat > "$RUNNER_TEMP/native-emitter-error-identity.mjs" <<'RUNNER'
+          cat > "$RUNNER_TEMP/typed-emitter-error-policy-baseline.mjs" <<'RUNNER'
           import assert from "node:assert/strict";
           import { createHash } from "node:crypto";
           import { spawn, spawnSync } from "node:child_process";
-          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync, symlinkSync, readlinkSync } from "node:fs";
           import { join, relative } from "node:path";
           import { fileURLToPath, pathToFileURL } from "node:url";
           import { setTimeout as delay } from "node:timers/promises";
           const self = fileURLToPath(import.meta.url), root = process.cwd();
-          const out = join(process.env.RUNNER_TEMP, "native-emitter-error-identity-proof");
-          const work = join(process.env.RUNNER_TEMP, "native-emitter-error-identity-work");
+          const out = join(process.env.RUNNER_TEMP, "typed-emitter-error-policy-baseline-proof");
+          const work = join(process.env.RUNNER_TEMP, "typed-emitter-error-policy-baseline-work");
           const head = process.env.SOURCE_SHA;
           const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: head, platform: process.platform };
           const CAP = 16 * 1024 * 1024;
-          const sourcePins = {".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44",".oxfmtrc.jsonc":"39e3e80a4b4aaabdac8b12e5a56ebc6f130a99c271d8e0bc1965a68dff0b60fb",".oxlintrc.jsonc":"8b843dbb8fbf3620f77f82c107e5e4834d3b991f4e6b8fdcb2c6d9d078bf5161","AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c","CHANGELOG.md":"a682c6f4a191f8c93d44209b7cae16320bd5af9058a3463b2d8dd8bee76a1596","CONTRIBUTING.md":"d2893ad8866f976b26eeb4463cb1eae046dc059ac4d140c27ee039d3ee9d8e7a","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/backend/llvm/dyn.ts":"55dcb307a231bc567ca3d08c50cb144d9a7ec590953049ecb6d3c93cb9b8c5e8","packages/compiler/src/backend/llvm/expr-callbacks.ts":"4ef72e23a8fa4b83cba95eceb01697ac4365d903ac6850c9aa7981c6ae500f13","packages/compiler/src/backend/llvm/expr-dynamic.ts":"0f6a897df0ab00074aba39564875842b091e24df6fe95e82d719210d7d4405a1","packages/compiler/src/backend/llvm/lib-process.ts":"ea6bb194f52cb67facd291401aa2533c0307a562e114bbc6106d98abfc5da0a5","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/compiler/src/backend/native/runtime-inputs.ts":"0bed0fc0f98fcd0212e67032fa61de94d2e926a8ee9c5c7fbbc6a24c91972788","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/cli/output-options.ts":"f67105fb66f3d95a679c7fe8be81939e6349a128731fe5563b5b9891c3b6a316","packages/compiler/src/compile-types.ts":"b1cc3f82c619dda913b3766a9dd7d4a4c207ada778d08467eb901d3294dab6dc","packages/compiler/src/diagnostics/diagnostic.ts":"f6151c4b9c3ef455225d3c431b0105c26b550c466175ac7b0a8152dfa50fb9a3","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/frontend/lowering/builtins/environment.ts":"096afd3dd58d041ebea6c565b5245acb9b93a7bd8afecabca8c9a2916b241c7a","packages/compiler/src/frontend/lowering/builtins/process.ts":"c6a0ce9b6a0160cc3fca75f1be0db85f9d46ad492c63631dcebdc4cfc56bb793","packages/compiler/src/frontend/lowering/caught-value-dispatch.ts":"2b5979c747e290892e58f0af504c5916444f60231179d9d4f1d97e1a7279badb","packages/compiler/src/frontend/lowering/containers/bytes.ts":"50c15a2c8bfd0715b8791ed2abd967aad30dced0c4b5be079c87053b0a54a3c2","packages/compiler/src/frontend/lowering/expressions/binary.ts":"9afd4d2410dfcfda9eb2f8b9ac369e8126f3c670f59828c9b239534db6f23b72","packages/compiler/src/frontend/lowering/lower-calls.ts":"81a1f47b90a76649b3a1ec5eb7c6ba3fd5e0c61d047e855b5c4a933bbf855bb5","packages/compiler/src/frontend/lowering/lower-classes.ts":"261a5c3578f2591bf4dddb18e283e12fc48698d93a34c28c33ff59ec0cf07b47","packages/compiler/src/frontend/lowering/lower-event-emitter.ts":"3e73ed3697fae93d409b4b92591eb9ad87e7defadf654f396f0691080cb99a18","packages/compiler/src/frontend/lowering/lower-exprs.ts":"21912d733d3728c8c28d821951ac10d6bb686fb7ae16dc3bd2132fe9bb16e03f","packages/compiler/src/frontend/lowering/lower-functions.ts":"96d8855867decc59426dba062221d7526527478120cf3b784442c38bf18367ae","packages/compiler/src/frontend/lowering/lower-modules.ts":"e0c52ed22a75d9e686521035fd034ab4e651abe12d2a0208b77893f4c8133ffe","packages/compiler/src/frontend/lowering/lower-node-island.ts":"cf8237c7258fd533b6d591ebf07eaeffb01b1edad3f3e67176243f29d8715574","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"17a1144990227554d0018284bfc9cd443bf64c167ed983722a53a32ce857bbba","packages/compiler/src/frontend/lowering/lower-stmts.ts":"d7357f9f7384a03072e27008d9f3913fbeeead7326d44830435ff76a71a395a7","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","packages/compiler/src/ir/ir.ts":"4083cf2a5b697c98938d50fb2434b95dba8ad3135bf1aed1e9a782717817382b","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/scripts/cache-key.mjs":"a949852965733eff702f2abc164e2466684e68d4b8726f6c98d0c6883cf875c3","packages/libnode-common/scripts/verify.mjs":"051fd399d29bddc8f757213ee00d5f6c1d200755266b0ebe86b7603462de503a","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime/src/scr_async.c":"6a990cc466361828bd82bd688fc3811da23b876df223fb5d0214c496ca855198","packages/runtime/src/scr_bytes.c":"5c49016bef3e37ec3c9ccca98650bf588b2eea69bac9e0fd4f979b55d6325a94","packages/runtime/src/scr_dyn_handle.c":"1a730fd9766c0284f3fe370b5f21044b95db5c3cd3fec35a594b7ef05dc1fe38","packages/runtime/src/scr_dyn_invoke.c":"34418a247215d7a8051ba99e60b9bc36b840f94ea30fe431e762f0f39b955e3e","packages/runtime/src/scr_error.c":"217bda2be5bf907120f9c2e432af5ab71040f6e10127ae69139971dd080bf753","packages/runtime/src/scr_events.c":"0f27965c4237b688841d14df5c71e8c87c34f0c0311569f40d35208ae5cd294e","packages/runtime/src/scr_events_emitter.c":"142920cf4a797c8523ee0b92d94f66a23a43f28b9b05bc815c17ec9c16d6b87f","packages/runtime/src/scr_events_emitter.h":"dbe826175253120c9e0a922b8f3169fe2cf783efd99347c27391960490f718ab","packages/runtime/src/scr_events_emitter.test.c":"55fff467920fd58c2c701ec1ecd94d3e94c191d4d900212abca0d0cd91f196df","packages/runtime/src/scr_events_emitter.test.ts":"6a107fec5b13f6ed10d0bb753fc23d1cb0f9f3464bd8fa735dbe485a87b37fff","packages/runtime/src/scr_json.c":"cb6eb34d6723a6074be1ff7f2c4e4a4e8a0cb62ace9cd0fd99f0024fcb4b11fb","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_lib.h":"83a688df501afd1115baaeff931c61bcb8973cd505acd8f59bca5a18cadafdbc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island.h":"aa94ab7b3c8899325cb77605bfb142823b7c50198d8d918e1a320ac42925d570","packages/runtime/src/scr_node_island_export.c":"ee93fa6046a8430bd6eb812058af06b6f0261a351b6e66cd13245afb66851c0d","packages/runtime/src/scr_node_island_handle.c":"4f34dc673574abd8fffd2b02ad03d12acd0378bd9364dbbba2833b8eeb886f39","packages/runtime/src/scr_node_island_host.cjs":"e853e03ceaa0ef422c7554da29d15d7f8c6bfab1c9668a837b2f8e4f68ca6913","packages/runtime/src/scr_regex.c":"a6790257bf0e56e575e18d1119fc276ff355135ceb693d2d9b3d268b5e47a1c7","packages/runtime/src/scr_regex.h":"3deb5f58aab84c525e6f6016d680d08eaac3f3f77483fa26894427ba9dd46746","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","tests/corpus/1698-stream-uncaught-error.ts":"88049be7d2105d64546b9bb1aa33184d8be6f9e7ec94db924fe74e1dd5a22e10","tests/corpus/2630-stream-consumers-errors.ts":"1e9d42e66dc603a60aa9de626da1062d575e0035e8716c0018e3c53457983c3d","tests/corpus/5134-events-error-monitor.ts":"9d7f1f6fd9d336bc61510642660a352792d6fc9fb9fc8c2eb796dbd794acd5c0","tests/corpus/5136-events-error-monitor-string-name.ts":"53821711b3fa6657e2cb0e15bbf7a2cd44581ee85d88b8d773505ac34fc30fec","tests/corpus/5138-events-error-monitor-shared-listener.ts":"24ae418c8e4a304a9f2abdc789a6917dcd0383c0d472468b4488e2526996a36c","tests/corpus/6580-emitter-typed-untyped-listeners.ts":"f49638840ffb306deb28af7f7aa37099ca828e12b3e7c903169cdcf78a8094de","tests/corpus/6581-emitter-untyped-error-and-meta.ts":"9945c140447c09adaacb3614f8d31b28b45debcad963c9aa7cd52696dc05804f","tests/corpus/6941-emitter-untyped-zero-arg-listener.ts":"03a0eea54c9eba012f3425df61926e97e5dcbe95de59406133e42f9e162945a5","tests/corpus/emitter-listener-this-typed.ts":"3520b4dc1b704b718aab89805171ee206a938b6e9737c82d026240d9ee2425bf","tests/corpus/emitter-unhandled-error-payloads-typed.ts":"4b9c0c8c5ece35b72707aed16eb16bd4f80a6e7b056612c7ba2b4cfff070f473","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/jsx-oracle.ts":"c4642f02da794f548bebe8d6e23ec4b48380e25cc803c4154c47dc1bfede76f8","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/harness/node-island-handles.test.ts":"a8e1ca75c757474befd93eb1e6b9cf7051299c021396e767a80dbe9c9055b05f","tests/harness/oracle-env.ts":"f16a4f44e97d1cb16a43421c20886effebf1b478d2d02ccebcaf13f7aa6fdcf6","tests/harness/shard.ts":"8ef5234e8fcf13672e7e1d774eaa4ff58e264c06e85be16e5f77eda5a66467bd","tests/harness/suite-lock.mjs":"78b5fd5c64f3795ac49b377e1f52faafd185134bebe391d363b07dd01fe09c31","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32"};
-          const nativeExpected = {"count":1055,"sha256":"732f95d8adf00abf7e4d7b0d30ededab519e879a1bca06cf00a71d38014d0e96"};
-          const gateSpecs = [{"id":"direct-monitor-plain","flavor":"plain","kind":"owner","files":["packages/runtime/src/scr_events_emitter.test.ts"],"expectedByFile":{"packages/runtime/src/scr_events_emitter.test.ts":["direct dynamic errorMonitor adapts fixed Error and zero-argument listeners"]}},{"id":"direct-monitor-san","flavor":"san","kind":"owner","files":["packages/runtime/src/scr_events_emitter.test.ts"],"expectedByFile":{"packages/runtime/src/scr_events_emitter.test.ts":["direct dynamic errorMonitor adapts fixed Error and zero-argument listeners"]}}];
-          const knownTitles = {"packages/runtime/src/scr_events_emitter.test.ts":["direct dynamic errorMonitor adapts fixed Error and zero-argument listeners"]};
-          const sourceDelta = {"parent":"e79f7e00aa149f39148a05a74fa5af4910f137f7","path":"packages/runtime/src/scr_events_emitter.test.ts","beforeSha256":"c68008632ba14e93b65279e33b4b77ae55f33ef9f42fc5c386c8f0b33489a130","afterSha256":"6a107fec5b13f6ed10d0bb753fc23d1cb0f9f3464bd8fa735dbe485a87b37fff","binaryDiffSha256":"8449844f36f096d68f361eecf63e0fdf9396834e27c773614fc9604b99686f81","allOtherTrackedFilesUnchanged":true};
-          const assertionAdmission = {"path":"packages/runtime/src/scr_events_emitter.test.c","line":35,"expression":"scr_ee_dyn != NULL","function":"main"};
-          const mutationSpec = {"id":"direct-monitor-hook-disabled","path":"packages/runtime/src/scr_events_emitter.c","before":"  } else {\n    scr_ee_dyn = &scr_ee_dyn_ops;\n  }\n  return scr_ee_emit_core(em, name, NULL, args ? args : scr_ee_no_args, argc, NULL);","after":"  } else {\n  }\n  return scr_ee_emit_core(em, name, NULL, args ? args : scr_ee_no_args, argc, NULL);","originalSha256":"142920cf4a797c8523ee0b92d94f66a23a43f28b9b05bc815c17ec9c16d6b87f","mutatedSha256":"cd13169eb74d30bceb93542ae2531aaa98d695aee62f6914e418b5ac07ccb9f3"};
-          const historicalFocusedEvidence = {"run":"41281310020","attempt":1,"job":"124773634422","workflow":"9ca24c2f1afccbd817e23e6e1891400c6c0785b4","source":"e79f7e00aa149f39148a05a74fa5af4910f137f7","artifact":"13074045309","zipBytes":773927,"zipSha256":"195b35bbd03eed8ce5bc203319ce5ee113d783ae08c16dfd140ae66971832e95","summarySha256":"00368b05252cd0479bda25e653460cbc72fbf5dd1bb99275b0adc74871428704","manifestEntries":123,"selectedPassed":48,"emitterPassed":8,"siblingPassed":40,"selectedFailedBeforeNativeExecution":2,"mutationAttempted":false,"inputsVerifiedAfter":true,"cleanupPassed":true,"authenticationBoundary":"coordinator and independent audit authenticated retained archive; references only, no remote replay or download","manifestSha256":"d72786973d5824b77ef47dc35209b2ca1ebb047f82753f0b6251a14dfa4d2a20"};
+          const sourcePins = {".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44",".oxfmtrc.jsonc":"39e3e80a4b4aaabdac8b12e5a56ebc6f130a99c271d8e0bc1965a68dff0b60fb",".oxlintrc.jsonc":"8b843dbb8fbf3620f77f82c107e5e4834d3b991f4e6b8fdcb2c6d9d078bf5161","AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c","CHANGELOG.md":"a682c6f4a191f8c93d44209b7cae16320bd5af9058a3463b2d8dd8bee76a1596","CONTRIBUTING.md":"d2893ad8866f976b26eeb4463cb1eae046dc059ac4d140c27ee039d3ee9d8e7a","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/backend/llvm/dyn.ts":"55dcb307a231bc567ca3d08c50cb144d9a7ec590953049ecb6d3c93cb9b8c5e8","packages/compiler/src/backend/llvm/expr-callbacks.ts":"4ef72e23a8fa4b83cba95eceb01697ac4365d903ac6850c9aa7981c6ae500f13","packages/compiler/src/backend/llvm/expr-dynamic.ts":"0f6a897df0ab00074aba39564875842b091e24df6fe95e82d719210d7d4405a1","packages/compiler/src/backend/llvm/lib-process.ts":"ea6bb194f52cb67facd291401aa2533c0307a562e114bbc6106d98abfc5da0a5","packages/compiler/src/backend/native-toolchain.ts":"8a5a29fa35d04ab98f0b8ce9d6da7b87c00598d0ef7685113357b0955bd3b10b","packages/compiler/src/backend/native/executable.ts":"3a6fe5c8bfaefe6978bddac84c6495efc1df5cabbc0c3b7c6af75a6d791b9d1a","packages/compiler/src/backend/native/runtime-inputs.ts":"0bed0fc0f98fcd0212e67032fa61de94d2e926a8ee9c5c7fbbc6a24c91972788","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/runtime-pack-core.ts":"3707c7b080d448f8c44f8243847302c3277fe60722feb5af36c4bc620dab6b6a","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/cli/output-options.ts":"f67105fb66f3d95a679c7fe8be81939e6349a128731fe5563b5b9891c3b6a316","packages/compiler/src/compile-types.ts":"b1cc3f82c619dda913b3766a9dd7d4a4c207ada778d08467eb901d3294dab6dc","packages/compiler/src/diagnostics/diagnostic.ts":"f6151c4b9c3ef455225d3c431b0105c26b550c466175ac7b0a8152dfa50fb9a3","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/frontend/lowering/builtins/environment.ts":"096afd3dd58d041ebea6c565b5245acb9b93a7bd8afecabca8c9a2916b241c7a","packages/compiler/src/frontend/lowering/builtins/process.ts":"c6a0ce9b6a0160cc3fca75f1be0db85f9d46ad492c63631dcebdc4cfc56bb793","packages/compiler/src/frontend/lowering/caught-value-dispatch.ts":"2b5979c747e290892e58f0af504c5916444f60231179d9d4f1d97e1a7279badb","packages/compiler/src/frontend/lowering/containers/bytes.ts":"50c15a2c8bfd0715b8791ed2abd967aad30dced0c4b5be079c87053b0a54a3c2","packages/compiler/src/frontend/lowering/expressions/binary.ts":"9afd4d2410dfcfda9eb2f8b9ac369e8126f3c670f59828c9b239534db6f23b72","packages/compiler/src/frontend/lowering/lower-calls.ts":"81a1f47b90a76649b3a1ec5eb7c6ba3fd5e0c61d047e855b5c4a933bbf855bb5","packages/compiler/src/frontend/lowering/lower-classes.ts":"261a5c3578f2591bf4dddb18e283e12fc48698d93a34c28c33ff59ec0cf07b47","packages/compiler/src/frontend/lowering/lower-event-emitter.ts":"3e73ed3697fae93d409b4b92591eb9ad87e7defadf654f396f0691080cb99a18","packages/compiler/src/frontend/lowering/lower-exprs.ts":"21912d733d3728c8c28d821951ac10d6bb686fb7ae16dc3bd2132fe9bb16e03f","packages/compiler/src/frontend/lowering/lower-functions.ts":"96d8855867decc59426dba062221d7526527478120cf3b784442c38bf18367ae","packages/compiler/src/frontend/lowering/lower-modules.ts":"e0c52ed22a75d9e686521035fd034ab4e651abe12d2a0208b77893f4c8133ffe","packages/compiler/src/frontend/lowering/lower-node-island.ts":"cf8237c7258fd533b6d591ebf07eaeffb01b1edad3f3e67176243f29d8715574","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"17a1144990227554d0018284bfc9cd443bf64c167ed983722a53a32ce857bbba","packages/compiler/src/frontend/lowering/lower-stmts.ts":"d7357f9f7384a03072e27008d9f3913fbeeead7326d44830435ff76a71a395a7","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","packages/compiler/src/ir/ir.ts":"4083cf2a5b697c98938d50fb2434b95dba8ad3135bf1aed1e9a782717817382b","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/ir/serialize.ts":"bd19a59890020c9c02969fe7e07976c4e599d194b4f700975e726b3fbf368594","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/scripts/cache-key.mjs":"a949852965733eff702f2abc164e2466684e68d4b8726f6c98d0c6883cf875c3","packages/libnode-common/scripts/verify.mjs":"051fd399d29bddc8f757213ee00d5f6c1d200755266b0ebe86b7603462de503a","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/runtime-pack-common/runtime-pack-matrix.mjs":"d1459c8f9aab092d4c1c871c301aae74ccf398ff00d8aa386b6c0201e12f4604","packages/runtime-pack-common/scripts/build.mjs":"b076e8b2825570073d96c1761626dbadf6f81811286fab3ff0be726af7c6eac3","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime-pack-common/test/runtime-pack-matrix.test.ts":"ac45ecf9691175d271c8df1080a810be1a5090f87357c9c27c280274e9ca4ac0","packages/runtime-pack-common/worker-matrix.mjs":"21170e2f737107057a34fffd68df9715cc7c70ab3c3680076d27bc830ca0bafe","packages/runtime/src/scr_async.c":"6a990cc466361828bd82bd688fc3811da23b876df223fb5d0214c496ca855198","packages/runtime/src/scr_bytes.c":"5c49016bef3e37ec3c9ccca98650bf588b2eea69bac9e0fd4f979b55d6325a94","packages/runtime/src/scr_dyn_invoke.c":"34418a247215d7a8051ba99e60b9bc36b840f94ea30fe431e762f0f39b955e3e","packages/runtime/src/scr_error.c":"217bda2be5bf907120f9c2e432af5ab71040f6e10127ae69139971dd080bf753","packages/runtime/src/scr_events.c":"0f27965c4237b688841d14df5c71e8c87c34f0c0311569f40d35208ae5cd294e","packages/runtime/src/scr_events_emitter.c":"142920cf4a797c8523ee0b92d94f66a23a43f28b9b05bc815c17ec9c16d6b87f","packages/runtime/src/scr_events_emitter.h":"dbe826175253120c9e0a922b8f3169fe2cf783efd99347c27391960490f718ab","packages/runtime/src/scr_json.c":"cb6eb34d6723a6074be1ff7f2c4e4a4e8a0cb62ace9cd0fd99f0024fcb4b11fb","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_lib.h":"83a688df501afd1115baaeff931c61bcb8973cd505acd8f59bca5a18cadafdbc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island.h":"aa94ab7b3c8899325cb77605bfb142823b7c50198d8d918e1a320ac42925d570","packages/runtime/src/scr_node_island_export.c":"ee93fa6046a8430bd6eb812058af06b6f0261a351b6e66cd13245afb66851c0d","packages/runtime/src/scr_node_island_handle.c":"4f34dc673574abd8fffd2b02ad03d12acd0378bd9364dbbba2833b8eeb886f39","packages/runtime/src/scr_node_island_host.cjs":"e853e03ceaa0ef422c7554da29d15d7f8c6bfab1c9668a837b2f8e4f68ca6913","packages/runtime/src/scr_regex.c":"a6790257bf0e56e575e18d1119fc276ff355135ceb693d2d9b3d268b5e47a1c7","packages/runtime/src/scr_regex.h":"3deb5f58aab84c525e6f6016d680d08eaac3f3f77483fa26894427ba9dd46746","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","tests/harness/node-island-handles.test.ts":"0e45acd39ec8f603d6af796198fe4dd084b0d1be134b9334e8c0ab88912558b3","tests/harness/shard.ts":"8ef5234e8fcf13672e7e1d774eaa4ff58e264c06e85be16e5f77eda5a66467bd","tests/harness/suite-lock.mjs":"78b5fd5c64f3795ac49b377e1f52faafd185134bebe391d363b07dd01fe09c31","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32"};
+          const nativeExpected = {"count":1055,"sha256":"cdf3ce274ba318d777cf6f578dd6e724fedeedca340f2df280a0c89f9533d24b"};
+          const gateSpecs = [{"id":"typed-release-plain","flavor":"plain","optimization":"release","files":["tests/harness/node-island-handles.test.ts"],"filter":"^foreign\\ Error\\ identity\\ typed\\ error\\ monitors\\ apply\\ current\\ foreign\\ Error\\ prototype\\ policy\\ in\\ release$","expectedByFile":{"tests/harness/node-island-handles.test.ts":["foreign Error identity typed error monitors apply current foreign Error prototype policy in release"]}},{"id":"typed-dev-plain","flavor":"plain","optimization":"dev","files":["tests/harness/node-island-handles.test.ts"],"filter":"^foreign\\ Error\\ identity\\ typed\\ error\\ monitors\\ apply\\ current\\ foreign\\ Error\\ prototype\\ policy\\ in\\ dev$","expectedByFile":{"tests/harness/node-island-handles.test.ts":["foreign Error identity typed error monitors apply current foreign Error prototype policy in dev"]}},{"id":"typed-release-san","flavor":"san","optimization":"release","files":["tests/harness/node-island-handles.test.ts"],"filter":"^foreign\\ Error\\ identity\\ typed\\ error\\ monitors\\ apply\\ current\\ foreign\\ Error\\ prototype\\ policy\\ in\\ release$","expectedByFile":{"tests/harness/node-island-handles.test.ts":["foreign Error identity typed error monitors apply current foreign Error prototype policy in release"]}},{"id":"typed-dev-san","flavor":"san","optimization":"dev","files":["tests/harness/node-island-handles.test.ts"],"filter":"^foreign\\ Error\\ identity\\ typed\\ error\\ monitors\\ apply\\ current\\ foreign\\ Error\\ prototype\\ policy\\ in\\ dev$","expectedByFile":{"tests/harness/node-island-handles.test.ts":["foreign Error identity typed error monitors apply current foreign Error prototype policy in dev"]}}];
+          const knownTitles = {"tests/harness/node-island-handles.test.ts":["Node island handles handles the program dropped are released","Node island handles island member calls and assignments evaluate in JavaScript's order","Node island handles requireModule() loads Node's built-in modules","Node island handles a package marked native never runs in a Node island","Node island handles a package whose fences may never run stays native","Node island handles a fence in module code makes a Node island, with the ES modules importing it","Node island handles without islands, a package's deferred refusals refuse at run time","Node island handles an island array that contradicts its declaration throws at the crossing","Node island handles an island record that contradicts its declaration throws at the crossing","Node island handles an island package ships with the program","foreign Error identity native EventEmitter rethrows an unhandled island Error unchanged","foreign Error identity computed error emits adapt fixed listeners without changing payload identity","foreign Error identity dynamic error monitors determine listener and prototype handling before unhandled throws","foreign Error identity dynamic error listeners and monitors do not materialize island Error properties","foreign Error identity returned, caught, callback and promise Errors keep their island identity","foreign Error identity Error branding and prototype membership do not read island properties","foreign Error identity checked Error conversions reject non-Error island handles","foreign Error identity released typed Error mirrors do not root island handles","foreign Error identity typed error monitors apply current foreign Error prototype policy in release","foreign Error identity typed error monitors apply current foreign Error prototype policy in dev"]};
+          const fixtureSpec = {"id":"emitter-typed-error-policy","body":"\nimport { EventEmitter, errorMonitor } from 'node:events';\nfunction reportWrapped(label: string, caught: unknown, value: Error): void {\n  const error = caught as any;\n  console.log(label, error.code, error.message, error.context === value);\n}\nconst detached = new EventEmitter();\nconst detachedValue = island.inspectable('text') as Error;\nfunction detachMonitor(error: Error): void { console.log('detach-monitor', error === detachedValue); island.detach(error); }\ndetached.on(errorMonitor, detachMonitor);\ntry { detached.emit('error', detachedValue); }\ncatch (caught) { reportWrapped('detached', caught, detachedValue); }\nconsole.log('detach-counts', island.inspectCount(), island.coercionCount());\nconst added = new EventEmitter();\nconst addedValue = island.inspectable('text') as Error;\nfunction addedListener(error: Error): void { console.log('added-listener', error === addedValue); }\nfunction addMonitor(error: Error): void { console.log('add-monitor', error === addedValue); island.detach(error); added.on('error', addedListener); }\nadded.on(errorMonitor, addMonitor);\nconsole.log('added', added.emit('error', addedValue));\nconsole.log('add-counts', island.inspectCount(), island.coercionCount());\nconst removed = new EventEmitter();\nconst removedValue = island.inspectable('text') as Error;\nfunction removedListener(error: Error): void { console.log('unexpected-listener', error === removedValue); }\nfunction removeMonitor(error: Error): void { console.log('remove-monitor', error === removedValue); removed.off('error', removedListener); island.detach(error); }\nremoved.on('error', removedListener);\nremoved.on(errorMonitor, removeMonitor);\ntry { removed.emit('error', removedValue); }\ncatch (caught) { reportWrapped('removed', caught, removedValue); }\nconsole.log('remove-counts', island.inspectCount(), island.coercionCount());\nconst throwing = new EventEmitter();\nconst throwingValue = island.inspectable('text') as Error;\nfunction throwMonitor(error: Error): void { console.log('throw-monitor', error === throwingValue); island.detach(error); throw 37; }\nfunction afterThrow(error: Error): void { console.log('unexpected-after-throw', error === throwingValue); }\nthrowing.on(errorMonitor, throwMonitor);\nthrowing.on('error', afterThrow);\ntry { throwing.emit('error', throwingValue); }\ncatch (caught) { console.log('monitor-caught', caught === 37); }\nconsole.log('throw-counts', island.inspectCount(), island.coercionCount());\nconst attached = new EventEmitter();\nconst attachedValue = island.inspectable('text') as Error;\nisland.detach(attachedValue);\nfunction attachMonitor(error: Error): void { console.log('attach-monitor', error === attachedValue); island.attach(error); }\nattached.on(errorMonitor, attachMonitor);\ntry { attached.emit('error', attachedValue); }\ncatch (caught) { console.log('attached', caught === attachedValue); }\nconsole.log('attach-counts', island.inspectCount(), island.coercionCount());\nconst inspected = new EventEmitter();\nconst inspectedValue = island.inspectable('throw-inspect') as Error;\nfunction inspectMonitor(error: Error): void { console.log('inspect-monitor', error === inspectedValue); island.detach(error); }\ninspected.on(errorMonitor, inspectMonitor);\ntry { inspected.emit('error', inspectedValue); }\ncatch (caught) { reportWrapped('inspect-fallback', caught, inspectedValue); }\nconsole.log('inspect-counts', island.inspectCount(), island.coercionCount());\nconst coerced = new EventEmitter();\nconst coercedValue = island.inspectable('throw-coerce') as Error;\nfunction coerceMonitor(error: Error): void { console.log('coerce-monitor', error === coercedValue); island.detach(error); }\ncoerced.on(errorMonitor, coerceMonitor);\ntry { coerced.emit('error', coercedValue); }\ncatch (caught) { console.log('coerce-caught', caught === 59); }\nconsole.log('coerce-counts', island.inspectCount(), island.coercionCount());\nconst native = new EventEmitter();\nconst nativeValue = new Error('native');\ntry { native.emit('error', nativeValue); }\ncatch (caught) { console.log('native-caught', caught === nativeValue); }\n","islandBase":"\nlet kept = new TypeError('same');\nexport function get() { return kept; }\nexport function fresh() { return new TypeError('same'); }\nexport function same(a, b) { return a === b; }\nexport function echo(value) { return value; }\nexport function fail() { throw kept; }\nexport function rethrow(value) { throw value; }\nexport function call(fn) { return fn(kept); }\nexport function callWith(fn, value) { return fn(value); }\nexport function callNull(fn) { return fn(null); }\nexport function fulfill() { return Promise.resolve(kept); }\nexport function reject() { return Promise.reject(kept); }\nexport function write(value) { kept.code = value; }\nexport function code() { return kept.code; }\nexport function plain() { return { name: 'TypeError', message: 'same', '%error': true }; }\nexport function prototypeOnly() { return Object.create(Error.prototype); }\nexport function detach(value) { Object.setPrototypeOf(value, null); }\nexport function attach(value) { Object.setPrototypeOf(value, Error.prototype); }\nlet reads = 0;\nexport function guarded() {\n  const value = new TypeError('guarded');\n  Object.defineProperty(value, 'name', { get() { reads++; return 'TypeError'; } });\n  Object.defineProperty(value, 'code', { get() { reads++; return 'CODE'; } });\n  return value;\n}\nexport function readCount() { return reads; }\n","islandExtra":"\nlet inspections = 0;\nlet coercions = 0;\nexport function inspectable(mode) {\n  inspections = 0;\n  coercions = 0;\n  const value = new Error('policy');\n  value[Symbol.for('nodejs.util.inspect.custom')] = () => {\n    inspections++;\n    if (mode !== 'text') throw 'inspect-stop';\n    return 'detached-sentinel';\n  };\n  value[Symbol.toPrimitive] = () => {\n    coercions++;\n    if (mode === 'throw-coerce') throw 59;\n    return 'coerced-sentinel';\n  };\n  return value;\n}\nexport function inspectCount() { return inspections; }\nexport function coercionCount() { return coercions; }\n","files":{"main.mts":"import * as island from './island.mjs';\n\nimport { EventEmitter, errorMonitor } from 'node:events';\nfunction reportWrapped(label: string, caught: unknown, value: Error): void {\n  const error = caught as any;\n  console.log(label, error.code, error.message, error.context === value);\n}\nconst detached = new EventEmitter();\nconst detachedValue = island.inspectable('text') as Error;\nfunction detachMonitor(error: Error): void { console.log('detach-monitor', error === detachedValue); island.detach(error); }\ndetached.on(errorMonitor, detachMonitor);\ntry { detached.emit('error', detachedValue); }\ncatch (caught) { reportWrapped('detached', caught, detachedValue); }\nconsole.log('detach-counts', island.inspectCount(), island.coercionCount());\nconst added = new EventEmitter();\nconst addedValue = island.inspectable('text') as Error;\nfunction addedListener(error: Error): void { console.log('added-listener', error === addedValue); }\nfunction addMonitor(error: Error): void { console.log('add-monitor', error === addedValue); island.detach(error); added.on('error', addedListener); }\nadded.on(errorMonitor, addMonitor);\nconsole.log('added', added.emit('error', addedValue));\nconsole.log('add-counts', island.inspectCount(), island.coercionCount());\nconst removed = new EventEmitter();\nconst removedValue = island.inspectable('text') as Error;\nfunction removedListener(error: Error): void { console.log('unexpected-listener', error === removedValue); }\nfunction removeMonitor(error: Error): void { console.log('remove-monitor', error === removedValue); removed.off('error', removedListener); island.detach(error); }\nremoved.on('error', removedListener);\nremoved.on(errorMonitor, removeMonitor);\ntry { removed.emit('error', removedValue); }\ncatch (caught) { reportWrapped('removed', caught, removedValue); }\nconsole.log('remove-counts', island.inspectCount(), island.coercionCount());\nconst throwing = new EventEmitter();\nconst throwingValue = island.inspectable('text') as Error;\nfunction throwMonitor(error: Error): void { console.log('throw-monitor', error === throwingValue); island.detach(error); throw 37; }\nfunction afterThrow(error: Error): void { console.log('unexpected-after-throw', error === throwingValue); }\nthrowing.on(errorMonitor, throwMonitor);\nthrowing.on('error', afterThrow);\ntry { throwing.emit('error', throwingValue); }\ncatch (caught) { console.log('monitor-caught', caught === 37); }\nconsole.log('throw-counts', island.inspectCount(), island.coercionCount());\nconst attached = new EventEmitter();\nconst attachedValue = island.inspectable('text') as Error;\nisland.detach(attachedValue);\nfunction attachMonitor(error: Error): void { console.log('attach-monitor', error === attachedValue); island.attach(error); }\nattached.on(errorMonitor, attachMonitor);\ntry { attached.emit('error', attachedValue); }\ncatch (caught) { console.log('attached', caught === attachedValue); }\nconsole.log('attach-counts', island.inspectCount(), island.coercionCount());\nconst inspected = new EventEmitter();\nconst inspectedValue = island.inspectable('throw-inspect') as Error;\nfunction inspectMonitor(error: Error): void { console.log('inspect-monitor', error === inspectedValue); island.detach(error); }\ninspected.on(errorMonitor, inspectMonitor);\ntry { inspected.emit('error', inspectedValue); }\ncatch (caught) { reportWrapped('inspect-fallback', caught, inspectedValue); }\nconsole.log('inspect-counts', island.inspectCount(), island.coercionCount());\nconst coerced = new EventEmitter();\nconst coercedValue = island.inspectable('throw-coerce') as Error;\nfunction coerceMonitor(error: Error): void { console.log('coerce-monitor', error === coercedValue); island.detach(error); }\ncoerced.on(errorMonitor, coerceMonitor);\ntry { coerced.emit('error', coercedValue); }\ncatch (caught) { console.log('coerce-caught', caught === 59); }\nconsole.log('coerce-counts', island.inspectCount(), island.coercionCount());\nconst native = new EventEmitter();\nconst nativeValue = new Error('native');\ntry { native.emit('error', nativeValue); }\ncatch (caught) { console.log('native-caught', caught === nativeValue); }\n","island.mjs":"\nlet kept = new TypeError('same');\nexport function get() { return kept; }\nexport function fresh() { return new TypeError('same'); }\nexport function same(a, b) { return a === b; }\nexport function echo(value) { return value; }\nexport function fail() { throw kept; }\nexport function rethrow(value) { throw value; }\nexport function call(fn) { return fn(kept); }\nexport function callWith(fn, value) { return fn(value); }\nexport function callNull(fn) { return fn(null); }\nexport function fulfill() { return Promise.resolve(kept); }\nexport function reject() { return Promise.reject(kept); }\nexport function write(value) { kept.code = value; }\nexport function code() { return kept.code; }\nexport function plain() { return { name: 'TypeError', message: 'same', '%error': true }; }\nexport function prototypeOnly() { return Object.create(Error.prototype); }\nexport function detach(value) { Object.setPrototypeOf(value, null); }\nexport function attach(value) { Object.setPrototypeOf(value, Error.prototype); }\nlet reads = 0;\nexport function guarded() {\n  const value = new TypeError('guarded');\n  Object.defineProperty(value, 'name', { get() { reads++; return 'TypeError'; } });\n  Object.defineProperty(value, 'code', { get() { reads++; return 'CODE'; } });\n  return value;\n}\nexport function readCount() { return reads; }\n\nlet inspections = 0;\nlet coercions = 0;\nexport function inspectable(mode) {\n  inspections = 0;\n  coercions = 0;\n  const value = new Error('policy');\n  value[Symbol.for('nodejs.util.inspect.custom')] = () => {\n    inspections++;\n    if (mode !== 'text') throw 'inspect-stop';\n    return 'detached-sentinel';\n  };\n  value[Symbol.toPrimitive] = () => {\n    coercions++;\n    if (mode === 'throw-coerce') throw 59;\n    return 'coerced-sentinel';\n  };\n  return value;\n}\nexport function inspectCount() { return inspections; }\nexport function coercionCount() { return coercions; }\n","expected-node.stdout.log":"detach-monitor true\ndetached ERR_UNHANDLED_ERROR Unhandled error. (detached-sentinel) true\ndetach-counts 1 0\nadd-monitor true\nadded-listener true\nadded true\nadd-counts 0 0\nremove-monitor true\nremoved ERR_UNHANDLED_ERROR Unhandled error. (detached-sentinel) true\nremove-counts 1 0\nthrow-monitor true\nmonitor-caught true\nthrow-counts 0 0\nattach-monitor true\nattached true\nattach-counts 0 0\ninspect-monitor true\ninspect-fallback ERR_UNHANDLED_ERROR Unhandled error. (coerced-sentinel) true\ninspect-counts 1 1\ncoerce-monitor true\ncoerce-caught true\ncoerce-counts 1 1\nnative-caught true\n","expected-native-mismatch.stdout.log":"detach-monitor true\ndetached undefined policy false\ndetach-counts 0 0\nadd-monitor true\nadded-listener true\nadded true\nadd-counts 0 0\nremove-monitor true\nremoved undefined policy false\nremove-counts 0 0\nthrow-monitor true\nmonitor-caught true\nthrow-counts 0 0\nattach-monitor true\nattached true\nattach-counts 0 0\ninspect-monitor true\ninspect-fallback undefined policy false\ninspect-counts 0 0\ncoerce-monitor true\ncoerce-caught false\ncoerce-counts 0 0\nnative-caught true\n"},"expectedNode":"detach-monitor true\ndetached ERR_UNHANDLED_ERROR Unhandled error. (detached-sentinel) true\ndetach-counts 1 0\nadd-monitor true\nadded-listener true\nadded true\nadd-counts 0 0\nremove-monitor true\nremoved ERR_UNHANDLED_ERROR Unhandled error. (detached-sentinel) true\nremove-counts 1 0\nthrow-monitor true\nmonitor-caught true\nthrow-counts 0 0\nattach-monitor true\nattached true\nattach-counts 0 0\ninspect-monitor true\ninspect-fallback ERR_UNHANDLED_ERROR Unhandled error. (coerced-sentinel) true\ninspect-counts 1 1\ncoerce-monitor true\ncoerce-caught true\ncoerce-counts 1 1\nnative-caught true\n","expectedNativeMismatch":"detach-monitor true\ndetached undefined policy false\ndetach-counts 0 0\nadd-monitor true\nadded-listener true\nadded true\nadd-counts 0 0\nremove-monitor true\nremoved undefined policy false\nremove-counts 0 0\nthrow-monitor true\nmonitor-caught true\nthrow-counts 0 0\nattach-monitor true\nattached true\nattach-counts 0 0\ninspect-monitor true\ninspect-fallback undefined policy false\ninspect-counts 0 0\ncoerce-monitor true\ncoerce-caught false\ncoerce-counts 0 0\nnative-caught true\n","mismatchStatus":"source-derived hypothesis; only lossless observed stdout can establish reproduction"};
+          const sourceDelta = {"base":"fc969f8a010359a920b2111b71188dc1c184ad34","parent":"11c61cd94c0799ad0b2bdafa87c3ba74835235f1","changedPaths":["packages/runtime-pack-common/test/runtime-pack-matrix.test.ts","tests/harness/node-island-handles.test.ts"],"baseFiles":{"packages/runtime-pack-common/test/runtime-pack-matrix.test.ts":"f3981601b83b24e668990f123d3c8eb31d734497eeb3c83d2bf5182fc0398c8d","tests/harness/node-island-handles.test.ts":"a8e1ca75c757474befd93eb1e6b9cf7051299c021396e767a80dbe9c9055b05f"},"candidateFiles":{"packages/runtime-pack-common/test/runtime-pack-matrix.test.ts":"ac45ecf9691175d271c8df1080a810be1a5090f87357c9c27c280274e9ca4ac0","tests/harness/node-island-handles.test.ts":"0e45acd39ec8f603d6af796198fe4dd084b0d1be134b9334e8c0ab88912558b3"},"baseTreeSha256":"5a018057bf61f4ad8f6b98c2c2051e6d58830777f69ba95a0ba9df05ef89cc4f","binaryDiffSha256":"173ea871a3c5e415dd9ac26709805d78d35ea0b4a807a2b9300ea3d65a9145e0"};
+          const assertionAdmission = {"file":"tests/harness/node-island-handles.test.ts","line":379,"messagePrefix":"AssertionError: native stdout ","assertion":"expect(native.stdout, `native stdout ${JSON.stringify(native.stdout)}`).toBe(node.stdout);","function":"foreignErrorParity","evidence":"The frozen helper reaches this assertion only after successful compilation, authored typed emitter IR and sole-island admission, a fresh Node oracle with exact stdout and empty stderr, ordinary native exit, and canonical-only native stderr."};
           const sourceFiles = Object.keys(sourcePins);
           const digest = bytes => createHash("sha256").update(bytes).digest("hex");
           const hash = path => digest(readFileSync(path));
@@ -172,20 +175,27 @@ jobs:
             assert.deepEqual(json(join(work, "owner.json")), owner);
           }
           function source() {
-            assert.equal(head, "fc969f8a010359a920b2111b71188dc1c184ad34"); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(head, "ad0aa8c88262c11b1353922068db77eed8599c52"); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
             assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
             const tree = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]);
-            assert.equal(digest(tree), "5a018057bf61f4ad8f6b98c2c2051e6d58830777f69ba95a0ba9df05ef89cc4f");
-            assert.equal(capture("git", ["rev-parse", "HEAD^"]), sourceDelta.parent);
-            assert.equal(capture("git", ["diff", "--name-only", sourceDelta.parent, "HEAD"]), sourceDelta.path);
-            const diff=spawnSync("git",["diff","--binary","--full-index","--no-ext-diff","--no-textconv","--no-color","--no-renames","--unified=3","--diff-algorithm=myers","--src-prefix=a/","--dst-prefix=b/",sourceDelta.parent,"HEAD"],{cwd:root,timeout:30000,maxBuffer:CAP});
+            assert.equal(digest(tree), "e9b4cda4edb8d8ab4e4f64b74c2eb036db7d0689b973c0d134b37fad29b78280");
+            assert.equal(capture("git",["rev-parse","HEAD^"]),sourceDelta.parent);
+            assert.equal(capture("git",["rev-parse","HEAD^^"]),sourceDelta.base);
+            assert.deepEqual(capture("git",["diff","--name-only",sourceDelta.base,"HEAD"]).split("\n"),sourceDelta.changedPaths);
+            const baseTree=capture("git",["ls-tree","-r","--full-tree",sourceDelta.base]);
+            assert.equal(digest(baseTree),sourceDelta.baseTreeSha256);
+            const unchanged=value=>value.split("\n").filter(row=>!sourceDelta.changedPaths.includes(row.split("\t")[1]));
+            assert.deepEqual(unchanged(tree),unchanged(baseTree),"production/native and all other test inputs must be identical to the frozen base");
+            const diff=spawnSync("git",["diff","--binary","--full-index","--no-ext-diff","--no-textconv","--no-color","--no-renames","--unified=3","--diff-algorithm=myers","--src-prefix=a/","--dst-prefix=b/",sourceDelta.base,"HEAD"],{cwd:root,timeout:30000,maxBuffer:CAP});
             assert.equal(diff.error,undefined);assert.equal(diff.status,0);assert.equal(digest(diff.stdout),sourceDelta.binaryDiffSha256);
-            const original=spawnSync("git",["show",sourceDelta.parent+":"+sourceDelta.path],{cwd:root,timeout:30000,maxBuffer:CAP});
-            assert.equal(original.error,undefined);assert.equal(original.status,0);assert.equal(digest(original.stdout),sourceDelta.beforeSha256);
-            assert.equal(hash(join(root,sourceDelta.path)),sourceDelta.afterSha256);
+            for(const path of sourceDelta.changedPaths){
+              const baseFile=spawnSync("git",["show",sourceDelta.base+":"+path],{cwd:root,timeout:30000,maxBuffer:CAP});
+              assert.equal(baseFile.error,undefined);assert.equal(baseFile.status,0);assert.equal(digest(baseFile.stdout),sourceDelta.baseFiles[path]);
+              assert.equal(hash(join(root,path)),sourceDelta.candidateFiles[path]);
+            }
             const pins = Object.fromEntries(sourceFiles.map(path => [path, hash(join(root, path))]));
             assert.deepEqual(pins, sourcePins);
-            return { head, clean: true, treeSha256: digest(tree), files: pins, allOtherTrackedFilesUnchanged:true };
+            return { head, clean: true, treeSha256: digest(tree), files: pins };
           }
           function nativeInputs() {
             const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
@@ -204,7 +214,10 @@ jobs:
               assert.ok(info.isFile()); return [{ path: name, bytes: info.size, sha256: hash(path) }];
             });
           }
-
+          function nativeFiles(target) {
+            return ["packages/llvm-" + target + "/bin", "packages/runtime-" + target + "/artifacts"].flatMap(path => files(join(root, path)).map(row => ({ ...row, path: path + "/" + row.path })))
+              .concat([{ path: "packages/runtime-" + target + "/runtime-pack.json", sha256: hash(join(root, "packages/runtime-" + target + "/runtime-pack.json")) }]);
+          }
           function tool(command, args = ["--version"]) {
             const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
             const result = spawnSync(command, args, { encoding: "utf8", timeout: 30000, maxBuffer: CAP });
@@ -212,7 +225,14 @@ jobs:
             return { path, sha256: hash(path), version: (result.stdout + result.stderr).trim() };
           }
           function tools() {
-            return { node: tool(process.execPath), pnpm: tool("pnpm"), clang: tool("clang"), ld: tool("ld"), nm: tool("nm"), llvm: tool("llvm-config"), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+            const common = { node: tool(process.execPath), pnpm: tool("pnpm"), clang: tool("clang"), ld: tool("ld", process.platform === "darwin" ? ["-v"] : ["--version"]), nm: tool("nm") };
+            if (process.platform === "darwin") {
+              const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+              return { ...common, dsymutil: tool("dsymutil"), dwarfdump: tool("dwarfdump"), lldb: tool("lldb"),
+                sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]), settingsSha256: hash(join(sdk, "SDKSettings.json")) },
+                xcode: capture("xcodebuild", ["-version"]), developer: capture("xcode-select", ["-p"]), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+            }
+            return { ...common, llvm: tool("llvm-config", ["--version"]), zig: tool("zig", ["version"]), cxx: tool("g++"), strip: tool("strip"), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
           }
           function makeEnvironment(id, sanitize) {
             const dir = join(work, id); mkdirSync(dir, { mode: 0o700 });
@@ -351,188 +371,198 @@ jobs:
           }
           function retain(path, name) { const to = join(out, name); copyFileSync(path, to); return record(to); }
           function readOutput(step, stream) { return readFileSync(join(out, step[stream].path), "utf8"); }
+          const harnessLink = join(root, "node_modules/.cache/scriptc-tests");
           function scrub(value) {
             let text=String(value);
             for(const [path,label] of [[work,"<work>"],[root,"<source>"],[process.env.RUNNER_TEMP,"<runner-temp>"]])text=text.split(path).join(label);
             return text;
           }
-          function expectedGate(spec) { return spec.expectedByFile; }
           function verifyGateData(spec,data,collection) {
-            const expected=expectedGate(spec), key=(file,name)=>file+"\u0000"+name;
+            const key=(file,name)=>file+"\u0000"+name;
             const fileOf=value=>{const matches=spec.files.filter(file=>value===file||value.endsWith("/"+file));assert.equal(matches.length,1,"unexpected test file");return matches[0];};
             assert.ok(Array.isArray(data.testResults));assert.ok(Array.isArray(collection));
-            const expectedKeys=Object.entries(expected).flatMap(([file,names])=>names.map(name=>key(file,name))).sort();
-            const rows=data.testResults.flatMap(suite=>{assert.equal(suite.message,"");return suite.assertionResults.map(row=>{
-              assert.ok(Array.isArray(row.ancestorTitles)&&typeof row.title==="string");
-              assert.equal(row.fullName,[...row.ancestorTitles,row.title].join(" "));
-              return {file:fileOf(suite.name),name:row.fullName,title:row.title,ancestors:row.ancestorTitles,status:row.status};
-            });});
+            const expectedKeys=Object.entries(spec.expectedByFile).flatMap(([file,names])=>names.map(name=>key(file,name))).sort();
+            const rows=data.testResults.flatMap(suite=>{
+              assert.equal(suite.message,"");
+              return suite.assertionResults.map(row=>{
+                assert.ok(Array.isArray(row.ancestorTitles)&&typeof row.title==="string");
+                assert.equal(row.fullName,[...row.ancestorTitles,row.title].join(" "));
+                assert.ok(Array.isArray(row.failureMessages));
+                return {file:fileOf(suite.name),name:row.fullName,title:row.title,ancestors:row.ancestorTitles,status:row.status,failureMessages:row.failureMessages};
+              });
+            });
             assert.equal(new Set(rows.map(row=>key(row.file,row.name))).size,rows.length,"duplicate test result");
-            assert.deepEqual([...new Set(data.testResults.map(suite=>fileOf(suite.name)))].sort(),[...spec.files].sort());
-            for(const file of spec.files){
-              const known=knownTitles[file];
-              assert.deepEqual(rows.filter(row=>row.file===file).map(row=>row.name).sort(),[...known].sort(),"frozen complete registration inventory differs");
-            }
+            assert.deepEqual(data.testResults.map(suite=>fileOf(suite.name)).sort(),[...spec.files].sort());
+            for(const file of spec.files)assert.deepEqual(rows.filter(row=>row.file===file).map(row=>row.name).sort(),[...knownTitles[file]].sort(),"frozen complete registration inventory differs");
             const selected=rows.filter(row=>expectedKeys.includes(key(row.file,row.name)));
-            assert.deepEqual(selected.map(row=>key(row.file,row.name)).sort(),expectedKeys,"missing selected test");
-            assert.ok(selected.every(row=>row.status==="passed"),"selected test skipped or failed");
-            assert.ok(rows.filter(row=>!expectedKeys.includes(key(row.file,row.name))).every(row=>["pending","skipped"].includes(row.status)),"unexpected executed test");
-            const selectedCollected=selected.map(row=>key(row.file,[...row.ancestors,row.title].join(" > "))).sort();
+            assert.equal(selected.length,1);assert.deepEqual(selected.map(row=>key(row.file,row.name)).sort(),expectedKeys,"missing selected test");
+            const unselected=rows.filter(row=>!expectedKeys.includes(key(row.file,row.name)));
+            assert.ok(unselected.every(row=>["pending","skipped"].includes(row.status)&&row.failureMessages.length===0),"unexpected executed test");
             const inventory=collection.map(row=>key(fileOf(row.file),row.name)).sort();
-            assert.equal(new Set(inventory).size,inventory.length);assert.deepEqual(inventory,selectedCollected,"collected selected inventory mismatch");
-            assert.equal(data.success,true);assert.equal(data.numFailedTests,0);assert.equal(data.numFailedTestSuites,0);
-            assert.equal(data.numPassedTests,selected.length);assert.equal(data.numTotalTests,rows.length);assert.equal(data.numPendingTests,rows.length-selected.length);assert.equal(data.numTodoTests,0);
-            return {selected,selectedCount:selected.length,unselectedCount:rows.length-selected.length,completeRegisteredCount:rows.length};
+            assert.equal(new Set(inventory).size,inventory.length);assert.deepEqual(inventory,selected.map(row=>key(row.file,[...row.ancestors,row.title].join(" > "))).sort(),"collected selected inventory mismatch");
+            assert.equal(data.numTotalTests,rows.length);assert.equal(data.numPendingTests,unselected.length);assert.equal(data.numTodoTests,0);assert.equal(data.numPendingTestSuites,0);
+            const result=selected[0];let observation,observedStdout;
+            if(result.status==="passed"){
+              assert.equal(result.failureMessages.length,0);assert.equal(data.success,true);assert.equal(data.numFailedTests,0);assert.equal(data.numFailedTestSuites,0);assert.equal(data.numPassedTests,1);
+              assert.equal(data.testResults[0].status,"passed");
+              observation="unexpected-parity-pass";observedStdout=fixtureSpec.expectedNode;
+            }else{
+              assert.equal(result.status,"failed","selected test did not execute");assert.equal(data.success,false);assert.equal(data.numFailedTests,1);assert.equal(data.numPassedTests,0);
+              // The failed test's file and enclosing describe are the two failed suites in Vitest 3.2.7.
+              assert.equal(data.numFailedTestSuites,2);assert.equal(data.testResults[0].status,"failed");
+              assert.equal(result.failureMessages.length,1);
+              const lines=result.failureMessages[0].split("\n");assert.ok(lines[0].startsWith(assertionAdmission.messagePrefix),"not the named native stdout assertion");
+              const payload=/^("(?:[^"\\]|\\.)*")(: expected .* to be .* \/\/ Object\.is equality)$/.exec(lines[0].slice(assertionAdmission.messagePrefix.length));
+              assert.ok(payload,"missing lossless native stdout JSON");const actualStdout=JSON.parse(payload[1]);observedStdout=actualStdout;
+              assert.equal(actualStdout,fixtureSpec.expectedNativeMismatch,"unexpected native stdout; not the frozen baseline mismatch");
+              const site=new RegExp("^\\s+at (?:async )?foreignErrorParity \\((?:file://)?[^\\n]*"+escape(assertionAdmission.file)+":"+assertionAdmission.line+":[0-9]+\\)$");
+              assert.equal(lines.filter(line=>site.test(line)).length,1,"missing exact native stdout assertion site");
+              assert.ok(lines.slice(1).every(line=>line===""||/^\s+at /.test(line)),"unexpected assertion payload");
+              observation="reproduced-typed-policy-mismatch";
+            }
+            return {observation,selected,selectedCount:1,unselectedCount:unselected.length,completeRegisteredCount:rows.length,
+              oracle:{stdout:fixtureSpec.expectedNode,stderr:"",evidence:"frozen sequential harness assertions"},
+              native:{stdout:observedStdout,normalizedStderr:"",ordinaryExit:true,evidence:"promisified execFile resolved before the admitted assertion"},
+              compileAndIrAdmitted:true};
           }
-          async function gate(spec) {
-            const env={...makeEnvironment(spec.id,spec.flavor==="san"),ASAN_OPTIONS:"detect_leaks=1",UBSAN_OPTIONS:"halt_on_error=1"};
-            const args=[...spec.files,...(spec.filter?["-t",spec.filter]:[])];
+          async function gate(spec,packRoot) {
+            const env={...makeEnvironment(spec.id,spec.flavor==="san"),SCRIPTC_LIBNODE:packRoot,ASAN_OPTIONS:"detect_leaks=0"};
+            const args=[...spec.files,"-t",spec.filter];
             const collection=join(out,spec.id+".collection.json"),result=join(out,spec.id+".tests.json");
-            const row={id:spec.id,flavor:spec.flavor,passed:false};
+            const row={id:spec.id,flavor:spec.flavor,optimization:spec.optimization,complete:false};
             try{
               row.collect=await run(spec.id+"-collect","pnpm",["exec","vitest","list",...args,"--json="+collection],180,env);requireSuccess(row.collect);
               row.collection=record(collection);
               row.execute=await run(spec.id+"-test","pnpm",["test",...args,"--reporter=json","--outputFile="+result],600,env);
               if(existsSync(result))row.result=record(result);
-              requireSuccess(row.execute);
+              assert.ok([0,1].includes(row.execute.code));requireSuccess({...row.execute,code:0});
               for(const stream of ["stdout","stderr"])assert.doesNotMatch(readOutput(row.execute,stream),/Unhandled (?:Errors?|Rejection|Exception)|AddressSanitizer:|LeakSanitizer:|runtime error:|UndefinedBehaviorSanitizer/);
-              row.inventory=verifyGateData(spec,json(result),json(collection));row.passed=true;
-            }catch(error){row.error=scrub(error.stack??error);}
+              row.inventory=verifyGateData(spec,json(result),json(collection));
+              assert.equal(row.execute.code,row.inventory.observation==="reproduced-typed-policy-mismatch"?1:0);
+              row.complete=true;row.observation=row.inventory.observation;
+            }catch(error){row.error=scrub(error.stack??error);row.observation="incomplete";}
             return row;
           }
-          function retainOwner() {
-            return {ownerHarness:retain(join(root,"packages/runtime/src/scr_events_emitter.test.ts"),"scr_events_emitter.test.ts"),ownerTest:retain(join(root,"packages/runtime/src/scr_events_emitter.test.c"),"scr_events_emitter.test.c"),listenerUnit:retain(join(root,"packages/runtime/src/scr_dyn_handle.c"),"scr_dyn_handle.c")};
-          }
-          async function cSources() {
-            const {EXECUTABLE_RUNTIME_SOURCES}=await import(pathToFileURL(join(root,"packages/compiler/dist/backend/native-toolchain.js")));
-            assert.equal(EXECUTABLE_RUNTIME_SOURCES.length,40);
-            const sources=["scr_events_emitter.test.c","scr_events_emitter.c","scr_dyn_handle.c",...EXECUTABLE_RUNTIME_SOURCES];
-            assert.equal(sources.length,43);assert.equal(new Set(sources).size,43);
-            const recipe=readFileSync(join(root,"packages/runtime/src/scr_events_emitter.test.ts"),"utf8");
-            for(const file of sources.slice(0,3))assert.equal(recipe.split('join(import.meta.dirname, "'+file+'")').length,2);
-            assert.equal(recipe.split("...EXECUTABLE_RUNTIME_SOURCES.map((name) => join(import.meta.dirname, name))").length,2);
-            return sources.map(path=>({path:"packages/runtime/src/"+path,sha256:hash(join(root,"packages/runtime/src",path))}));
-          }
-          function restoreMutation() {
-            const receipt=join(work,"mutation.json");if(!existsSync(receipt))return {needed:false};
-            assert.ok(allDrained(),"refuse source restore while owned processes may live");
-            const journal=json(receipt);assert.deepEqual(journal.owner,owner);assert.deepEqual(journal.spec,mutationSpec);
-            const backup=join(work,"scr_events_emitter.original.c"),target=join(root,mutationSpec.path);
-            assert.equal(hash(backup),mutationSpec.originalSha256);
-            const current=hash(target);assert.ok([mutationSpec.originalSha256,mutationSpec.mutatedSha256].includes(current),"unknown mutation bytes; retain scratch");
-            if(current===mutationSpec.mutatedSha256)copyFileSync(backup,target);
-            assert.equal(hash(target),mutationSpec.originalSha256);const readback=source();
-            const value={needed:true,restored:true,beforeSha256:current,afterSha256:hash(target),source:readback};save("mutation-restored.json",value);return value;
-          }
-          function mutationFailure(step,stdout,stderr) {
-            assert.equal(step.code,null);assert.equal(step.signal,"SIGABRT");requireSuccess({...step,code:0,signal:null});
-            assert.equal(stdout,"");
-            const pattern=new RegExp("^emitter-monitor-mutated: [^\\n]*"+escape(assertionAdmission.path)+":"+assertionAdmission.line+": (?:int )?main(?:\\(void\\))?: Assertion [`']"+escape(assertionAdmission.expression)+"' failed\\.\\n$");
-            assert.match(stderr,pattern,"not the exact direct-monitor owner assertion");
-            return {kind:mutationSpec.id,assertion:assertionAdmission,signal:step.signal,stderrSha256:digest(stderr),compileRequired:true};
-          }
-          async function mutation() {
-            const row={id:mutationSpec.id,passed:false,sanitize:true,apiPreserved:true};
-            try{
-              assert.ok(allDrained());source();
-              const target=join(root,mutationSpec.path),original=readFileSync(target,"utf8");
-              assert.equal(digest(original),mutationSpec.originalSha256);assert.equal(original.split(mutationSpec.before).length,2);
-              const changed=original.replace(mutationSpec.before,mutationSpec.after);assert.equal(digest(changed),mutationSpec.mutatedSha256);
-              copyFileSync(target,join(work,"scr_events_emitter.original.c"));
-              writeFileSync(join(work,"mutation.json"),JSON.stringify({owner,spec:mutationSpec}),{flag:"wx"});
-              writeFileSync(target,changed);assert.equal(hash(target),mutationSpec.mutatedSha256);
-              row.source={path:mutationSpec.path,originalSha256:mutationSpec.originalSha256,mutatedSha256:hash(target)};
-              const sources=await cSources();
-              const binary=join(work,"emitter-monitor-mutated");
-              const args=["-std=c11","-O1","-Wall","-Wextra","-Wno-deprecated-declarations","-pthread","-fsanitize=address,undefined","-DSCR_RC_AUDIT","-D_GNU_SOURCE",
-                ...sources.map(row=>join(root,row.path)),"-lm","-o",binary];
-              const env={...makeEnvironment("mutation-cache",true),ASAN_OPTIONS:"detect_leaks=1",UBSAN_OPTIONS:"halt_on_error=1"};
-              row.command={command:"clang",args,sanitize:true,sourceRuntimeRequired:true,translationUnits:sources,recipe:"packages/runtime/src/scr_events_emitter.test.ts",recipeSha256:sourcePins["packages/runtime/src/scr_events_emitter.test.ts"]};
-              row.compile=await run("mutation-compile","clang",args,180,env);requireSuccess(row.compile);
-              assert.deepEqual(readFileSync(binary).subarray(0,4),Buffer.from([127,69,76,70]));row.binary={bytes:statSync(binary).size,sha256:hash(binary)};
-              row.execution=await run("mutation-execute",binary,[],30,env);
-              row.witness=mutationFailure(row.execution,readOutput(row.execution,"stdout"),readOutput(row.execution,"stderr"));
-              assert.equal(hash(binary),row.binary.sha256);assert.equal(hash(target),mutationSpec.mutatedSha256);row.passed=true;
-            }catch(error){row.error=scrub(error.stack??error);}
-            finally{try{row.restoration=restoreMutation();assert.equal(row.restoration.restored,true);}catch(error){row.passed=false;row.restoreError=scrub(error.stack??error);}}
-            return row;
+          function retainFixture() {
+            const path=assertionAdmission.file,text=readFileSync(join(root,path),"utf8");
+            assert.ok(text.includes("const foreignErrorModule = `"+fixtureSpec.islandBase+"`;"));
+            assert.ok(text.includes("`emitter-typed-error-policy-${optimization}`,\n        `"+fixtureSpec.body+"`,\n        (entry, binary)"));
+            assert.equal(fixtureSpec.files["main.mts"],"import * as island from './island.mjs';\n"+fixtureSpec.body);
+            assert.equal(fixtureSpec.files["island.mjs"],fixtureSpec.islandBase+fixtureSpec.islandExtra);
+            assert.ok(text.includes("islandSource: `${foreignErrorModule}"+fixtureSpec.islandExtra+"`,"));
+            assert.ok(text.includes(JSON.stringify(fixtureSpec.expectedNode)));
+            assert.ok(text.includes('test.each(["release", "dev"] as const)'));
+            assert.equal(text.split("\n")[assertionAdmission.line-1].trim(),assertionAdmission.assertion);
+            const retained=join(out,"fixture");mkdirSync(retained);
+            for(const [path,bytes] of Object.entries(fixtureSpec.files))writeFileSync(join(retained,path),bytes,{flag:"wx"});
+            return {origin:{source:head,file:path,sha256:sourcePins[path]},files:files(retained),expectedNode:fixtureSpec.expectedNode,expectedNativeMismatch:fixtureSpec.expectedNativeMismatch,mismatchStatus:fixtureSpec.mismatchStatus,assertionAdmission,
+              harness:retain(join(root,path),"node-island-handles.test.ts")};
           }
           async function main() {
             delete process.env.FORCE_COLOR;
             const report=json(join(out,"summary.json"));verifyWorkOwner();let verifyInputs;
             try{
-              assert.deepEqual(source(),report.sourceBefore);report.nativeInputs=nativeInputs();report.toolsBefore=tools();report.installedLockSha256=hash("node_modules/.pnpm/lock.yaml");
-              assert.equal(process.version,"v24.22.1");assert.equal(report.toolsBefore.pnpm.version,"11.1.3");assert.equal(report.toolsBefore.llvm.version,"22.1.8");assert.match(report.toolsBefore.clang.version,/\bclang version 22\.1\.8\b/);
-              const changedTs=["packages/runtime/src/scr_events_emitter.test.ts"];
+              assert.deepEqual(source(),report.sourceBefore);report.nativeInputs=nativeInputs();
+              report.nativeBefore=nativeFiles("linux-x64-gnu");report.toolsBefore=tools();report.installedLockSha256=hash("node_modules/.pnpm/lock.yaml");
+              assert.equal(process.version,"v24.22.1");assert.equal(report.toolsBefore.pnpm.version,"11.1.3");assert.equal(report.toolsBefore.llvm.version,"22.1.8");assert.equal(report.toolsBefore.zig.version,"0.16.0");
+              report.helper=JSON.parse(capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen",["version","--format=json"]));
+              assert.equal(report.helper.ok,true);assert.equal(report.helper.protocol_version,"1");assert.equal(report.helper.llvm_version,"22.1.8");
+              assert.equal(report.helper.scriptc_package_version,json("packages/llvm-linux-x64-gnu/package.json").version);
+              report.runtimeManifest=retain("packages/runtime-linux-x64-gnu/runtime-pack.json","runtime-pack.json");
+              const runtimeManifest=json("packages/runtime-linux-x64-gnu/runtime-pack.json");
+              report.emitterPackEvidence=["release","dev"].map(optimization=>{
+                const flavor=runtimeManifest.flavors[optimization];assert.equal(flavor.optimization,optimization==="release"?"-O2":"-O0");
+                const units=flavor.runtime_units.filter(unit=>unit.source==="scr_events_emitter.c");assert.equal(units.length,1);
+                const variants=units[0].variants,defaults=variants.filter(variant=>variant.id==="default");assert.equal(defaults.length,1);
+                assert.ok(variants.every(variant=>!variant.defines.includes("SCR_NODE_ISLANDS")),"baseline emitter unexpectedly has an island variant");
+                const variant=defaults[0],artifact=report.nativeBefore.find(row=>row.path==="packages/runtime-linux-x64-gnu/"+variant.path);
+                assert.ok(artifact);assert.equal(artifact.sha256,variant.sha256);assert.equal(artifact.bytes,variant.size);
+                return {optimization,variants,defaultArtifact:artifact,plainSelection:"source-derived default variant for nodeIsland=true/workers=false; no executed link command receipt",sanSelection:"source-derived external compilation with SCR_NODE_ISLANDS; no executed C command receipt"};
+              });
+              const changedTs=sourceDelta.changedPaths;
               report.format=await run("format","pnpm",["exec","oxfmt","--check",...changedTs],180,makeEnvironment("format",false));requireSuccess(report.format);
               report.lint=await run("lint","pnpm",["exec","oxlint","--deny-warnings",...changedTs],180,makeEnvironment("lint",false));requireSuccess(report.lint);
               report.build=await run("workspace-build","pnpm",["build"],600,makeEnvironment("build",false));requireSuccess(report.build);
+              assert.deepEqual(nativeFiles("linux-x64-gnu"),report.nativeBefore);
               report.distBefore=["packages/compiler/dist","packages/cli/dist"].flatMap(path=>files(join(root,path)).map(row=>({...row,path:path+"/"+row.path})));
-              report.translationUnits=await cSources();report.retainedOwner=retainOwner();
+              const {readLibnodePack}=await import(pathToFileURL(join(root,"packages/compiler/dist/node-islands/libnode-pack.js")));
+              const packRoot=join(work,"libnode");assert.equal(existsSync(packRoot),false);
+              report.libnodeFetch=await run("libnode-fetch",process.execPath,["packages/libnode-common/fetch-dev-pack.mjs","--out",packRoot],600,makeEnvironment("libnode-fetch",false));requireSuccess(report.libnodeFetch);
+              const pack=readLibnodePack(packRoot,{verifyHashes:true});assert.equal(pack.manifest.nodeVersion,"24.22.1");assert.equal(pack.manifest.bridgeAbi,10);assert.equal(pack.manifest.platform,"linux");assert.equal(pack.manifest.arch,"x64");
+              report.libnode={manifest:pack.manifest,manifestFile:retain(join(packRoot,"manifest.json"),"libnode-manifest.json"),files:files(packRoot),route:"explicit checksum-pinned Node 24.22.1 development pack with this source bridge",developmentPin:sourcePins["packages/libnode-common/dev-pack.json"]};
+              process.env.SCRIPTC_LIBNODE=packRoot;
+              report.fixture=retainFixture();
+              const cacheParent=join(root,"node_modules/.cache");mkdirSync(cacheParent,{recursive:true});
+              assert.equal(existsSync(harnessLink),false);try{lstatSync(harnessLink);assert.fail("existing harness link");}catch(error){if(error.code!=="ENOENT")throw error;}
+              const harnessOutput=join(work,"harness-output");mkdirSync(harnessOutput,{mode:0o700});symlinkSync(harnessOutput,harnessLink);report.harnessLinkCreated=true;save("summary.json",report);
               verifyInputs=async()=>{
-                assert.deepEqual(nativeInputs(),report.nativeInputs);assert.deepEqual(await cSources(),report.translationUnits);
+                requireSuccess(await run("verify-runtime-after",process.execPath,["packages/runtime-linux-x64-gnu/scripts/verify.mjs"],120));
+                assert.deepEqual(nativeFiles("linux-x64-gnu"),report.nativeBefore);assert.deepEqual(nativeInputs(),report.nativeInputs);
+                assert.deepEqual(readLibnodePack(packRoot,{verifyHashes:true}).manifest,pack.manifest);assert.deepEqual(files(packRoot),report.libnode.files);
                 assert.deepEqual(["packages/compiler/dist","packages/cli/dist"].flatMap(path=>files(join(root,path)).map(row=>({...row,path:path+"/"+row.path}))),report.distBefore);
                 assert.equal(hash("node_modules/.pnpm/lock.yaml"),report.installedLockSha256);assert.deepEqual(tools(),report.toolsBefore);
-                assert.deepEqual(source(),report.sourceBefore);report.inputsVerifiedAfter=true;
+                assert.deepEqual(files(join(out,"fixture")),report.fixture.files);assert.deepEqual(source(),report.sourceBefore);report.inputsVerifiedAfter=true;
               };
               const capacity=join(process.env.RUNNER_TEMP,process.env.PROOF_CAPACITY_NAME,"capacity.py");assert.equal(hash(capacity),"13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");requireSuccess(await run("pre-proof-capacity","python3",[capacity,"pre-proof"],60));
-              for(const spec of gateSpecs){report.gates.push(await gate(spec));save("summary.json",report);assert.ok(allDrained(),"test custody unresolved");}
-              report.selectedExecutions=report.gates.reduce((n,row)=>n+(row.inventory?.selectedCount??0),0);
-              assert.equal(report.gates.length,2);assert.equal(report.selectedExecutions,2);assert.ok(report.gates.every(row=>row.passed),"direct owner positive gate failed");
-              report.mutation=await mutation();save("summary.json",report);assert.equal(report.mutation.passed,true,"direct-monitor negative proof failed");
-              report.preCleanupComplete=true;
+              for(const spec of gateSpecs){report.gates.push(await gate(spec,packRoot));save("summary.json",report);assert.ok(allDrained(),"test custody unresolved");}
+              report.selectedExecutions=report.gates.filter(row=>row.complete).length;
+              report.preCleanupComplete=report.gates.length===4&&report.gates.every(row=>row.complete);
+              report.reproducedCells=report.gates.filter(row=>row.observation==="reproduced-typed-policy-mismatch").map(row=>({id:row.id,flavor:row.flavor,optimization:row.optimization}));
+              report.unexpectedPassCells=report.gates.filter(row=>row.observation==="unexpected-parity-pass").map(row=>({id:row.id,flavor:row.flavor,optimization:row.optimization}));
             }catch(error){report.error=scrub(error.stack??error);}
             finally{
-              try{report.restoration=restoreMutation();assert.ok(verifyInputs,"preparation did not complete");await verifyInputs();report.sourceAfter=source();}catch(error){report.readbackError=scrub(error.stack??error);}
+              try{assert.ok(verifyInputs,"preparation did not complete");await verifyInputs();report.sourceAfter=source();}catch(error){report.readbackError=scrub(error.stack??error);}
               save("summary.json",report);
             }
-            assert.equal(report.preCleanupComplete,true,"direct owner supplement incomplete");assert.equal(report.inputsVerifiedAfter,true);
+            assert.equal(report.preCleanupComplete,true,"emitter diagnostic incomplete");assert.equal(report.inputsVerifiedAfter,true);
+            assert.equal(report.reproducedCells.length,0,"typed emitter prototype policy mismatch reproduced");
           }
           function initialize(){
-            assert.equal(head,"fc969f8a010359a920b2111b71188dc1c184ad34");assert.equal(process.platform,"linux");assert.equal(process.arch,"x64");assert.equal(process.version,"v24.22.1");
+            assert.equal(head,"ad0aa8c88262c11b1353922068db77eed8599c52");assert.equal(process.platform,"linux");assert.equal(process.arch,"x64");assert.equal(process.version,"v24.22.1");
             mkdirSync(work,{mode:0o700});writeFileSync(join(work,"owner.json"),JSON.stringify(owner),{flag:"wx",mode:0o600});mkdirSync(out,{mode:0o700});copyFileSync(self,join(out,"runner.mjs"));
-            save("summary.json",{schemaVersion:1,...owner,runnerSha256:hash(self),sourceBefore:source(),sourceDelta,historicalFocusedEvidence,
-              scope:{selectedTests:2,gates:2,directOwnerTests:2,flavors:["plain","san"],translationUnits:43,baseRuntimeUnits:40,optionalRuntimeUnits:2,mutations:1,baselineReplays:0,repeatedHistoricalPositiveRows:0},
-              limitations:["Supplement only: two direct-C positive rows and one SAN direct-monitor hook mutation. The authenticated 48 historical passing rows belong to e79 and are reference pins, not executions of this child head.","The only source difference from e79 is the test recipe adding the canonical scr_dyn_handle.c unit. Production and C assertion bytes are unchanged; all other tracked paths are machine-checked equal.","C compilation uses Clang22 and 40 canonical base units plus emitter and dynamic-listener support, with the actual C owner test. There is no runtime-pack, LLVM-helper or libnode build/reuse claim. SAN adds ASan, UBSan and SCR_RC_AUDIT, with leak checks enabled.","The positive wrapper requires successful compile, ordinary execution, exact stdout and empty stderr. One API-preserving SAN mutation removes only direct-monitor hook installation; successful compile and exact line35 SIGABRT owner assertion are mandatory. Link, sanitizer, timeout or other crash errors do not count.","This supplement cannot independently claim the original 50-row result, full qualification, binary-linkage zero cost, performance, adoption or wider NI8/ABI coverage. Coordinator reconciliation must preserve source and result identities."],
-              gates:[],supplementalProofComplete:false,fullQualification:false,zeroCostQualification:false,productionAdoption:false});
+            save("summary.json",{schemaVersion:1,...owner,runnerSha256:hash(self),sourceBefore:source(),sourceDelta,scope:{selectedTests:4,gates:4,freshNodeOracles:4,flavors:["plain","san"],optimizations:["release","dev"],productionMutation:false,matrixTestExecuted:false},
+              limitations:["Four fresh typed emitter baseline cells only: plain/SAN times explicitly selected release/dev. The matrix unit is separate and excluded; no prior sibling, C, mutation or settled identity campaign is replayed.","A reproduced mismatch requires lossless explicit native stdout JSON equal to the frozen source-derived hypothesis plus the exact assertion site, after successful compile, authored emitter.emitError/%Error and sole-island admission, fresh Node parity, ordinary native exit and stderr validation. Other failures remain incomplete.","The harness owns Node/native children and removes its temporary fixture. The raw evidence is complete outer process streams, Vitest results, the lossless assertion payload and immutable fixture bytes; independent child command or IR files are not retained.","Plain release/dev runtime-pack selection versus SAN source compilation follows pinned compiler source. Real runtime manifests/artifacts are hashed before/after; selected object paths and SAN compiler argv are source-derived, not observed command receipts.","Unexpected parity passes are reported separately. Diagnostic completion never means runtime qualification, repair acceptance, full zero-cost or production adoption.","All production inputs equal frozen fc969; only two test files differ. Source-keyed native setup must validate/rebuild mismatching artifacts. No D44 or e79 artifact is blindly reused.","Only the exact ASan swapcontext warning is normalized. Embedded Node uses detect_leaks=0. Prototype constructor families and the separately identified isInstance exception behavior are outside this diagnostic."],
+              gates:[],diagnosticComplete:false,runtimeQualification:false,productionAdoption:false});
           }
           function finalize(){
             const report=json(join(out,"summary.json")),cleanup={passed:false,retained:true};
             try{
               verifyWorkOwner();assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k=>[k,report[k]])),owner);assert.ok(allDrained(),"owned process custody unresolved");
-              assert.equal(hash(self),report.runnerSha256);report.finalRestoration=restoreMutation();cleanup.source=source();assert.deepEqual(cleanup.source,report.sourceBefore);
+              assert.equal(hash(self),report.runnerSha256);cleanup.source=source();assert.deepEqual(cleanup.source,report.sourceBefore);
+              if(report.harnessLinkCreated){assert.ok(lstatSync(harnessLink).isSymbolicLink());assert.equal(readlinkSync(harnessLink),join(work,"harness-output"));rmSync(harnessLink);}
               rmSync(work,{recursive:true});cleanup.passed=true;cleanup.retained=false;rmSync(self);cleanup.payloadRemoved=true;
             }catch(error){cleanup.error=scrub(error.stack??error);}
-            report.cleanup=cleanup;report.supplementalProofComplete=report.preCleanupComplete===true&&report.inputsVerifiedAfter===true&&cleanup.passed;
-            report.fullQualification=false;report.zeroCostQualification=false;report.productionAdoption=false;save("summary.json",report);save("artifact-manifest.json",files(out).filter(row=>row.path!=="artifact-manifest.json"));
-            assert.equal(report.supplementalProofComplete,true,"direct owner supplement incomplete");
+            report.cleanup=cleanup;report.diagnosticComplete=report.preCleanupComplete===true&&report.inputsVerifiedAfter===true&&cleanup.passed;
+            report.runtimeQualification=false;report.productionAdoption=false;save("summary.json",report);save("artifact-manifest.json",files(out).filter(row=>row.path!=="artifact-manifest.json"));
+            assert.equal(report.diagnosticComplete,true,"emitter diagnostic incomplete");
+            assert.equal(report.reproducedCells.length,0,"typed emitter prototype policy mismatch reproduced");
           }
           if(process.argv[2]!=="--probe"){
             try{if(process.argv[2]==="--init")initialize();else if(process.argv[2]==="--finalize")finalize();else if(process.argv[2]==="--child")await childMain();else await main();}
-            catch(error){process.stderr.write(scrub(error.stack??error)+"\n[native-emitter-error-identity] FAILED (exit 1)\n");process.exitCode=1;}
+            catch(error){process.stderr.write(scrub(error.stack??error)+"\n[typed-emitter-error-policy-baseline] FAILED (exit 1)\n");process.exitCode=1;}
           }
           RUNNER
-          node "$RUNNER_TEMP/native-emitter-error-identity.mjs" --init
-      - name: Verify two direct-owner rows and the pending hook mutation
+          node "$RUNNER_TEMP/typed-emitter-error-policy-baseline.mjs" --init
+      - name: Replay four typed emitter baseline cells
         run: |
           ulimit -c 0
-          node "$RUNNER_TEMP/native-emitter-error-identity.mjs"
+          node "$RUNNER_TEMP/typed-emitter-error-policy-baseline.mjs"
       - name: Verify custody and remove owned scratch
         if: always()
         run: |
-          test -f "$RUNNER_TEMP/native-emitter-error-identity.mjs"
-          node "$RUNNER_TEMP/native-emitter-error-identity.mjs" --finalize
+          test -f "$RUNNER_TEMP/typed-emitter-error-policy-baseline.mjs"
+          node "$RUNNER_TEMP/typed-emitter-error-policy-baseline.mjs" --finalize
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-emitter-error-identity
-          path: ${{ runner.temp }}/native-emitter-error-identity-proof
+          name: typed-emitter-error-policy-baseline
+          path: ${{ runner.temp }}/typed-emitter-error-policy-baseline-proof
           if-no-files-found: error
           retention-days: 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-emitter-error-identity-capacity
-          path: ${{ runner.temp }}/native-emitter-error-identity-capacity
+          name: typed-emitter-error-policy-baseline-capacity
+          path: ${{ runner.temp }}/typed-emitter-error-policy-baseline-capacity
           if-no-files-found: error
           retention-days: 1
