@@ -845,12 +845,34 @@ static void record_frozen_bit(void) {
   assert(immortal[0] == SIZE_MAX && !scr_rc_frozen(immortal));
 }
 
+/* Test-only observer: the normal runtime has no pool inspection API. */
+size_t scr_dyn_pooled_count_at(void);
+
+typedef struct ErrorHeapSnapshot {
+  size_t allocated, pooled;
+} ErrorHeapSnapshot;
+
+static ErrorHeapSnapshot error_heap_snapshot(void) {
+  ErrorHeapSnapshot snapshot = {scr_cyc_live, scr_dyn_pooled_count_at()};
+  assert(snapshot.pooled <= snapshot.allocated);
+  return snapshot;
+}
+
 /* Run in a separate process: select traced allocation before any Error
- * exists. These graphs never enter the Error/dyn identity cache. */
-static void error_heap_restored(size_t before) {
+ * exists. Disposed Dyn pool blocks retain headers, not owned graph edges. */
+static void error_heap_restored(ErrorHeapSnapshot before, const char *phase,
+                                int variant, int gen, int alias) {
   scr_collect_cycles();
   assert(!scr_exc_pending());
-  assert(scr_cyc_live == before);
+  ErrorHeapSnapshot after = error_heap_snapshot();
+  if (after.allocated - after.pooled != before.allocated - before.pooled) {
+    const char *threshold = getenv("SCR_CYCLE_THRESHOLD");
+    fprintf(stderr, "error-owned phase=%s variant=%d gen=%d alias=%d threshold=%s "
+                    "allocated-before=%zu pooled-before=%zu allocated-after=%zu pooled-after=%zu\n",
+            phase, variant, gen, alias, threshold ? threshold : "unset",
+            before.allocated, before.pooled, after.allocated, after.pooled);
+  }
+  assert(after.allocated - after.pooled == before.allocated - before.pooled);
 }
 
 static ScrDyn *error_backedge(ScrError *error) {
@@ -885,7 +907,7 @@ static void error_payload_cycles(void) {
   for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
     for (uint16_t gen = SCR_CYC_NURSERY; gen < SCR_CYC_NGENS; gen++) {
       for (int alias = 0; alias < 3; alias++) {
-        size_t before = scr_cyc_live;
+        ErrorHeapSnapshot before = error_heap_snapshot();
         ScrDyn *payload = scr_dyn_new_arr();
         scr_cyc_set_gen(scr_cyc_hdr(payload), gen);
         ScrError *error = error_with_payload(kinds[k], payload);
@@ -906,18 +928,18 @@ static void error_payload_cycles(void) {
           if (held) scr_error_release(held);
           else scr_dyn_release(payload);
         }
-        error_heap_restored(before);
+        error_heap_restored(before, "cycle", kinds[k], gen, alias);
       }
     }
 
     /* Ordinary destruction releases each slot, while a retained child lives. */
-    size_t before = scr_cyc_live;
+    ErrorHeapSnapshot before = error_heap_snapshot();
     ScrDyn *payload = scr_dyn_new_arr();
     ScrError *error = error_with_payload(kinds[k], payload);
     scr_error_release(error);
     assert(payload->rc == 1 && payload->kind == SCR_DYN_ARR);
     scr_dyn_release(payload);
-    error_heap_restored(before);
+    error_heap_restored(before, "ordinary", kinds[k], -1, -1);
   }
 }
 
@@ -946,7 +968,7 @@ static ScrDyn *error_witness_value(ErrorSlotWitness *witness) {
 
 static void error_payload_mutations(void) {
   for (int operation = 0; operation < 8; operation++) {
-    size_t before = scr_cyc_live;
+    ErrorHeapSnapshot before = error_heap_snapshot();
     ErrorSlotWitness witness = {0};
     ScrDyn *previous = error_witness_value(&witness);
     ScrDyn *replacement = scr_dyn_new_arr();
@@ -989,12 +1011,12 @@ static void error_payload_mutations(void) {
       scr_error_release(error);
     }
     scr_dyn_release(replacement);
-    error_heap_restored(before);
+    error_heap_restored(before, "mutation", operation, -1, -1);
   }
 
   /* Release of an old cyclic payload may collect while its owner stays live. */
   for (int remove = 0; remove < 2; remove++) {
-    size_t before = scr_cyc_live;
+    ErrorHeapSnapshot before = error_heap_snapshot();
     ScrDyn *previous = scr_dyn_new_arr(), *replacement = scr_dyn_new_arr();
     scr_cyc_set_gen(scr_cyc_hdr(previous), SCR_CYC_OLD);
     ScrError *error = error_with_payload(SCR_ERR_ERROR, previous);
@@ -1007,14 +1029,14 @@ static void error_payload_mutations(void) {
     assert(error->error_cause == (remove ? NULL : replacement));
     scr_error_release(error);
     scr_dyn_release(replacement);
-    error_heap_restored(before);
+    error_heap_restored(before, "cyclic-mutation", remove, -1, -1);
   }
 }
 
 static void error_suppressed_snapshots(void) {
   for (int shared = 0; shared < 2; shared++) {
     for (int alias = 0; alias < 3; alias++) {
-      size_t before = scr_cyc_live;
+      ErrorHeapSnapshot before = error_heap_snapshot();
       ScrDyn *body = scr_dyn_new_arr();
       ScrDyn *disposal = shared ? scr_dyn_retain(body) : scr_dyn_new_arr();
       scr_throw_ref(scr_dyn_retain(body), scr_dyn_retain_v, scr_dyn_release_v, scr_dyn_trace_v);
@@ -1046,13 +1068,13 @@ static void error_suppressed_snapshots(void) {
         assert(body->v.arr.len == 1 && disposal->v.arr.len == 1);
         scr_caught_release(held);
       }
-      error_heap_restored(before);
+      error_heap_restored(before, "suppressed", shared, -1, alias);
       assert(!scr_exc_suppressed_values((const void *)address, &first, &second));
     }
   }
 
   /* Non-cyclic snapshots retain ordinary destruction semantics. */
-  size_t before = scr_cyc_live;
+  ErrorHeapSnapshot before = error_heap_snapshot();
   scr_throw_f64(1);
   ScrCaught *body = scr_exc_take();
   scr_throw_f64(2);
@@ -1060,7 +1082,7 @@ static void error_suppressed_snapshots(void) {
   ScrCaught *outer = scr_exc_take();
   uintptr_t address = (uintptr_t)outer->payload;
   scr_caught_release(outer);
-  error_heap_restored(before);
+  error_heap_restored(before, "suppressed-ordinary", 0, -1, -1);
   const ScrCaught *first, *second;
   assert(!scr_exc_suppressed_values((const void *)address, &first, &second));
 }

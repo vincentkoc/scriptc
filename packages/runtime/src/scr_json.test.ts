@@ -20,6 +20,7 @@ test.each([false, true])(
         "-Wall",
         "-Wextra",
         "-fsanitize=address,undefined",
+        "-DSCR_CYC_TESTING",
         ...(audit ? ["-DSCR_RC_AUDIT"] : []),
         "-I",
         src,

@@ -1136,6 +1136,17 @@ static SCR_TL size_t scr_dyn_free_count;
 #define SCR_DYN_FREE_MAX ((size_t)1 << 20)
 #endif
 
+#ifdef SCR_CYC_TESTING
+/* Disposed pool blocks keep their headers but own no live graph edges. */
+size_t scr_dyn_pooled_count_at(void) {
+#ifdef SCR_RC_AUDIT
+  return 0;
+#else
+  return scr_dyn_free_count;
+#endif
+}
+#endif
+
 /* Drops a disposed object's keys and storage: a dictionary's entries with the keys
  * they hold (recycled entries past len may hold keys too), or a layout-mode
  * object's slots unless `keep_slots` (a pooled node keeps them for its next
