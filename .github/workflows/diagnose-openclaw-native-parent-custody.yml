@@ -1,0 +1,773 @@
+name: Diagnose OpenClaw native parent custody
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-openclaw-native-parent-custody.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-openclaw-native-parent-custody-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 8b9f7981e9198831474bbbe2eb47c48407daa380
+
+jobs:
+  diagnose:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    env:
+      PROOF_CAPACITY_NAME: openclaw-native-parent-custody-capacity
+      DIAGNOSTIC_SOURCE: 8b9f7981e9198831474bbbe2eb47c48407daa380
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
+      - uses: ./.github/actions/llvm-linux
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Prepare owned diagnostic runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/openclaw-native-parent-custody.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { basename, join, relative } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self = fileURLToPath(import.meta.url), root = process.cwd();
+          const out = join(process.env.RUNNER_TEMP, "openclaw-native-parent-custody-proof");
+          const work = join(process.env.RUNNER_TEMP, "openclaw-native-parent-custody-work");
+          const head = process.env.SOURCE_SHA;
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: head, platform: process.platform };
+          const CAP = 16 * 1024 * 1024;
+          const sourcePins = {".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed",".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/cli/output-options.ts":"f67105fb66f3d95a679c7fe8be81939e6349a128731fe5563b5b9891c3b6a316","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/frontend/lowering/builtins/child-process.ts":"43f187d7143a3842eae578a50d396b80f2b6d536c1a62790752ae49c2072c356","packages/compiler/src/frontend/lowering/builtins/child-process-sync.ts":"8ef20c3c828fb26a9349f256ac3f5a73c6721a7aea81da16c2545875f449e6dd","packages/compiler/src/frontend/lowering/builtins/process.ts":"c6a0ce9b6a0160cc3fca75f1be0db85f9d46ad492c63631dcebdc4cfc56bb793","packages/compiler/src/frontend/lowering/lower-node-island.ts":"e24b6e158ccd48a54ca959fea8caaf6f5acf8694d6a58f9c2218190790a8651f","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/ir/ir.ts":"4083cf2a5b697c98938d50fb2434b95dba8ad3135bf1aed1e9a782717817382b","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803","packages/runtime/src/scr_child.c":"5b706647bf0157d3a8d1c66cddc87ae8562df8da6dfd276e1e2777e8eb580642","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/scripts/cache-key.mjs":"a949852965733eff702f2abc164e2466684e68d4b8726f6c98d0c6883cf875c3","packages/libnode-common/scripts/verify.mjs":"051fd399d29bddc8f757213ee00d5f6c1d200755266b0ebe86b7603462de503a","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","tests/corpus/1360-spawn-sync.ts":"ca36c543a756f1c79f8e1888e57831ce66603ca0d435e77d7282465945ce1d53","tests/corpus/7030-spawn-sync-env.ts":"9bd06f18b2d80467c08db2e722a25170183bb5ede384a389ef6c365924fb5bc4","tests/harness/process-argv.test.ts":"c08eee08acae0682b85fcf17cb05e751c3402deb9b257e74c0c61e59e2155bb3","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_lib.h":"83a688df501afd1115baaeff931c61bcb8973cd505acd8f59bca5a18cadafdbc","packages/compiler/src/frontend/lowering/builtins/environment.ts":"096afd3dd58d041ebea6c565b5245acb9b93a7bd8afecabca8c9a2916b241c7a","packages/runtime/src/scr_events.c":"0f27965c4237b688841d14df5c71e8c87c34f0c0311569f40d35208ae5cd294e","packages/runtime/src/scr_async.c":"6a990cc466361828bd82bd688fc3811da23b876df223fb5d0214c496ca855198","packages/runtime/src/scr_node_island_host.cjs":"e853e03ceaa0ef422c7554da29d15d7f8c6bfab1c9668a837b2f8e4f68ca6913","packages/compiler/src/frontend/lowering/lower-timers.ts":"60b575cb24a4dbe48faa20c3902ad5aba958743dec43c062602be3e352ed6006","packages/compiler/src/backend/llvm/lib-process.ts":"ea6bb194f52cb67facd291401aa2533c0307a562e114bbc6106d98abfc5da0a5","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/frontend/lowering/lower-functions.ts":"96d8855867decc59426dba062221d7526527478120cf3b784442c38bf18367ae"};
+          const sourceFiles = Object.keys(sourcePins);
+          const nativeExpected = {"count": 1053, "sha256": "35ebd589a5df0336f1219abfd535c91fe9c15bfd3a62af36e74303e7c63e436b"};
+          const openclaw = {"head":"17f92d91bdbe9164c6a9ca516542d30220de7ef5","files":{"cli-parent-lifetime.mjs":{"text":"import { GATEWAY_SHUTDOWN_RESERVE_MS } from \"./gateway-shutdown-budget.mjs\";\n\nconst parentKey = Symbol.for(\"openclaw.cliRespawnParent\");\nexport const CLI_RESPAWN_PARENT_ENV = \"OPENCLAW_CLI_RESPAWN_PARENT\";\n// Compiled executables cannot run a preload. Consume its one-child equivalent\n// before any detached worker can inherit it, and reject a different parent.\nconst inheritedParent = process.env[CLI_RESPAWN_PARENT_ENV];\ndelete process.env[CLI_RESPAWN_PARENT_ENV];\nif (inheritedParent === String(process.ppid)) {\n  globalThis[parentKey] = { pid: process.ppid };\n}\n// Consume the private preload so later detached workers cannot inherit this contract.\nexport const CLI_PARENT_BOUND_PRELOAD = `data:text/javascript,${encodeURIComponent(`\n  globalThis[Symbol.for(\"openclaw.cliRespawnParent\")] = { pid: process.ppid };\n  process.execArgv = process.execArgv.filter((arg, index, args) =>\n    arg !== import.meta.url && !(arg === \"--import\" && args[index + 1] === import.meta.url));\n`)}`;\n\n/** Only the respawn producer opts in; detached update drivers keep independent custody. */\nexport function getCliParentPid() {\n  return globalThis[parentKey]?.pid;\n}\n\nlet terminating = false;\nexport function requestCliParentTermination(\n  signal = () => {\n    if (!process.emit(\"SIGTERM\")) {\n      process.kill(process.pid, \"SIGTERM\");\n    }\n  },\n) {\n  if (terminating) {\n    return;\n  }\n  terminating = true;\n  // Doctor's signal gate cancels work and settles rollback/restoration before exit.\n  setTimeout(() => process.kill(process.pid, \"SIGKILL\"), GATEWAY_SHUTDOWN_RESERVE_MS).unref();\n  signal();\n}\n\nexport function watchCliRespawnParent() {\n  const parent = globalThis[parentKey];\n  if (!parent || parent.watching) {\n    return;\n  }\n  // Node clears the channel before emitting disconnect. Late startup must still\n  // terminate, while a Node process that never had IPC has connected === undefined.\n  if (process.connected === false) {\n    requestCliParentTermination();\n    return;\n  }\n  if (!process.channel) {\n    return;\n  }\n  parent.watching = true;\n  process.once(\"disconnect\", requestCliParentTermination);\n  process.channel.unref();\n}\n","sha256":"a9823dfcd215a1ed3f3c89e263164c9deffbcd4a4d337fc5dd4dc0d6f36a7ae1","gitBlob":"705e80263b76cb592fd9525c49ed033411fe857d"},"gateway-shutdown-budget.mjs":{"text":"// Shared stop policy; v2026.9.5 restart-health.constants.ts fixes the replacement window.\nexport const GATEWAY_RESTART_REPLACEMENT_TIMEOUT_MS = 60_000;\nconst GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_MS = 315_000;\nexport const GATEWAY_SHUTDOWN_RESERVE_MS = 10_000;\nexport const GATEWAY_SUPERVISOR_EXIT_MARGIN_MS = 5_000;\nexport const GATEWAY_SHUTDOWN_TIMEOUT_MS =\n  GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_MS + GATEWAY_SHUTDOWN_RESERVE_MS;\nexport const GATEWAY_SERVICE_STOP_TIMEOUT_MS =\n  GATEWAY_SHUTDOWN_TIMEOUT_MS + GATEWAY_SUPERVISOR_EXIT_MARGIN_MS;\n\nexport const LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS = GATEWAY_SERVICE_STOP_TIMEOUT_MS / 1_000;\n\n// Keep a positive shutdown budget when a supervisor's deadline is under 20s.\nconst GATEWAY_SUPERVISOR_EXIT_MARGIN_SHARE = 0.25;\n\n// Preserve a legacy job's 5s drain where possible. Under 20s, trade some cleanup\n// reserve for drain; on very short jobs, split the remaining budget in half.\n// Inspection time is debited before this allocation, so a slow probe can also\n// reduce the drain. The measured upgrade tradeoff is documented in restart-recovery.\nconst GATEWAY_SHUTDOWN_DRAIN_FLOOR_MS = 5_000;\nconst GATEWAY_SHUTDOWN_DRAIN_FLOOR_SHARE = 0.5;\n\n/** The exit margin to hold back from a supervisor-enforced stop deadline. */\nexport const resolveSupervisorExitMarginMs = (stopTimeoutMs) =>\n  Math.min(\n    GATEWAY_SUPERVISOR_EXIT_MARGIN_MS,\n    Math.floor(Math.max(0, stopTimeoutMs) * GATEWAY_SUPERVISOR_EXIT_MARGIN_SHARE),\n  );\n\n/** The post-drain reserve to hold back from a resolved shutdown budget. */\nexport const resolveShutdownReserveMs = (shutdownTimeoutMs) => {\n  const budgetMs = Math.max(0, shutdownTimeoutMs);\n  const drainFloorMs = Math.min(\n    GATEWAY_SHUTDOWN_DRAIN_FLOOR_MS,\n    Math.floor(budgetMs * GATEWAY_SHUTDOWN_DRAIN_FLOOR_SHARE),\n  );\n  return Math.min(GATEWAY_SHUTDOWN_RESERVE_MS, budgetMs - drainFloorMs);\n};\n\n// Escalation graces the Node recovery launcher applies to a stopping child. Kept\n// here rather than in the launcher so both use the same escalation policy.\nconst RESPAWN_SIGNAL_EXIT_GRACE_MS = 1_000;\nexport const RESPAWN_SIGNAL_FORCE_KILL_GRACE_MS = 1_000;\nconst RESPAWN_SIGNAL_HARD_EXIT_GRACE_MS = 1_000;\n\n// Every runRespawnedChild call site stamps one of these. The compile-cache\n// marker is also used by a different respawner, but that one refuses foreground\n// Gateway runs on darwin. Keep this list with the launcher deadline it authorizes.\nconst RESPAWN_LAUNCHER_MARKER_ENV_VARS = [\n  \"OPENCLAW_NODE_UPDATE_RESPAWNED\",\n  \"OPENCLAW_COMPILE_CACHE_DISABLED_RESPAWNED\",\n  \"OPENCLAW_PACKAGED_COMPILE_CACHE_RESPAWNED\",\n];\n\n/** Whether a `runRespawnedChild` parent started this process. */\nexport const isRespawnedByLauncher = (env) =>\n  RESPAWN_LAUNCHER_MARKER_ENV_VARS.some((name) => env[name] === \"1\");\n\n// New launchers use the shared service policy. A serving Gateway separately\n// retains the shorter deadline of an unidentified, already-running old launcher.\nexport const resolveLauncherStopTimeoutMs = ({ platform, foreground }) => {\n  const signalExitGraceMs =\n    platform !== \"win32\" && foreground\n      ? GATEWAY_SERVICE_STOP_TIMEOUT_MS -\n        RESPAWN_SIGNAL_FORCE_KILL_GRACE_MS -\n        RESPAWN_SIGNAL_HARD_EXIT_GRACE_MS\n      : RESPAWN_SIGNAL_EXIT_GRACE_MS;\n  return signalExitGraceMs + RESPAWN_SIGNAL_FORCE_KILL_GRACE_MS;\n};\n","sha256":"02757141fd71a0e03ee885d952edbcd664395a420b26c6b7ba596529336baa3a","gitBlob":"d32df227cd225f4d6e75afbeddc9b14a0a4a5cbd"}}};
+          const historicalOpenclaw = {"head":"6f8c9bad8bd1a8c339f2d61985e637f9e557550d","files":{"cli-parent-lifetime.mjs":{"text":"import { GATEWAY_SHUTDOWN_RESERVE_MS } from \"./gateway-shutdown-budget.mjs\";\n\nconst parentKey = Symbol.for(\"openclaw.cliRespawnParent\");\nexport const CLI_RESPAWN_PARENT_ENV = \"OPENCLAW_CLI_RESPAWN_PARENT\";\n// Compiled executables cannot run a preload. Consume its one-child equivalent\n// before any detached worker can inherit it, and reject a different parent.\nconst inheritedParent = process.env[CLI_RESPAWN_PARENT_ENV];\ndelete process.env[CLI_RESPAWN_PARENT_ENV];\nif (inheritedParent === String(process.ppid)) {\n  globalThis[parentKey] = { pid: process.ppid };\n}\n// Consume the private preload so later detached workers cannot inherit this contract.\nexport const CLI_PARENT_BOUND_PRELOAD = `data:text/javascript,${encodeURIComponent(`\n  globalThis[Symbol.for(\"openclaw.cliRespawnParent\")] = { pid: process.ppid };\n  process.execArgv = process.execArgv.filter((arg, index, args) =>\n    arg !== import.meta.url && !(arg === \"--import\" && args[index + 1] === import.meta.url));\n`)}`;\n\n/** Only the respawn producer opts in; detached update drivers keep independent custody. */\nexport function getCliParentPid() {\n  return globalThis[parentKey]?.pid;\n}\n\nlet terminating = false;\nexport function requestCliParentTermination(\n  signal = () => {\n    if (!process.emit(\"SIGTERM\")) {\n      process.kill(process.pid, \"SIGTERM\");\n    }\n  },\n) {\n  if (terminating) {\n    return;\n  }\n  terminating = true;\n  // Doctor's signal gate cancels work and settles rollback/restoration before exit.\n  setTimeout(() => process.kill(process.pid, \"SIGKILL\"), GATEWAY_SHUTDOWN_RESERVE_MS).unref();\n  signal();\n}\n\nexport function watchCliRespawnParent() {\n  const parent = globalThis[parentKey];\n  if (!parent || parent.watching || !process.channel) {\n    return;\n  }\n  parent.watching = true;\n  process.once(\"disconnect\", requestCliParentTermination);\n  process.channel.unref();\n  if (!process.connected) {\n    requestCliParentTermination();\n  }\n}\n","sha256":"ea3e4018367731671600be70437f44ccac3a767c6d6db6310951cb0c70ab3825","gitBlob":"c6764bb78193a43fa3b60bfe46d2532060a60152"},"gateway-shutdown-budget.mjs":{"text":"// Shared stop policy; v2026.9.5 restart-health.constants.ts fixes the replacement window.\nexport const GATEWAY_RESTART_REPLACEMENT_TIMEOUT_MS = 60_000;\nconst GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_MS = 315_000;\nexport const GATEWAY_SHUTDOWN_RESERVE_MS = 10_000;\nexport const GATEWAY_SUPERVISOR_EXIT_MARGIN_MS = 5_000;\nexport const GATEWAY_SHUTDOWN_TIMEOUT_MS =\n  GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_MS + GATEWAY_SHUTDOWN_RESERVE_MS;\nexport const GATEWAY_SERVICE_STOP_TIMEOUT_MS =\n  GATEWAY_SHUTDOWN_TIMEOUT_MS + GATEWAY_SUPERVISOR_EXIT_MARGIN_MS;\n\nexport const LAUNCH_AGENT_EXIT_TIMEOUT_SECONDS = GATEWAY_SERVICE_STOP_TIMEOUT_MS / 1_000;\n\n// Keep a positive shutdown budget when a supervisor's deadline is under 20s.\nconst GATEWAY_SUPERVISOR_EXIT_MARGIN_SHARE = 0.25;\n\n// Preserve a legacy job's 5s drain where possible. Under 20s, trade some cleanup\n// reserve for drain; on very short jobs, split the remaining budget in half.\n// Inspection time is debited before this allocation, so a slow probe can also\n// reduce the drain. The measured upgrade tradeoff is documented in restart-recovery.\nconst GATEWAY_SHUTDOWN_DRAIN_FLOOR_MS = 5_000;\nconst GATEWAY_SHUTDOWN_DRAIN_FLOOR_SHARE = 0.5;\n\n/** The exit margin to hold back from a supervisor-enforced stop deadline. */\nexport const resolveSupervisorExitMarginMs = (stopTimeoutMs) =>\n  Math.min(\n    GATEWAY_SUPERVISOR_EXIT_MARGIN_MS,\n    Math.floor(Math.max(0, stopTimeoutMs) * GATEWAY_SUPERVISOR_EXIT_MARGIN_SHARE),\n  );\n\n/** The post-drain reserve to hold back from a resolved shutdown budget. */\nexport const resolveShutdownReserveMs = (shutdownTimeoutMs) => {\n  const budgetMs = Math.max(0, shutdownTimeoutMs);\n  const drainFloorMs = Math.min(\n    GATEWAY_SHUTDOWN_DRAIN_FLOOR_MS,\n    Math.floor(budgetMs * GATEWAY_SHUTDOWN_DRAIN_FLOOR_SHARE),\n  );\n  return Math.min(GATEWAY_SHUTDOWN_RESERVE_MS, budgetMs - drainFloorMs);\n};\n\n// Escalation graces the Node recovery launcher applies to a stopping child. Kept\n// here rather than in the launcher so both use the same escalation policy.\nconst RESPAWN_SIGNAL_EXIT_GRACE_MS = 1_000;\nexport const RESPAWN_SIGNAL_FORCE_KILL_GRACE_MS = 1_000;\nconst RESPAWN_SIGNAL_HARD_EXIT_GRACE_MS = 1_000;\n\n// Every runRespawnedChild call site stamps one of these. The compile-cache\n// marker is also used by a different respawner, but that one refuses foreground\n// Gateway runs on darwin. Keep this list with the launcher deadline it authorizes.\nconst RESPAWN_LAUNCHER_MARKER_ENV_VARS = [\n  \"OPENCLAW_NODE_UPDATE_RESPAWNED\",\n  \"OPENCLAW_COMPILE_CACHE_DISABLED_RESPAWNED\",\n  \"OPENCLAW_PACKAGED_COMPILE_CACHE_RESPAWNED\",\n];\n\n/** Whether a `runRespawnedChild` parent started this process. */\nexport const isRespawnedByLauncher = (env) =>\n  RESPAWN_LAUNCHER_MARKER_ENV_VARS.some((name) => env[name] === \"1\");\n\n// New launchers use the shared service policy. A serving Gateway separately\n// retains the shorter deadline of an unidentified, already-running old launcher.\nexport const resolveLauncherStopTimeoutMs = ({ platform, foreground }) => {\n  const signalExitGraceMs =\n    platform !== \"win32\" && foreground\n      ? GATEWAY_SERVICE_STOP_TIMEOUT_MS -\n        RESPAWN_SIGNAL_FORCE_KILL_GRACE_MS -\n        RESPAWN_SIGNAL_HARD_EXIT_GRACE_MS\n      : RESPAWN_SIGNAL_EXIT_GRACE_MS;\n  return signalExitGraceMs + RESPAWN_SIGNAL_FORCE_KILL_GRACE_MS;\n};\n","sha256":"02757141fd71a0e03ee885d952edbcd664395a420b26c6b7ba596529336baa3a","gitBlob":"d32df227cd225f4d6e75afbeddc9b14a0a4a5cbd"}}};
+          const fixtureSource = "import { requireModule } from \"@scriptc/node\";\n\nconst transport = requireModule(\"./transport.mjs\");\nconst mode = process.env.CUSTODY_CASE ?? \"\";\nconst role = process.env.CUSTODY_ROLE ?? \"child\";\n\nfunction runParent(): void {\n  let work = 0;\n  setInterval(() => { work += 1; }, 1000);\n  transport.spawnOwned(process.env.CUSTODY_CHILD_COMMAND ?? process.execPath, process.env.CUSTODY_CHILD_ENTRY ?? process.argv[1], process.env.CUSTODY_NATIVE === \"1\");\n}\n\nfunction runChild(): void {\n  if (mode === \"unref\") {\n    transport.watch();\n    transport.ready(mode);\n    return;\n  }\n  let work = 0;\n  let terms = 0;\n  const timer = setInterval(() => { work += 1; }, 50);\n  function onTermination(): void {\n    terms += 1;\n    console.log(JSON.stringify({ kind: \"native-handler\", pid: process.pid, terms, work }));\n    if (mode !== \"stubborn\") clearInterval(timer);\n  }\n  function onFinish(): void {\n    console.log(JSON.stringify({ kind: \"native-finish\", pid: process.pid, terms, work }));\n    clearInterval(timer);\n  }\n  function onExit(code: number): void {\n    console.log(JSON.stringify({ kind: \"native-exit\", pid: process.pid, terms, code }));\n  }\n  process.on(\"SIGTERM\", onTermination);\n  process.on(\"SIGUSR1\", onFinish);\n  process.on(\"exit\", onExit);\n  if (mode === \"late-watch\") {\n    transport.armLate();\n  } else {\n    transport.watch();\n    if (mode !== \"parent-death\") transport.armDisconnect();\n  }\n  transport.ready(mode);\n}\nif (role === \"parent\") runParent();\nelse runChild();\n";
+          const transportSource = "import assert from \"node:assert/strict\";\nimport { spawn } from \"node:child_process\";\nimport { existsSync, writeFileSync } from \"node:fs\";\nimport { getCliParentPid, watchCliRespawnParent } from \"./openclaw/cli-parent-lifetime.mjs\";\n\n// A test-only startup barrier admits the actual process before application work.\n// It does not add an event-loop handle or change the unchanged helper.\nconst gate = process.env.CUSTODY_GATE;\nassert.ok(gate?.startsWith(\"/\"));\nwriteFileSync(gate + \".ready\", JSON.stringify({ pid: process.pid, ppid: process.ppid, nonce:process.env.CUSTODY_NONCE }), { flag: \"wx\", mode: 0o600 });\nconst gateDeadline = Date.now() + 10000;\nwhile (!existsSync(gate + \".permit\")) {\n  if (Date.now() >= gateDeadline) throw new Error(\"custody startup admission expired\");\n  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);\n}\nfunction facts(kind, mode) {\n  console.log(JSON.stringify({\n    kind, mode, pid: process.pid, ppid: process.ppid, nonce:process.env.CUSTODY_NONCE,\n    parentPid: getCliParentPid() ?? null, watching:globalThis[Symbol.for(\"openclaw.cliRespawnParent\")]?.watching===true,\n    connected: process.connected === true, channel: Boolean(process.channel),\n    markerConsumed: !Object.hasOwn(process.env, \"OPENCLAW_CLI_RESPAWN_PARENT\"),\n  }));\n}\nexport function watch() { watchCliRespawnParent(); }\nexport function ready(mode) { facts(\"ready\", mode); }\nexport function armDisconnect() {\n  process.once(\"disconnect\", () => facts(\"disconnected\", process.env.CUSTODY_CASE));\n  process.once(\"message\", message => {\n    assert.equal(message, \"disconnect\");\n    facts(\"disconnect-request\", process.env.CUSTODY_CASE);\n    process.disconnect();\n  });\n}\nexport function armLate() {\n  process.once(\"disconnect\", () => {\n    facts(\"late-before-watch\", process.env.CUSTODY_CASE);\n    watchCliRespawnParent();\n    facts(\"late-watch\", process.env.CUSTODY_CASE);\n  });\n  process.once(\"message\", message => {\n    assert.equal(message, \"disconnect\");\n    facts(\"disconnect-request\", process.env.CUSTODY_CASE);\n    process.disconnect();\n  });\n}\nexport function spawnOwned(command, entry, native) {\n  assert.equal(process.env.CUSTODY_ROLE, \"parent\");\n  assert.equal(process.env.CUSTODY_CASE, \"parent-death\");\n  assert.equal(command, process.env.CUSTODY_CHILD_COMMAND ?? process.execPath);\n  const args = native ? [] : [entry];\n  const child = spawn(command, args, {\n    stdio: [\"ignore\", \"inherit\", \"inherit\", \"ipc\"],\n    env: { ...process.env, CUSTODY_ROLE: \"child\", CUSTODY_GATE: gate + \"-child\", OPENCLAW_CLI_RESPAWN_PARENT: String(process.pid) },\n  });\n  child.once(\"error\", error => { throw error; });\n  console.log(JSON.stringify({ kind: \"spawned\", pid: process.pid, childPid: child.pid, command, args }));\n}\n";
+          const controllerSource = "import assert from \"node:assert/strict\";\nimport { spawn } from \"node:child_process\";\nimport { createHash, randomUUID } from \"node:crypto\";\nimport { existsSync, readFileSync, writeFileSync } from \"node:fs\";\nimport { setTimeout as delay } from \"node:timers/promises\";\n\nconst [mode, command, entry, native, gate, receipt] = process.argv.slice(2);\nconst report = { schemaVersion: 1, mode, parentPid: process.pid, custody: \"ChildProcess exit + close + independent stdout/stderr end/close\", complete: false, cleanupUsed: false, events: [] };\nconst cap = 1024 * 1024;\nconst now = () => Number(process.hrtime.bigint() / 1000000n);\nconst started = now();\nfunction proc(pid) {\n  assert.ok(Number.isInteger(pid) && pid > 1);\n  const text = readFileSync(\"/proc/\" + pid + \"/stat\", \"utf8\");\n  const fields = text.slice(text.lastIndexOf(\")\") + 2).trim().split(/\\s+/);\n  return { pid, ppid: Number(fields[1]), group: Number(fields[2]), session: Number(fields[3]), starttime: fields[19], state: fields[0] };\n}\nconst parent = proc(process.pid);\nconst nonce=randomUUID();report.nonce=nonce;\nconst env = { ...process.env, CUSTODY_ROLE: \"child\", CUSTODY_CASE: mode, CUSTODY_NATIVE: native, CUSTODY_GATE: gate, CUSTODY_NONCE:nonce };\ndelete env.OPENCLAW_CLI_RESPAWN_PARENT;\nif (mode !== \"absent-marker\") env.OPENCLAW_CLI_RESPAWN_PARENT = String(process.pid + (mode === \"wrong-marker\" ? 1000000 : 0));\nconst args = native === \"1\" ? [] : [entry];\nconst child = spawn(command, args, { stdio: [\"ignore\", \"pipe\", \"pipe\", \"ipc\"], env });\nreport.command = command; report.args = args; report.marker = env.OPENCLAW_CLI_RESPAWN_PARENT ?? null;\nlet exited = false, closed = false, disconnected = false, error = null, interrupted = false;\nconst streams = [child.stdout, child.stderr].map(() => ({ bytes: 0, text: \"\", chunks: [], end: false, close: false, hash: createHash(\"sha256\") }));\nlet pending = \"\";\nchild.once(\"error\", value => { error = value.code ?? value.name; });\nchild.once(\"exit\", (code, signal) => { exited = true; report.exit = { code, signal, atMs: now() - started }; });\nchild.once(\"close\", (code, signal) => { closed = true; report.close = { code, signal, atMs: now() - started }; });\nchild.once(\"disconnect\", () => { disconnected = true; report.parentDisconnectAtMs = now() - started; });\nfor (const [index, stream] of [child.stdout, child.stderr].entries()) {\n  stream.on(\"data\", bytes => {\n    const sink = streams[index]; sink.bytes += bytes.length; sink.hash.update(bytes);\n    if (sink.bytes > cap) { error = \"stream-limit\"; return; }\n    sink.chunks.push(Buffer.from(bytes));\n    sink.text += bytes.toString(\"utf8\");\n    if (index === 0) {\n      pending += bytes.toString(\"utf8\");\n      while (pending.includes(\"\\n\")) {\n        const at = pending.indexOf(\"\\n\"), line = pending.slice(0, at); pending = pending.slice(at + 1);\n        try { const value = JSON.parse(line); report.events.push({ ...value, observedAtMs: now() - started }); }\n        catch { error = \"malformed-child-record\"; }\n      }\n    }\n  });\n  stream.once(\"end\", () => { streams[index].end = true; });\n  stream.once(\"close\", () => { streams[index].close = true; });\n}\nconst stop = () => { interrupted = true; };\nprocess.on(\"SIGTERM\", stop); process.on(\"SIGINT\", stop);\nasync function wait(predicate, milliseconds, allowExit = false) {\n  const end = now() + milliseconds;\n  while (!predicate() && !error && !interrupted && !(allowExit && exited) && now() < end) await delay(10);\n  assert.equal(error, null); assert.equal(interrupted, false);\n  assert.ok(predicate() || (allowExit && exited), \"bounded custody observation expired\");\n}\nfunction sameChild() {\n  const current = proc(child.pid);\n  assert.equal(current.pid, report.admission.pid);\n  assert.equal(current.starttime, report.admission.starttime);\n  assert.equal(current.ppid, process.pid); assert.equal(current.group, parent.group);\n  return current;\n}\ntry {\n  assert.ok(child.pid > 1 && child.pid !== process.pid && parent.group > 1);\n  await wait(() => existsSync(gate + \".ready\"), 10000);\n  const ready = JSON.parse(readFileSync(gate + \".ready\", \"utf8\"));\n  report.admission = proc(child.pid);\n  assert.equal(ready.nonce,nonce); assert.equal(ready.pid, child.pid); assert.equal(ready.ppid, process.pid);\n  assert.equal(report.admission.ppid, process.pid); assert.equal(report.admission.group, parent.group);\n  writeFileSync(gate + \".permit\", \"go\\n\", { flag: \"wx\", mode: 0o600 });\n  await wait(() => report.events.some(row => row.kind === \"ready\"), 10000, true);\n  const facts = report.events.find(row => row.kind === \"ready\");\n  assert.ok(facts, \"child never reached application readiness\"); assert.equal(facts.pid, child.pid);\n  assert.equal(facts.nonce,nonce); assert.equal(facts.ppid, process.pid); assert.equal(facts.connected, true); assert.equal(facts.channel, true);\n  assert.equal(facts.markerConsumed, true);\n  assert.equal(facts.parentPid, [\"wrong-marker\", \"absent-marker\"].includes(mode) ? null : process.pid);\n  assert.equal(facts.watching,![\"late-watch\",\"wrong-marker\",\"absent-marker\"].includes(mode));\n  report.readinessAdmitted = true;\n  if (mode !== \"unref\" && !exited) {\n    sameChild(); assert.equal(child.connected, true);\n    report.disconnectRequestAtMs = now() - started;\n    report.disconnectEndpoint = \"child process.disconnect(), requested over canonical IPC\";\n    await new Promise((resolve, reject) => child.send(\"disconnect\", failure => failure ? reject(failure) : resolve()));\n    const eventName = mode === \"late-watch\" ? \"late-watch\" : \"disconnected\";\n    await wait(() => report.events.some(row => row.kind === eventName), 10000, true);\n    if (([\"wrong-marker\", \"absent-marker\"].includes(mode) || (mode === \"late-watch\" && process.env.CUSTODY_EXPECT_LATE_BUG === \"1\")) && !exited) {\n      sameChild(); report.finishSignalAtMs = now() - started;\n      assert.equal(child.kill(\"SIGUSR1\"), true);\n    }\n  }\n  await wait(() => closed && streams.every(row => row.end && row.close), mode === \"stubborn\" ? 20000 : 10000);\n  assert.equal(pending, \"\");\n  assert.deepEqual({ code: report.close.code, signal: report.close.signal }, { code: report.exit.code, signal: report.exit.signal });\n  report.complete = true; report.parentConnectedUntilNaturalExit = mode === \"unref\" && !(\"disconnectRequestAtMs\" in report);\n} catch (failure) {\n  report.failure = String(failure);\n} finally {\n  process.off(\"SIGTERM\", stop); process.off(\"SIGINT\", stop);\n  if (!exited && child.pid > 1 && report.admission) {\n    try {\n      sameChild(); report.cleanupUsed = true; child.kill(\"SIGTERM\");\n      for (let i = 0; i < 100 && !exited; i++) await delay(10);\n      if (!exited) { sameChild(); child.kill(\"SIGKILL\"); }\n      for (let i = 0; i < 500 && !closed; i++) await delay(10);\n    } catch (failure) { report.cleanupError = String(failure); }\n  }\n  report.terminalCaptured = exited && closed && streams.every(row => row.end && row.close);\n  report.disconnected = disconnected;\n  report.streams=streams.map((row,index)=>{\n    const raw=Buffer.concat(row.chunks),path=receipt+(index===0?\".stdout.log\":\".stderr.log\");\n    writeFileSync(path,raw,{flag:\"wx\",mode:0o600});\n    const sha256=row.hash.digest(\"hex\");\n    assert.equal(readFileSync(path).length,row.bytes);\n    assert.equal(createHash(\"sha256\").update(readFileSync(path)).digest(\"hex\"),sha256);\n    return {bytes:row.bytes,text:raw.toString(\"utf8\"),path,end:row.end,close:row.close,sha256};\n  });\n  report.complete = report.complete && report.terminalCaptured && !report.cleanupUsed;\n  writeFileSync(receipt, JSON.stringify(report, null, 2) + \"\\n\", { flag: \"wx\", mode: 0o600 });\n}\nif (!report.complete) process.exitCode = 1;\n";
+          const reaperSource = "import ctypes, errno, hashlib, json, os, pathlib, selectors, signal, sys, time\n\ncommand, entry, native, gate, receipt, node, parent_native = sys.argv[1:]\nlauncher_command = command if parent_native == \"1\" else node\nlauncher_args = [launcher_command] if parent_native == \"1\" else [node, entry]\ngate = pathlib.Path(gate)\nreceipt = pathlib.Path(receipt)\nCAP = 1024 * 1024\nstarted = time.monotonic()\nnonce = os.urandom(16).hex()\nreport = {\"schemaVersion\": 1, \"evidence\": \"waitpid-adopted\", \"complete\": False,\n          \"cleanupUsed\": False, \"nonce\": nonce, \"groupDrained\": False, \"events\": [], \"supervisor\": os.getpid()}\ndef save():\n    # This file exists before fork, so a dead supervisor leaves unresolved custody.\n    receipt.write_text(json.dumps(report, indent=2) + \"\\n\")\ndef identity(pid):\n    text = pathlib.Path(\"/proc\", str(pid), \"stat\").read_text()\n    fields = text[text.rindex(\")\") + 2:].split()\n    return {\"pid\": pid, \"ppid\": int(fields[1]), \"group\": int(fields[2]),\n            \"session\": int(fields[3]), \"starttime\": fields[19], \"state\": fields[0]}\ndef same(wanted, parent=None):\n    current = identity(wanted[\"pid\"])\n    for key in (\"pid\", \"group\", \"session\", \"starttime\"):\n        assert current[key] == wanted[key], \"process identity changed\"\n    if parent is not None:\n        assert current[\"ppid\"] == parent, \"process parent changed\"\n    return current\ndef decoded(status):\n    return {\"raw\": status, \"exited\": os.WIFEXITED(status),\n            \"code\": os.WEXITSTATUS(status) if os.WIFEXITED(status) else None,\n            \"signaled\": os.WIFSIGNALED(status),\n            \"signal\": os.WTERMSIG(status) if os.WIFSIGNALED(status) else None,\n            \"coreDumped\": bool(os.WCOREDUMP(status)) if os.WIFSIGNALED(status) else False}\ninterrupted = False\ncleaning = False\ndef interrupt(signum, frame):\n    global interrupted\n    interrupted = True\nsignal.signal(signal.SIGTERM, interrupt)\nsignal.signal(signal.SIGINT, interrupt)\nsignal.signal(signal.SIGCHLD, signal.SIG_DFL)\nlibc = ctypes.CDLL(None, use_errno=True)\nassert libc.prctl(36, 1, 0, 0, 0) == 0, \"PR_SET_CHILD_SUBREAPER failed\"\nenabled = ctypes.c_int()\nassert libc.prctl(37, ctypes.byref(enabled), 0, 0, 0) == 0 and enabled.value == 1, \"subreaper readback failed\"\nreport[\"subreaper\"] = True\nreport[\"launcherCommand\"] = launcher_command\nreport[\"launcherArgs\"] = launcher_args\nreport[\"compiledParent\"] = parent_native == \"1\"\nreport[\"sigchld\"] = \"SIG_DFL; no competing child owner\"\nsupervisor = identity(os.getpid())\nassert supervisor[\"group\"] > 1\nselector = selectors.DefaultSelector()\nstreams = {}\nreport[\"storageComplete\"] = True\npending = \"\"\ndef retire_reader(key, eof=False):\n    row = streams[key.data]\n    row[\"eof\"] = eof\n    row[\"readerRetired\"] = not eof\n    for operation in (lambda: selector.unregister(key.fd), lambda: os.close(key.fd)):\n        try:\n            operation()\n        except (OSError, KeyError, ValueError):\n            report[\"storageComplete\"] = False\n            row[\"retireFailed\"] = True\n            if not cleaning:\n                raise\ndef pump():\n    global pending\n    try:\n        ready = selector.select(0.02)\n    except OSError as error:\n        report[\"storageComplete\"] = False\n        report[\"selectorFailure\"] = type(error).__name__\n        if not cleaning:\n            raise\n        for key in list(selector.get_map().values()):\n            retire_reader(key)\n        return\n    for key, _ in ready:\n        name = key.data\n        row = streams[name]\n        try:\n            data = os.read(key.fd, 65536)\n        except BlockingIOError:\n            continue\n        except OSError as error:\n            report[\"storageComplete\"] = False\n            row[\"readFailure\"] = {\"type\": type(error).__name__, \"errno\": error.errno}\n            if not cleaning:\n                raise\n            retire_reader(key)\n            continue\n        if not data:\n            retire_reader(key, eof=True)\n            continue\n        row[\"bytes\"] += len(data)\n        if cleaning:\n            # Failed output cannot interrupt exact child reaping. Retain only the\n            # bounded prefix, drain the rest, and never parse cleanup bytes as proof.\n            report[\"cleanupParsingSkipped\"] = True\n            report[\"storageComplete\"] = False\n            pending = \"\"\n            try:\n                keep = data[:max(0, CAP - len(row[\"data\"]))]\n                row[\"data\"].extend(keep)\n                row[\"discardedBytes\"] = row.get(\"discardedBytes\", 0) + len(data) - len(keep)\n            except Exception as error:\n                row[\"captureFailure\"] = type(error).__name__\n            continue\n        try:\n            assert row[\"bytes\"] <= CAP, \"child stream exceeds diagnostic storage\"\n            row[\"data\"].extend(data)\n            if name == \"stdout\":\n                pending += data.decode(\"utf-8\", errors=\"strict\")\n                while \"\\n\" in pending:\n                    line, pending = pending.split(\"\\n\", 1)\n                    value = json.loads(line)\n                    assert isinstance(value, dict)\n                    value[\"observedAtMs\"] = round((time.monotonic() - started) * 1000, 3)\n                    report[\"events\"].append(value)\n        except Exception as error:\n            report[\"storageComplete\"] = False\n            row[\"captureFailure\"] = type(error).__name__\n            raise\ndef wait_until(predicate, seconds):\n    deadline = time.monotonic() + seconds\n    while not predicate():\n        assert cleaning or not interrupted, \"controller interrupted\"\n        assert time.monotonic() < deadline, \"custody deadline exceeded\"\n        pump()\ndef exact_wait(pid, seconds):\n    deadline = time.monotonic() + seconds\n    while True:\n        try:\n            result, status = os.waitpid(pid, os.WNOHANG)\n        except InterruptedError:\n            assert time.monotonic() < deadline\n            continue\n        # ECHILD is not proof of death: it is a lost wait owner.\n        if result:\n            assert result == pid\n            return decoded(status)\n        assert time.monotonic() < deadline, \"exact waitpid deadline exceeded\"\n        assert cleaning or not interrupted, \"controller interrupted\"\n        pump()\ndef group_members(group):\n    rows = []\n    for name in os.listdir(\"/proc\"):\n        if not name.isdecimal():\n            continue\n        try:\n            row = identity(int(name))\n        except (FileNotFoundError, ProcessLookupError):\n            continue\n        if row[\"group\"] == group:\n            rows.append(row)\n    return rows\nlauncher = None\nchild = None\nreaped = set()\nwrite_ends = []\npermit_r, permit_w = os.pipe()\nexecuted = False\nsave()\ntry:\n    for name in (\"stdout\", \"stderr\"):\n        read_fd, write_fd = os.pipe()\n        os.set_blocking(read_fd, False)\n        selector.register(read_fd, selectors.EVENT_READ, name)\n        streams[name] = {\"bytes\": 0, \"data\": bytearray(), \"eof\": False}\n        write_ends.append(write_fd)\n    launcher_pid = os.fork()\n    if launcher_pid == 0:\n        try:\n            os.close(permit_w)\n            os.setsid()\n            assert os.read(permit_r, 1) == b\"g\", \"pre-exec admission refused\"\n            os.close(permit_r)\n            signal.signal(signal.SIGTERM, signal.SIG_DFL)\n            signal.signal(signal.SIGINT, signal.SIG_DFL)\n            signal.signal(signal.SIGCHLD, signal.SIG_DFL)\n            os.dup2(write_ends[0], 1)\n            os.dup2(write_ends[1], 2)\n            for fd in write_ends:\n                os.close(fd)\n            for key in list(selector.get_map().values()):\n                os.close(key.fd)\n            null = os.open(\"/dev/null\", os.O_RDONLY)\n            os.dup2(null, 0)\n            os.close(null)\n            env = dict(os.environ, CUSTODY_ROLE=\"parent\", CUSTODY_CASE=\"parent-death\",\n                       CUSTODY_NATIVE=native, CUSTODY_GATE=str(gate), CUSTODY_NONCE=nonce, CUSTODY_CHILD_COMMAND=command, CUSTODY_CHILD_ENTRY=entry)\n            env.pop(\"OPENCLAW_CLI_RESPAWN_PARENT\", None)\n            os.execve(launcher_command, launcher_args, env)\n        except BaseException:\n            os._exit(126)\n    os.close(permit_r)\n    permit_r = None\n    report[\"spawnedPid\"] = launcher_pid\n    launcher = identity(launcher_pid)\n    assert launcher[\"ppid\"] == os.getpid(), \"fork owner mismatch\"\n    initial_starttime = launcher[\"starttime\"]\n    report[\"forkIdentity\"] = launcher\n    save()\n    deadline = time.monotonic() + 5\n    while launcher[\"group\"] != launcher_pid or launcher[\"session\"] != launcher_pid:\n        assert launcher[\"state\"] != \"Z\" and time.monotonic() < deadline, \"setsid admission failed\"\n        assert not interrupted, \"controller interrupted\"\n        time.sleep(0.01)\n        launcher = identity(launcher_pid)\n        assert launcher[\"ppid\"] == os.getpid() and launcher[\"starttime\"] == initial_starttime\n    assert launcher_pid > 1 and launcher_pid != supervisor[\"group\"]\n    report[\"launcher\"] = launcher\n    report[\"admittedGroup\"] = launcher_pid\n    save()\n    assert os.write(permit_w, b\"g\") == 1\n    os.close(permit_w)\n    permit_w = None\n    executed = True\n    report[\"execPermitted\"] = True\n    save()\n    for fd in write_ends:\n        os.close(fd)\n    write_ends = []\n    wait_until(lambda: pathlib.Path(str(gate) + \".ready\").exists(), 10)\n    launcher = identity(launcher_pid)\n    assert launcher_pid > 1 and launcher_pid != supervisor[\"group\"]\n    assert launcher[\"ppid\"] == os.getpid() and launcher[\"group\"] == launcher_pid and launcher[\"session\"] == launcher_pid\n    assert json.loads(pathlib.Path(str(gate) + \".ready\").read_text()) == {\"pid\": launcher_pid, \"ppid\": os.getpid(), \"nonce\": nonce}\n    report[\"launcher\"] = launcher\n    report[\"admittedGroup\"] = launcher_pid\n    save()\n    pathlib.Path(str(gate) + \".permit\").write_text(\"go\\n\")\n    child_gate = pathlib.Path(str(gate) + \"-child\")\n    wait_until(lambda: any(row.get(\"kind\") == \"spawned\" for row in report[\"events\"]), 10)\n    spawned = [row for row in report[\"events\"] if row.get(\"kind\") == \"spawned\"]\n    assert len(spawned) == 1 and spawned[0][\"pid\"] == launcher_pid\n    assert spawned[0][\"command\"] == command and spawned[0][\"args\"] == ([] if native == \"1\" else [entry])\n    child_pid = spawned[0][\"childPid\"]\n    assert isinstance(child_pid, int) and child_pid > 1 and child_pid not in (launcher_pid, os.getpid())\n    child = identity(child_pid)\n    assert child[\"ppid\"] == launcher_pid and child[\"group\"] == launcher_pid and child[\"session\"] == launcher_pid\n    wait_until(lambda: pathlib.Path(str(child_gate) + \".ready\").exists(), 10)\n    assert json.loads(pathlib.Path(str(child_gate) + \".ready\").read_text()) == {\"pid\": child_pid, \"ppid\": launcher_pid, \"nonce\": nonce}\n    report[\"child\"] = child\n    assert {row[\"pid\"] for row in group_members(launcher_pid)} == {launcher_pid, child_pid}, \"unowned group member\"\n    save()\n    pathlib.Path(str(child_gate) + \".permit\").write_text(\"go\\n\")\n    wait_until(lambda: any(row.get(\"kind\") == \"ready\" and row.get(\"pid\") == child_pid for row in report[\"events\"]), 10)\n    ready = [row for row in report[\"events\"] if row.get(\"kind\") == \"ready\" and row.get(\"pid\") == child_pid]\n    assert len(ready) == 1\n    assert ready[0][\"nonce\"] == nonce\n    assert ready[0][\"mode\"] == \"parent-death\" and ready[0][\"ppid\"] == launcher_pid\n    assert ready[0][\"parentPid\"] == launcher_pid and ready[0][\"connected\"] and ready[0][\"channel\"] and ready[0][\"markerConsumed\"] and ready[0][\"watching\"]\n    same(launcher, os.getpid())\n    same(child, launcher_pid)\n    report[\"cause\"] = {\"kind\": \"owned-launcher-SIGKILL\", \"pid\": launcher_pid,\n                       \"atMs\": round((time.monotonic() - started) * 1000, 3)}\n    save()\n    os.kill(launcher_pid, signal.SIGKILL)\n    report[\"launcherStatus\"] = exact_wait(launcher_pid, 5)\n    reaped.add(launcher_pid)\n    assert report[\"launcherStatus\"][\"signaled\"] and report[\"launcherStatus\"][\"signal\"] == signal.SIGKILL\n    # Even an already-exited zombie retains its starttime and adoption identity until this exact wait.\n    report[\"adoptedChild\"] = same(child, os.getpid())\n    report[\"childStatus\"] = exact_wait(child_pid, 15)\n    reaped.add(child_pid)\n    wait_until(lambda: all(row[\"eof\"] or (cleaning and row.get(\"readerRetired\", False)) for row in streams.values()), 5)\n    assert not pending, \"incomplete final child record\"\n    assert not group_members(launcher_pid), \"owned fixture group did not drain\"\n    report[\"groupDrained\"] = True\n    report[\"complete\"] = True\nexcept BaseException as error:\n    report[\"error\"] = type(error).__name__ + \": \" + str(error)\nfinally:\n    cleaning = True\n    for fd in (permit_r, permit_w):\n        if fd is not None:\n            os.close(fd)\n    for fd in write_ends:\n        os.close(fd)\n    # Only identity-proven members of this one fixture group may be cleaned.\n    if not report[\"groupDrained\"]:\n        report[\"cleanupUsed\"] = True\n        try:\n            assert launcher is not None, \"launcher custody was not admitted\"\n            if not executed:\n                current = identity(launcher[\"pid\"])\n                assert current[\"ppid\"] == os.getpid() and current[\"starttime\"] == launcher[\"starttime\"]\n                os.kill(launcher[\"pid\"], signal.SIGKILL)\n                report[\"preExecStatus\"] = exact_wait(launcher[\"pid\"], 5)\n                reaped.add(launcher[\"pid\"])\n                wait_until(lambda: all(row[\"eof\"] or (cleaning and row.get(\"readerRetired\", False)) for row in streams.values()), 5)\n                report[\"preExecOnlyReaped\"] = True\n                report[\"groupDrained\"] = True\n                members = []\n            else:\n                # Reap the admitted launcher before admitting an interrupted spawn's\n                # child. Only this subreaper can adopt a member of its private session.\n                if launcher[\"pid\"] not in reaped:\n                    same(launcher, os.getpid())\n                    os.kill(launcher[\"pid\"], signal.SIGKILL)\n                    report.setdefault(\"cleanupStatuses\", {})[str(launcher[\"pid\"])] = exact_wait(launcher[\"pid\"], 5)\n                    reaped.add(launcher[\"pid\"])\n                members = group_members(launcher[\"group\"])\n                assert len(members) <= 1, \"unexpected fixture descendants\"\n                report[\"cleanupAdopted\"] = []\n                for row in members:\n                    assert row[\"pid\"] > 1 and row[\"pid\"] not in (launcher[\"pid\"], os.getpid())\n                    assert row[\"ppid\"] == os.getpid() and row[\"session\"] == launcher[\"session\"]\n                    assert row[\"group\"] == launcher[\"group\"], \"foreign adopted process\"\n                    assert int(row[\"starttime\"]) >= int(launcher[\"starttime\"]), \"adopted child predates launcher\"\n                    if child is not None:\n                        assert row[\"pid\"] == child[\"pid\"] and row[\"starttime\"] == child[\"starttime\"]\n                    report[\"cleanupAdopted\"].append(row)\n                    save()\n                    same(row, os.getpid())\n                    os.kill(row[\"pid\"], signal.SIGKILL)\n                    report.setdefault(\"cleanupStatuses\", {})[str(row[\"pid\"])] = exact_wait(row[\"pid\"], 5)\n                    reaped.add(row[\"pid\"])\n                wait_until(lambda: all(row[\"eof\"] or (cleaning and row.get(\"readerRetired\", False)) for row in streams.values()), 5)\n                report[\"groupDrained\"] = not group_members(launcher[\"group\"])\n        except BaseException as error:\n            report[\"cleanupError\"] = type(error).__name__ + \": \" + str(error)\n    for name, row in streams.items():\n        path = pathlib.Path(str(receipt) + \".\" + name + \".log\")\n        with path.open(\"xb\") as sink:\n            count = sink.write(row[\"data\"])\n            assert count == len(row[\"data\"]), \"short raw stream write\"\n        assert path.read_bytes() == row[\"data\"], \"raw stream readback mismatch\"\n    report[\"streams\"] = {\n        name: {\"path\": str(receipt) + \".\" + name + \".log\", \"bytes\": row[\"bytes\"], \"retainedBytes\": len(row[\"data\"]), \"readerRetired\": row.get(\"readerRetired\", False),\n               \"discardedBytes\": row.get(\"discardedBytes\", 0), \"readFailure\": row.get(\"readFailure\"), \"captureFailure\": row.get(\"captureFailure\"), \"sha256\": hashlib.sha256(row[\"data\"]).hexdigest(),\n               \"text\": row[\"data\"].decode(\"utf-8\", errors=\"replace\"), \"eof\": row[\"eof\"]}\n        for name, row in streams.items()\n    }\n    report[\"complete\"] = bool(report[\"complete\"] and report[\"groupDrained\"] and not report[\"cleanupUsed\"] and report[\"storageComplete\"])\n    report[\"elapsedMs\"] = round((time.monotonic() - started) * 1000, 3)\n    save()\n    selector.close()\nif not report[\"complete\"]:\n    raise SystemExit(1)\n";
+          const caseNames = ["disconnect", "parent-death", "stubborn", "unref", "late-watch", "wrong-marker", "absent-marker"];
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          const capture = (command, args = []) => {
+            const value = spawnSync(command, args, { cwd: root, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.error, undefined, command + " launcher failed"); assert.equal(value.status, 0, command + ": " + value.stderr);
+            return value.stdout.trim();
+          };
+          const escape = text => text.replace(/[.*+?^$()|[\]{}\\]/g, char => "\\" + char);
+          const normalize = text => text.replace(/^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext functions and may produce false positives in some cases!\n/gm, "");
+          function verifyWorkOwner() {
+            const info = lstatSync(work); assert.ok(info.isDirectory() && !info.isSymbolicLink()); assert.equal(info.mode & 0o777, 0o700);
+            assert.deepEqual(json(join(work, "owner.json")), owner);
+          }
+          function source() {
+            assert.equal(head, "8b9f7981e9198831474bbbe2eb47c48407daa380"); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const tree = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]);
+            assert.equal(digest(tree), "7f5f79ac0950296feabf3b1e315cf7570467d9fa921aba5c908ca7fd4861f7e1");
+            const pins = Object.fromEntries(sourceFiles.map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(pins, sourcePins);
+            return { head, clean: true, treeSha256: digest(tree), files: pins };
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const path = row.slice(row.indexOf("\t") + 1);
+              return path.startsWith("native/llvm-codegen/") || /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(path) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(path) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(path);
+            });
+            assert.equal(rows.length, nativeExpected.count); assert.equal(digest(rows.join("\n")), nativeExpected.sha256);
+            return { rows, sha256: digest(rows.join("\n")), disk: rows.map(row => { const path = row.split("\t")[1]; return { path, sha256: hash(join(root, path)) }; }) };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a,b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink()); if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile()); return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function nativeFiles(target) {
+            return ["packages/llvm-" + target + "/bin", "packages/runtime-" + target + "/artifacts"].flatMap(path => files(join(root, path)).map(row => ({ ...row, path: path + "/" + row.path })))
+              .concat([{ path: "packages/runtime-" + target + "/runtime-pack.json", sha256: hash(join(root, "packages/runtime-" + target + "/runtime-pack.json")) }]);
+          }
+          function tool(command, args = ["--version"]) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            const result = spawnSync(command, args, { encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(result.error, undefined); assert.equal(result.status, 0);
+            return { path, sha256: hash(path), version: (result.stdout + result.stderr).trim() };
+          }
+          function tools() {
+            const common = { node: tool(process.execPath), pnpm: tool("pnpm"), clang: tool("clang"), ld: tool("ld", process.platform === "darwin" ? ["-v"] : ["--version"]), nm: tool("nm") };
+            if (process.platform === "darwin") {
+              const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+              return { ...common, dsymutil: tool("dsymutil"), dwarfdump: tool("dwarfdump"), lldb: tool("lldb"),
+                sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]), settingsSha256: hash(join(sdk, "SDKSettings.json")) },
+                xcode: capture("xcodebuild", ["-version"]), developer: capture("xcode-select", ["-p"]), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+            }
+            return { ...common, python: tool("python3"), llvm: tool("llvm-config", ["--version"]), zig: tool("zig", ["version"]), cxx: tool("g++"), strip: tool("strip"), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+          }
+          function makeEnvironment(id, sanitize) {
+            const dir = join(work, id); mkdirSync(dir, { mode: 0o700 });
+            for (const name of ["cache", "tmp", "xdg"]) mkdirSync(join(dir, name), { mode: 0o700 });
+            return { SCRIPTC_SAN: sanitize ? "1" : "", SCRIPTC_TEST_WORKERS: "1", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1",
+              SCRIPTC_CACHE_DIR: join(dir, "cache"), TMPDIR: join(dir, "tmp"), XDG_CACHE_HOME: join(dir, "xdg") };
+          }
+
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            if (!readdirSync(out).filter(name => name.endsWith(".subreaper.json")).every(name => {
+              const value = json(join(out,name));
+              return value.groupDrained === true && (
+                (Number.isInteger(value.admittedGroup) && value.admittedGroup > 1 && groupMembers(value.admittedGroup).length === 0) ||
+                (value.preExecOnlyReaped === true && value.execPermitted !== true && value.preExecStatus?.signaled === true &&
+                  value.preExecStatus.signal === 9 && value.forkIdentity?.pid === value.spawnedPid && value.spawnedPid > 1));
+            })) return false;
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function retain(path, name) { const to = join(out, name); copyFileSync(path, to); return record(to); }
+          function readOutput(step, stream) { return readFileSync(join(out, step[stream].path), "utf8"); }
+          function validateCompile(step, entry, artifact) {
+            requireSuccess(step);
+            const data = JSON.parse(readOutput(step, "stdout"));
+            assert.equal(data.schema, "scriptc-diagnostics"); assert.equal(data.schemaVersion, 1);
+            assert.equal(data.command, "build"); assert.equal(data.entry, entry);
+            assert.equal(data.artifact, artifact); assert.equal(data.phase, "complete"); assert.equal(data.success, true);
+            assert.ok(Array.isArray(data.diagnostics));
+            assert.equal(data.diagnostics.filter(row => row.severity === "error").length, 0);
+            // Explicit requireModule calls are not static package-scan SC8001 notes.
+            assert.equal(data.diagnostics.filter(row => row.code === "SC8001").length, 0);
+            return data;
+          }
+          function collect(value, predicate, result = []) {
+            if (value && typeof value === "object") {
+              if (predicate(value)) result.push(value);
+              for (const child of Object.values(value)) collect(child, predicate, result);
+            }
+            return result;
+          }
+          function irEvidence(program, entry) {
+            assert.notEqual(program.commonJsEntry, true);
+            const map = new Map(program.functions.map(fn => [fn.name, fn]));
+            const owners = program.functions.filter(fn => fn.loc?.file === entry && fn.body?.length);
+            assert.ok(owners.length);
+            const occurrences = (name, source) => {
+              const start = fixtureSource.indexOf(source); assert.ok(start >= 0);
+              const rows = owners.flatMap(fn => collect(fn.body, node => node.kind === "libCall" && node.fn === name &&
+                node.loc?.file === entry && node.loc.start === start).map(call => ({ owner: fn.name, call })));
+              assert.ok(rows.length > 0, "missing authored native " + name);
+              return rows;
+            };
+            const resolve = (expr, owner, seen = new Set()) => {
+              assert.ok(expr && !seen.has(expr), "cyclic or missing closure binding"); seen.add(expr);
+              if (expr.kind === "closure") { assert.ok(map.has(expr.fnName)); return expr.fnName; }
+              if (expr.kind === "dynFrom" || expr.kind === "dynCheck") return resolve(expr.value, owner, seen);
+              if (expr.kind === "varRef") {
+                const fn = map.get(owner);
+                const writes = collect(fn.body, node => (node.kind === "varDecl" || node.kind === "assign") && node.localId === expr.localId);
+                assert.equal(writes.length, 1, "closure must have one owner-local writer");
+                return resolve(writes[0].init ?? writes[0].value, owner, seen);
+              }
+              throw Error("unrecognized native closure binding " + expr.kind);
+            };
+            const nativeReach = (name, marker) => {
+              const seen = new Set(), pending = [name];
+              while (pending.length) {
+                const current = pending.pop(); if (seen.has(current)) continue; seen.add(current);
+                const fn = map.get(current); assert.ok(fn?.body?.length, "missing native callback body");
+                assert.equal(collect(fn.body, node => node.kind === "libCall" && node.fn.startsWith("nodeIsland.")).length, 0,
+                  "application callback delegated to Node");
+                for (const edge of collect(fn.body, node => node.kind === "call" || node.kind === "closure")) {
+                  const target = edge.callee ?? edge.fnName; if (map.has(target)) pending.push(target);
+                }
+                if (fn.jsEntry) { assert.ok(map.has(fn.jsEntry)); pending.push(fn.jsEntry); }
+              }
+              assert.ok([...seen].some(key => JSON.stringify(map.get(key).body).includes(marker)), "native marker missing");
+              return [...seen];
+            };
+            const signals = [
+              ["SIGTERM", 'process.on("SIGTERM", onTermination)', "native-handler"],
+              ["SIGUSR1", 'process.on("SIGUSR1", onFinish)', "native-finish"],
+            ].map(([signal, source, marker]) => {
+              const rows = occurrences("process.onSignal", source);
+              return { signal, rows: rows.map(({owner,call}) => {
+                assert.equal(call.args[0].kind, "strLit"); assert.equal(call.args[0].value, signal);
+                assert.equal(call.args.length, 3); assert.equal(call.args[2].kind, "boolLit"); assert.equal(call.args[2].value, false);
+                const callback = resolve(call.args[1], owner);
+                const reachable = nativeReach(callback, marker);
+                assert.ok(reachable.some(name => collect(map.get(name).body, node => node.kind === "libCall" && node.fn === "timers.clearInterval").length));
+                return { owner, loc: call.loc, callback, reachable };
+              }) };
+            });
+            const work = occurrences("timers.setInterval", "setInterval(() => { work += 1; }, 50)");
+            const timerOwners = work.map(({ owner, call }) => {
+              assert.equal(call.args[1].kind, "numLit"); assert.equal(call.args[1].value, 50);
+              const callback = resolve(call.args[0], owner);
+              const reachable = nativeReach(callback, '"value":1');
+              assert.ok(collect(map.get(callback).body, node => node.kind === "assign" || node.kind === "boxSet").length,
+                "application interval does no native work");
+              return { owner, callback, loc: call.loc, reachable };
+            });
+            const exits = occurrences("process.onExit", 'process.on("exit", onExit)');
+            const exitOwners = exits.map(({owner,call}) => {
+              assert.equal(call.args.length,2); assert.equal(call.args[1].kind,"boolLit"); assert.equal(call.args[1].value,false);
+              const callback=resolve(call.args[0],owner);
+              return {owner,callback,reachable:nativeReach(callback,"native-exit"),loc:call.loc};
+            });
+            const parent = owners.filter(fn => fn.sourceName === "runParent" || fn.name === "runParent");
+            assert.ok(parent.length && parent.some(fn => collect(fn.body, node => node.kind === "libCall" && node.fn === "timers.setInterval").length),
+              "compiled parent entry and liveness must remain native");
+            const parentSpawn = parent.flatMap(fn=>collect(fn.body,node=>node.kind==="dynInvoke" && node.method==="spawnOwned"));
+            assert.ok(parentSpawn.length>0,"compiled parent did not call the explicit island spawn");
+            for(const call of parentSpawn){
+              assert.equal(call.loc.file,entry);assert.equal(call.loc.start,fixtureSource.indexOf("transport.spawnOwned("));assert.equal(call.args.length,3);
+            }
+            const required = collect(program, node => node.kind === "libCall" && node.fn === "nodeIsland.require");
+            assert.equal(required.length, 1);
+            assert.equal(required[0].loc.file, entry);
+            assert.equal(required[0].loc.start, fixtureSource.indexOf('requireModule("./transport.mjs")'));
+            const inventory = program.nodeIsland?.modules?.files;
+            assert.ok(Array.isArray(inventory));
+            verifyModuleRows(inventory.map(row => ({ path: row.path, bytes: row.size, sha256: row.sha256, placeholder: row.placeholder ?? false })));
+            return { nativeEntry: true, signals, timerOwners, exitOwners, parentSpawn:parentSpawn.map(call=>({loc:call.loc,method:call.method})), parentOwners: parent.map(fn => fn.name), explicitRequire: required[0].loc, moduleInventory: inventory };
+          }
+          function verifyModuleRows(rows) {
+            const expected = Object.entries(openclaw.files).map(([name,item]) =>
+              ({ path: "openclaw/" + name, bytes: Buffer.byteLength(item.text), sha256: item.sha256 }));
+            expected.push({ path: "transport.mjs", bytes: Buffer.byteLength(transportSource), sha256: digest(transportSource) });
+            expected.push({ path: "package.json", bytes: Buffer.byteLength('{"type":"module"}\n'), sha256: digest('{"type":"module"}\n') });
+            assert.equal(rows.length, expected.length, "only helper, budget, transport and package scope may ship");
+            for (const item of expected) {
+              const row = rows.find(row => row.path === item.path);
+              assert.ok(row); assert.equal(row.bytes, item.bytes); assert.equal(row.sha256, item.sha256); assert.notEqual(row.placeholder, true);
+            }
+          }
+          function makeFixture(historical = false) {
+            const dir = join(work, historical ? "historical-fixture" : "fixture"); mkdirSync(dir, { mode: 0o700 });
+            const data = { "main.ts": fixtureSource, "transport.mjs": transportSource, "package.json": '{"type":"module"}\n' };
+            const closure = historical ? historicalOpenclaw : openclaw;
+            for (const [name,item] of Object.entries(closure.files)) {
+              assert.equal(digest(item.text), item.sha256);
+              assert.equal(createHash("sha1").update("blob " + Buffer.byteLength(item.text) + "\0").update(item.text).digest("hex"), item.gitBlob);
+              data["openclaw/" + name] = item.text;
+            }
+            for (const name of ["package.json", "index.js", "index.d.ts"])
+              data["node_modules/@scriptc/node/" + name] = readFileSync(join(root,"packages/node",name),"utf8");
+            for (const [name,text] of Object.entries(data)) {
+              mkdirSync(join(dir,name,".."), { recursive:true }); writeFileSync(join(dir,name),text,{flag:"wx",mode:0o600});
+              mkdirSync(join(out,historical ? "historical-fixtures" : "fixtures",name,".."),{recursive:true});
+              copyFileSync(join(dir,name),join(out,historical ? "historical-fixtures" : "fixtures",name));
+            }
+            return {dir,entry:join(dir,"main.ts"),manifest:files(dir)};
+          }
+          function observed(receipt, mode, historical = false) {
+            assert.equal(receipt.complete,true,"incomplete controller custody");
+            assert.equal(receipt.cleanupUsed,false);
+            const dead = mode === "parent-death";
+            const childPid = dead ? receipt.child.pid : receipt.admission.pid;
+            const parentPid = dead ? receipt.launcher.pid : receipt.parentPid;
+            for (const name of ["stdout","stderr"]) {
+              const stream = dead ? receipt.streams[name] : receipt.streams[name === "stdout" ? 0 : 1];
+              assert.equal(statSync(stream.path).size,stream.bytes); assert.equal(hash(stream.path),stream.sha256);
+              assert.equal(Buffer.byteLength(stream.text),stream.bytes);
+              assert.equal(digest(stream.text),stream.sha256);
+              if (dead) assert.equal(stream.eof,true);
+              else { assert.equal(stream.end,true); assert.equal(stream.close,true); }
+            }
+            const stderr = normalize(dead ? receipt.streams.stderr.text : receipt.streams[1].text);
+            const events = receipt.events, ready = events.filter(row=>row.kind==="ready");
+            assert.equal(ready.length,1); assert.equal(ready[0].pid,childPid); assert.equal(ready[0].ppid,parentPid);
+            if(mode==="late-watch"){
+              const before=events.filter(row=>row.kind==="late-before-watch"),after=events.filter(row=>row.kind==="late-watch");
+              assert.equal(before.length,1);assert.equal(after.length,1);
+              assert.equal(before[0].pid,childPid);assert.equal(before[0].nonce,receipt.nonce);
+              assert.equal(before[0].connected,false);assert.equal(before[0].channel,false);
+              assert.ok(events.indexOf(before[0])<events.indexOf(after[0]));
+            }
+            const handlers=events.filter(row=>row.kind==="native-handler");
+            const finishes=events.filter(row=>row.kind==="native-finish");
+            const exits=events.filter(row=>row.kind==="native-exit");
+            for(const event of [...handlers,...finishes,...exits]) assert.equal(event.pid,childPid);
+            const terminal = dead ? {code:receipt.childStatus.code,signal:receipt.childStatus.signal===null?null:"SIG"+({9:"KILL",15:"TERM"})[receipt.childStatus.signal]} : receipt.exit;
+            const negative = ["wrong-marker","absent-marker"].includes(mode) || historical;
+            const expectedTerms = mode==="unref" || negative ? 0 : 1;
+            let factsMatch = handlers.length===expectedTerms && handlers.every(row=>row.terms===1 && Number.isInteger(row.work) && row.work>=0) &&
+              finishes.length===(negative?1:0) && finishes.every(row=>row.terms===0) && stderr==="";
+            if(mode==="stubborn"){
+              factsMatch &&= terminal.code===null && terminal.signal==="SIGKILL" && exits.length===0;
+              const request=events.find(row=>row.kind==="disconnect-request");
+              factsMatch &&= !!request && receipt.exit.atMs-request.observedAtMs>=9500 && receipt.exit.atMs-request.observedAtMs<20000;
+            } else {
+              factsMatch &&= terminal.code===0 && terminal.signal===null;
+              if(mode!=="unref")factsMatch &&= exits.length===1 && exits[0].terms===expectedTerms && exits[0].code===0;
+              else factsMatch &&= exits.length===0 && receipt.parentConnectedUntilNaturalExit===true;
+            }
+            if(dead){
+              assert.equal(receipt.evidence,"waitpid-adopted");
+              assert.equal(receipt.groupDrained,true); assert.equal(receipt.adoptedChild.ppid,receipt.supervisor);
+              assert.equal(receipt.launcherStatus.signal,9); assert.equal(receipt.cause.pid,parentPid);
+            }
+            return { factsMatch, expectedTerms, observedTerms:handlers.length, terminal, normalizedStderr:stderr,
+              lateWatchHistoricalBug:historical && handlers.length===0 && finishes.length===1,
+              evidence:dead?"exact adopted waitpid + independent pipe EOF":"ChildProcess exit/close + independent pipe end/close",
+              runtimeAcceptance:false };
+          }
+          async function observeCase(label,mode,command,fixture,native,env,historical=false,compiledParent=false){
+            const receipt=join(out,label+(mode==="parent-death"?".subreaper.json":".custody.json"));
+            const gate=join(work,label+"-gate");
+            if(mode==="parent-death")writeFileSync(receipt,JSON.stringify({complete:false,groupDrained:false,spawned:false})+"\n",{flag:"wx"});
+            const controller=join(work,mode==="parent-death"?"subreaper.py":"controller.mjs");
+            const step=await run(label,mode==="parent-death"?"python3":process.execPath,
+              [controller,...(mode==="parent-death"?[]:[mode]),command,fixture.entry,native?"1":"0",gate,receipt,...(mode==="parent-death"?[process.execPath,compiledParent?"1":"0"]:[])],
+              mode==="parent-death"?55:45,{...env,CUSTODY_EXPECT_LATE_BUG:historical?"1":"",OPENCLAW_CLI_RESPAWN_PARENT:""});
+            requireSuccess(step);
+            const custody=json(receipt), observation=observed(custody,mode,historical);
+            return {execution:step,receipt:record(receipt),observation,complete:true};
+          }
+
+          function scrub(value) {
+            let text = String(value);
+            for (const [path, label] of [[work, "<work>"], [root, "<source>"], [process.env.RUNNER_TEMP, "<runner-temp>"]]) text = text.split(path).join(label);
+            return text;
+          }
+          async function main() {
+            const report = json(join(out, "summary.json")); verifyWorkOwner();
+            let verifyInputs;
+            try {
+              assert.deepEqual(source(), report.sourceBefore); report.nativeInputs = nativeInputs();
+              report.nativeBefore = nativeFiles("linux-x64-gnu"); report.toolsBefore = tools();
+              assert.equal(process.version, "v24.22.1"); assert.equal(report.toolsBefore.pnpm.version, "11.1.3");
+              assert.equal(report.toolsBefore.llvm.version, "22.1.8"); assert.equal(report.toolsBefore.zig.version, "0.16.0");
+              report.helper = JSON.parse(capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+              assert.equal(report.helper.ok, true); assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
+              assert.equal(report.helper.scriptc_package_version, json("packages/llvm-linux-x64-gnu/package.json").version);
+              report.runtimeManifest = retain("packages/runtime-linux-x64-gnu/runtime-pack.json", "runtime-pack.json");
+              save("summary.json", report);
+              const buildEnv = makeEnvironment("build", false);
+              report.build = await run("workspace-build", "pnpm", ["build"], 600, buildEnv); requireSuccess(report.build);
+              assert.deepEqual(nativeFiles("linux-x64-gnu"), report.nativeBefore);
+              const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
+              const packRoot = join(work, "libnode");
+              assert.equal(existsSync(packRoot), false);
+              report.libnodeFetch = await run("libnode-fetch", process.execPath,
+                ["packages/libnode-common/fetch-dev-pack.mjs", "--out", packRoot], 600, makeEnvironment("libnode-fetch", false));
+              requireSuccess(report.libnodeFetch);
+              const pack = readLibnodePack(packRoot, { verifyHashes: true });
+              assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
+              assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
+              report.libnode = { manifest: pack.manifest, manifestFile: retain(join(packRoot, "manifest.json"), "libnode-manifest.json"),
+                files: files(packRoot), route: "explicit checksum-pinned Linux Node 24.22.1 development pack; bridge built from this source",
+                developmentPin: sourcePins["packages/libnode-common/dev-pack.json"], historicalBinaryReuseClaim: false };
+              process.env.SCRIPTC_LIBNODE = packRoot;
+              const fixture = makeFixture(); report.fixture = { manifest: fixture.manifest, digest: digest(JSON.stringify(fixture.manifest)) };
+              const historicalFixture = makeFixture(true);
+              report.historicalFixture = { manifest:historicalFixture.manifest, digest:digest(JSON.stringify(historicalFixture.manifest)) };
+              const payloads = { "controller.mjs":controllerSource, "subreaper.py":reaperSource };
+              for(const [name,text] of Object.entries(payloads)){
+                writeFileSync(join(work,name),text,{flag:"wx",mode:0o600});
+                writeFileSync(join(out,name),text,{flag:"wx",mode:0o600});
+              }
+              report.controllers = Object.fromEntries(Object.keys(payloads).map(name=>[name,record(join(out,name))]));
+
+              const verifyFixture = () => {
+                assert.deepEqual(files(fixture.dir),fixture.manifest);
+                assert.deepEqual(files(historicalFixture.dir),historicalFixture.manifest);
+                for(const [name,text] of Object.entries(payloads)) assert.equal(hash(join(work,name)),digest(text));
+              };
+              verifyInputs = async () => {
+                requireSuccess(await run("verify-runtime-after", process.execPath, ["packages/runtime-linux-x64-gnu/scripts/verify.mjs"], 120));
+                assert.deepEqual(nativeFiles("linux-x64-gnu"), report.nativeBefore);
+                assert.deepEqual(readLibnodePack(packRoot, { verifyHashes: true }).manifest, pack.manifest);
+                assert.deepEqual(files(packRoot), report.libnode.files);
+                assert.deepEqual(nativeInputs(), report.nativeInputs); assert.deepEqual(tools(), report.toolsBefore);
+                assert.deepEqual(source(), report.sourceBefore); verifyFixture();
+                report.inputsVerifiedAfter = true;
+              };
+              const capacity = join(process.env.RUNNER_TEMP, process.env.PROOF_CAPACITY_NAME, "capacity.py");
+              assert.equal(hash(capacity), "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");
+              requireSuccess(await run("pre-proof-capacity", "python3", [capacity, "pre-proof"], 60));
+              for(const mode of caseNames){
+                const row={mode,complete:false};report.oracles.push(row);
+                try{
+                  Object.assign(row,await observeCase("oracle-"+mode,mode,process.execPath,fixture,false,{}));
+                  assert.equal(row.observation.factsMatch,true,"pinned Node oracle facts differ");verifyFixture();
+                }catch(error){row.complete=false;row.error=scrub(error.stack??error);}
+                save("summary.json",report);
+                assert.equal(row.complete,true,"Node custody/readiness incomplete");
+                assert.ok(allDrained(),"Node process ownership unresolved");
+              }
+              report.historicalLateWatch=await observeCase("historical-late-watch","late-watch",process.execPath,historicalFixture,false,{},true);
+              assert.equal(report.historicalLateWatch.observation.lateWatchHistoricalBug,true);
+              assert.equal(report.historicalLateWatch.observation.factsMatch,true);
+              save("summary.json",report);
+              const common = ["packages/cli/dist/main.js", "build", fixture.entry, "--print=diagnostics", "--node-islands=explicit"];
+              const irPath = join(out, "program.ir.json");
+              report.ir = { status: "pending" };
+              try {
+                report.ir.compile = await run("ir-compile", process.execPath, [...common, "--emit=ir", "-o", irPath], 180, makeEnvironment("ir", false));
+                report.ir.diagnostics = validateCompile(report.ir.compile, fixture.entry, irPath);
+                report.ir.artifact = record(irPath); report.ir.ownership = irEvidence(json(irPath), fixture.entry); report.ir.status = "passed";
+              } catch (error) { report.ir.status = "failed"; report.ir.error = scrub(error.stack ?? error); }
+              save("summary.json", report);
+              assert.equal(report.ir.status,"passed","IR ownership admission failed; no native compile or execution");
+              for (const flavor of ["plain", "san"]) {
+                const row = { flavor, compileAdmitted: false, cases: [] }; report.flavors.push(row);
+                const dir = join(work, flavor); mkdirSync(dir, { mode: 0o700 });
+                const binary = join(dir, "program"), env = { ...makeEnvironment(flavor + "-cache", flavor === "san"), SCRIPTC_LIBNODE: packRoot, ASAN_OPTIONS: "detect_leaks=0" };
+                try {
+                  row.compile = await run(flavor + "-compile", process.execPath, [...common, "-o", binary, "--keep-llvm", "--libnode=beside", ...(flavor === "san" ? ["--sanitize"] : [])], 600, env);
+                  if (existsSync(join(dir, "main.ll"))) row.llvm = retain(join(dir, "main.ll"), flavor + ".ll");
+                  row.diagnostics = validateCompile(row.compile, fixture.entry, binary);
+                  assert.equal(report.ir.status, "passed"); assert.ok(row.llvm);
+                  assert.deepEqual(readFileSync(binary).subarray(0, 4), Buffer.from([127, 69, 76, 70]));
+                  assert.equal(existsSync(join(dir, "manifest.json")), false, "standalone manifest would change planner semantics");
+                  row.binary = { bytes: statSync(binary).size, sha256: hash(binary) };
+                  const deployment = () => {
+                    assert.equal(hash(binary), row.binary.sha256);
+                    assert.deepEqual(readLibnodePack(binary + ".libnode", { verifyHashes: true }).manifest, pack.manifest);
+                    const modules = files(binary + ".libnode/modules"); verifyModuleRows(modules);
+                    return files(binary + ".libnode");
+                  };
+                  row.deployment = deployment(); row.compileAdmitted = true;
+                  for (const mode of caseNames) {
+                    const item = { mode, attempted: true, complete: false }; row.cases.push(item);
+                    try {
+                      Object.assign(item,await observeCase(flavor+"-"+mode,mode,binary,fixture,true,{...env,SCRIPTC_LIBNODE:""}));
+                      assert.deepEqual(deployment(), row.deployment); verifyFixture(); item.inputsVerifiedAfter = true; item.complete = true;
+                    } catch (error) { item.error = scrub(error.stack ?? error); }
+                    save("summary.json", report); if (!allDrained()) throw new Error("native process ownership unresolved");
+                    assert.equal(item.complete,true,"native custody admission incomplete; stop dependent execution");
+                  }
+                  const compiledParent={mode:"compiled-parent-death",attempted:true,complete:false};row.cases.push(compiledParent);
+                  try{
+                    Object.assign(compiledParent,await observeCase(flavor+"-compiled-parent-death","parent-death",binary,fixture,true,{...env,SCRIPTC_LIBNODE:""},false,true));
+                    assert.deepEqual(deployment(),row.deployment);verifyFixture();compiledParent.inputsVerifiedAfter=true;
+                  }catch(error){compiledParent.error=scrub(error.stack??error);}
+                } catch (error) { row.error = scrub(error.stack ?? error); }
+                save("summary.json", report); if (!allDrained()) throw new Error("native compile ownership unresolved");
+                assert.ok(row.compileAdmitted && row.cases.length===8 && row.cases.every(item=>item.complete),"native preparation/custody incomplete");
+              }
+              report.preCleanupComplete = report.oracles.length === 7 && report.oracles.every(row => row.complete) &&
+                report.ir.status === "passed" && report.flavors.length === 2 && report.flavors.every(row => row.compileAdmitted &&
+                row.cases.length === 8 && row.cases.every(item => item.complete && item.inputsVerifiedAfter));
+              report.preCleanupComplete &&= report.historicalLateWatch?.complete === true;
+              report.nativeParity=report.preCleanupComplete && report.flavors.every(row=>row.cases.every(item=>item.observation.factsMatch));
+            } catch (error) { report.error = scrub(error.stack ?? error); }
+            finally {
+              try { assert.ok(verifyInputs, "preparation did not complete"); await verifyInputs(); }
+              catch (error) { report.readbackError = scrub(error.stack ?? error); }
+              report.sourceAfter = source(); save("summary.json", report);
+            }
+            assert.equal(report.preCleanupComplete, true, "diagnostic incomplete");
+            assert.equal(report.inputsVerifiedAfter, true);
+            assert.equal(report.nativeParity, true, "native parent-custody facts differ; see raw receipts");
+          }
+          function initialize() {
+            assert.equal(head, "8b9f7981e9198831474bbbe2eb47c48407daa380");
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
+            mkdirSync(work, { mode: 0o700 }); writeFileSync(join(work, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+            mkdirSync(out, { mode: 0o700 }); copyFileSync(self, join(out, "runner.mjs"));
+            save("summary.json", { schemaVersion: 1, ...owner, runnerSha256: hash(self), sourceBefore: source(),
+              openclaw: { head: openclaw.head, files: Object.fromEntries(Object.entries(openclaw.files).map(([name, item]) => [name, { sha256: item.sha256, gitBlob: item.gitBlob }])) },
+              historicalOpenclaw:{head:historicalOpenclaw.head,files:Object.fromEntries(Object.entries(historicalOpenclaw.files).map(([name,item])=>[name,{sha256:item.sha256,gitBlob:item.gitBlob}]))},
+              scope:{mainCases:7,nodeOracles:7,historicalNodeControls:1,nativeCompiles:2,irCompiles:1,nativeObservations:16,totalObservations:24},
+              limitations:["Reviewed OpenClaw draft https://github.com/openclaw/openclaw/pull/189915 is explicitly pinned; no shipped or adoption claim.",
+                "Explicit-disconnect rows are child-initiated over canonical IPC, not parent ChildProcess.disconnect().",
+                "Live-parent rows require actual ChildProcess exit/close and independent stdout/stderr end/close.",
+                "Parent-death rows use exact adopted waitpid status and pipe EOF from a task-only Linux subreaper; no descendant ChildProcess.close claim.",
+                "Seven main rows use the reviewed helper. Only one Node late-watch negative control uses the historical helper.",
+                "Two additional native observations require a compiled parent, explicit island spawn and native child.",
+                "Native signal and interval owners are IR-admitted; the unchanged helper and IPC transport run in Node.",
+                "Detached-worker independence, shared synthetic-emit compatibility, full OpenClaw lifetime and runtime acceptance are unqualified.",
+                "Startup gates add no event-loop handle. SIGUSR1 ends marker/old-helper controls; cleanup never supplies a passing outcome.",
+                "ASan leak detection is disabled as in the prior embedded-Node diagnostic; only its canonical swapcontext warning is normalized."],
+              oracles: [], flavors: [], diagnosticComplete: false, qualificationComplete: false, runtimeAcceptance: false });
+          }
+          function finalize() {
+            const report = json(join(out, "summary.json")), cleanup = { passed: false, retained: true };
+            try {
+              verifyWorkOwner(); assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k => [k, report[k]])), owner);
+              assert.ok(allDrained(), "owned process custody unresolved");
+              assert.equal(hash(self), report.runnerSha256); cleanup.source = source(); assert.deepEqual(cleanup.source, report.sourceBefore);
+              rmSync(work, { recursive: true }); cleanup.passed = true; cleanup.retained = false;
+              rmSync(self); cleanup.payloadRemoved = true;
+            } catch (error) { cleanup.error = scrub(error.stack ?? error); }
+            report.cleanup = cleanup;
+            report.diagnosticComplete = report.preCleanupComplete === true && report.inputsVerifiedAfter === true && cleanup.passed;
+            report.qualificationComplete = false; report.runtimeAcceptance = false;
+            save("summary.json", report); save("artifact-manifest.json", files(out).filter(row => row.path !== "artifact-manifest.json"));
+            assert.equal(report.diagnosticComplete, true, "diagnostic incomplete");
+            assert.equal(report.nativeParity, true, "diagnostic retained native mismatches");
+          }
+          if (process.argv[2] !== "--probe") {
+            try {
+              if (process.argv[2] === "--init") initialize();
+              else if (process.argv[2] === "--finalize") finalize();
+              else if (process.argv[2] === "--child") await childMain();
+              else await main();
+            } catch (error) { process.stderr.write(scrub(error.stack ?? error) + "\n[openclaw-native-parent-custody] FAILED (exit 1)\n"); process.exitCode = 1; }
+          }
+          RUNNER
+          node "$RUNNER_TEMP/openclaw-native-parent-custody.mjs" --init
+      - name: Observe native parent custody
+        run: |
+          ulimit -c 0
+          node "$RUNNER_TEMP/openclaw-native-parent-custody.mjs"
+      - name: Verify custody and remove owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/openclaw-native-parent-custody.mjs"
+          node "$RUNNER_TEMP/openclaw-native-parent-custody.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openclaw-native-parent-custody
+          path: ${{ runner.temp }}/openclaw-native-parent-custody-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openclaw-native-parent-custody-capacity
+          path: ${{ runner.temp }}/openclaw-native-parent-custody-capacity
+          if-no-files-found: error
+          retention-days: 1
