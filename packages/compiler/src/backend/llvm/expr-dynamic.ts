@@ -864,9 +864,8 @@ export function emitDynamicExpr(
         test = B.tmp();
         B.line(`${test} = call zeroext i1 @scr_dyn_truthy(ptr ${d.name})`);
       } else if (e.test === "error") {
-        // `u instanceof Error`: the checked-dynamic tree's error encoding — an object
-        // carrying the reserved "%error" marker key, a registered native
-        // Error view.
+        // Error brand checks accept native views and foreign Error handles.
+        // Authored island instanceof uses prototype membership separately.
         const kd = host.dynKind(d.name);
         const isObj = B.tmp();
         B.line(`${isObj} = icmp eq i32 ${kd}, ${DYN_KIND.OBJ}`);

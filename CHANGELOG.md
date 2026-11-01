@@ -4,6 +4,8 @@ All notable changes to scriptc will be documented in this file.
 
 ## Unreleased
 
+- Errors created in Node islands keep their identity through typed callbacks, checked conversions, throws, and promises. Dynamic properties stay on the island object; Error branding and prototype checks remain distinct.
+
 - Cycle collection follows native Error causes, AggregateError lists and disposal SuppressedError snapshots, preserving retained values and reclaiming released cycles without releasing their payloads twice.
 
 - Native TLS rejects certificates with compromised public keys, including selected trust anchors, and reports the same verification result through typed and dynamic socket properties. Optional verification records `CERT_REVOKED` or `UNSPECIFIED` without authorizing the peer.

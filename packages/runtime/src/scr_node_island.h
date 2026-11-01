@@ -139,6 +139,11 @@ typedef struct ScrNiDynOps {
   int (*instance_of)(ScrDyn *value, ScrDyn *ctor);
   ScrDyn *(*to_primitive)(const ScrDyn *self, int hint);
   bool (*is_function)(const ScrDyn *value);
+  /* Branding reads bridge flags only; extraction may snapshot Error fields. */
+  bool (*is_error)(const ScrDyn *value);
+  bool (*error_instanceof)(const ScrDyn *value, int kind);
+  ScrError *(*error_of)(const ScrDyn *value); /* +1 typed mirror */
+  ScrDyn *(*error_value)(const ScrError *error); /* +1 handle, NULL for native Errors */
 } ScrNiDynOps;
 extern const ScrNiDynOps *scr_ni_dyn_ops;
 
@@ -168,7 +173,6 @@ void scr_ni_stop(void);
  * referent. The conversions of scr_node_island_handle.c call these. */
 bool scr_ni_value_out(ScrDyn *v, struct ScrNodeValue *out); /* NI-4's into-V8 conversion */
 ScrDyn *scr_ni_value_in(const struct ScrNodeValue *v);      /* +1 */
-ScrDyn *scr_ni_arg_in(const struct ScrNodeValue *v); /* +1; island Errors as their ScrError */
 bool scr_ni_exportable(const ScrDyn *v);
 void scr_ni_export_out(ScrDyn *v, struct ScrNodeValue *out);
 ScrDyn *scr_ni_export_value(uint32_t id); /* borrowed, or NULL */

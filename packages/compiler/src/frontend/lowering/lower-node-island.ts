@@ -28,6 +28,8 @@ import {
   BOOL,
   DYN,
   FOREIGN,
+  F64,
+  RUNTIME_ERROR_CLASSES,
   STRING,
   VOID,
   type IrExpr,
@@ -1763,50 +1765,26 @@ export function lowerIslandExpr(lowerer: Lowerer, expr: ts.Expression): IrExpr |
     const op = expr.operatorToken.kind;
     if (op === ts.SyntaxKind.InstanceOfKeyword) {
       const global = intrinsicErrorClassOf(lowerer, expr.right);
-      if (global !== null && !lowerer.islandInstanceofHandled.has(expr)) {
-        const name: IrExpr = { kind: "strLit", value: global, type: STRING, loc };
-        // An island value (an instance of a native subclass of an island
-        // error class, say) answers as in Node.
-        if (isForeignExpr(lowerer, expr.left)) {
-          lowerer.usesNodeIsland = true;
-          const value = lowerer.coerceToExpected(lowerer.lowerExpr(expr.left), DYN);
-          return {
-            kind: "libCall",
-            fn: "nodeIsland.instanceofGlobal",
-            args: [value, name],
-            type: BOOL,
-            loc,
-          };
-        }
-        // A dyn or caught value may hold one: the native test, else Node's.
-        const left = stripTypeWrappers(expr.left);
-        if (ts.isIdentifier(left)) {
-          const probe = lowerer.lowerExpr(left);
-          if (probe.type.kind === "dyn" || probe.type.kind === "caught") {
-            lowerer.islandInstanceofHandled.add(expr);
-            let native: IrExpr;
-            try {
-              native = lowerer.lowerExpr(expr);
-            } finally {
-              lowerer.islandInstanceofHandled.delete(expr);
-            }
-            lowerer.usesNodeIsland = true;
-            return {
-              kind: "logical",
-              op: "||",
-              left: native,
-              right: {
-                kind: "libCall",
-                fn: "nodeIsland.instanceofGlobal",
-                args: [lowerer.coerceToExpected(probe, DYN), name],
-                type: BOOL,
-                loc,
-              },
-              type: BOOL,
+      if (global !== null) {
+        // Brand checks admit typed Errors, but authored instanceof follows the
+        // current prototype. Box once so caught and typed island mirrors reach
+        // the same owner as returned handles, including nonidentifier operands.
+        const value = lowerer.coerceToExpected(lowerer.lowerExpr(expr.left), DYN);
+        return {
+          kind: "libCall",
+          fn: "dyn.errInstanceof",
+          args: [
+            value,
+            {
+              kind: "numLit",
+              value: RUNTIME_ERROR_CLASSES.get(`%${global}`)!.kind,
+              type: F64,
               loc,
-            };
-          }
-        }
+            },
+          ],
+          type: BOOL,
+          loc,
+        };
       }
     }
     if (op === ts.SyntaxKind.InstanceOfKeyword && isForeignExpr(lowerer, expr.right)) {
