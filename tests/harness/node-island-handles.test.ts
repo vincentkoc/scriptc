@@ -316,19 +316,21 @@ async function withForeignErrors(
   source: string,
   check: (entry: string, binary: string) => Promise<void>,
   inspectIr?: (ir: ReturnType<typeof deserializeModule>, entry: string) => void,
+  options: { optimization?: "release" | "dev"; islandSource?: string } = {},
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), `scriptc-${name}-`));
   try {
     const entry = join(dir, "main.mts");
     const island = join(dir, "island.mjs");
     writeFileSync(entry, `import * as island from './island.mjs';\n${source}`);
-    writeFileSync(island, foreignErrorModule);
+    writeFileSync(island, options.islandSource ?? foreignErrorModule);
     const result = await compile(entry, {
       outDir: dir,
       outPath: join(dir, "program"),
       sanitize,
       nodeIslands: { mode: "explicit", islands: [island] },
       ...(inspectIr === undefined ? {} : { emitIr: true }),
+      ...(options.optimization === undefined ? {} : { optimization: options.optimization }),
     });
     if (!result.ok)
       throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
@@ -586,6 +588,154 @@ console.log('typed-remaining', throwing.listenerCount('error'));
       },
     );
   }, 300_000);
+
+  test.each(["release", "dev"] as const)(
+    "typed error monitors apply current foreign Error prototype policy in %s",
+    async (optimization) => {
+      await withForeignErrors(
+        `emitter-typed-error-policy-${optimization}`,
+        `
+import { EventEmitter, errorMonitor } from 'node:events';
+function reportWrapped(label: string, caught: unknown, value: Error): void {
+  const error = caught as any;
+  console.log(label, error.code, error.message, error.context === value);
+}
+const detached = new EventEmitter();
+const detachedValue = island.inspectable('text') as Error;
+function detachMonitor(error: Error): void { console.log('detach-monitor', error === detachedValue); island.detach(error); }
+detached.on(errorMonitor, detachMonitor);
+try { detached.emit('error', detachedValue); }
+catch (caught) { reportWrapped('detached', caught, detachedValue); }
+console.log('detach-counts', island.inspectCount(), island.coercionCount());
+const added = new EventEmitter();
+const addedValue = island.inspectable('text') as Error;
+function addedListener(error: Error): void { console.log('added-listener', error === addedValue); }
+function addMonitor(error: Error): void { console.log('add-monitor', error === addedValue); island.detach(error); added.on('error', addedListener); }
+added.on(errorMonitor, addMonitor);
+console.log('added', added.emit('error', addedValue));
+console.log('add-counts', island.inspectCount(), island.coercionCount());
+const removed = new EventEmitter();
+const removedValue = island.inspectable('text') as Error;
+function removedListener(error: Error): void { console.log('unexpected-listener', error === removedValue); }
+function removeMonitor(error: Error): void { console.log('remove-monitor', error === removedValue); removed.off('error', removedListener); island.detach(error); }
+removed.on('error', removedListener);
+removed.on(errorMonitor, removeMonitor);
+try { removed.emit('error', removedValue); }
+catch (caught) { reportWrapped('removed', caught, removedValue); }
+console.log('remove-counts', island.inspectCount(), island.coercionCount());
+const throwing = new EventEmitter();
+const throwingValue = island.inspectable('text') as Error;
+function throwMonitor(error: Error): void { console.log('throw-monitor', error === throwingValue); island.detach(error); throw 37; }
+function afterThrow(error: Error): void { console.log('unexpected-after-throw', error === throwingValue); }
+throwing.on(errorMonitor, throwMonitor);
+throwing.on('error', afterThrow);
+try { throwing.emit('error', throwingValue); }
+catch (caught) { console.log('monitor-caught', caught === 37); }
+console.log('throw-counts', island.inspectCount(), island.coercionCount());
+const attached = new EventEmitter();
+const attachedValue = island.inspectable('text') as Error;
+island.detach(attachedValue);
+function attachMonitor(error: Error): void { console.log('attach-monitor', error === attachedValue); island.attach(error); }
+attached.on(errorMonitor, attachMonitor);
+try { attached.emit('error', attachedValue); }
+catch (caught) { console.log('attached', caught === attachedValue); }
+console.log('attach-counts', island.inspectCount(), island.coercionCount());
+const inspected = new EventEmitter();
+const inspectedValue = island.inspectable('throw-inspect') as Error;
+function inspectMonitor(error: Error): void { console.log('inspect-monitor', error === inspectedValue); island.detach(error); }
+inspected.on(errorMonitor, inspectMonitor);
+try { inspected.emit('error', inspectedValue); }
+catch (caught) { reportWrapped('inspect-fallback', caught, inspectedValue); }
+console.log('inspect-counts', island.inspectCount(), island.coercionCount());
+const coerced = new EventEmitter();
+const coercedValue = island.inspectable('throw-coerce') as Error;
+function coerceMonitor(error: Error): void { console.log('coerce-monitor', error === coercedValue); island.detach(error); }
+coerced.on(errorMonitor, coerceMonitor);
+try { coerced.emit('error', coercedValue); }
+catch (caught) { console.log('coerce-caught', caught === 59); }
+console.log('coerce-counts', island.inspectCount(), island.coercionCount());
+const native = new EventEmitter();
+const nativeValue = new Error('native');
+try { native.emit('error', nativeValue); }
+catch (caught) { console.log('native-caught', caught === nativeValue); }
+`,
+        (entry, binary) =>
+          foreignErrorParity(
+            entry,
+            binary,
+            "detach-monitor true\ndetached ERR_UNHANDLED_ERROR Unhandled error. (detached-sentinel) true\ndetach-counts 1 0\nadd-monitor true\nadded-listener true\nadded true\nadd-counts 0 0\nremove-monitor true\nremoved ERR_UNHANDLED_ERROR Unhandled error. (detached-sentinel) true\nremove-counts 1 0\nthrow-monitor true\nmonitor-caught true\nthrow-counts 0 0\nattach-monitor true\nattached true\nattach-counts 0 0\ninspect-monitor true\ninspect-fallback ERR_UNHANDLED_ERROR Unhandled error. (coerced-sentinel) true\ninspect-counts 1 1\ncoerce-monitor true\ncoerce-caught true\ncoerce-counts 1 1\nnative-caught true\n",
+          ),
+        (ir, entry) => {
+          const authored = authoredEmitterCall(ir, entry);
+          for (const [emitter, value] of [
+            ["detached", "detachedValue"],
+            ["added", "addedValue"],
+            ["removed", "removedValue"],
+            ["throwing", "throwingValue"],
+            ["attached", "attachedValue"],
+            ["inspected", "inspectedValue"],
+            ["coerced", "coercedValue"],
+            ["native", "nativeValue"],
+          ]) {
+            const call = authored("emitter.emitError", `${emitter}.emit('error', ${value})`);
+            expect(call.args.map((arg) => arg.type)).toEqual([
+              { kind: "object", className: "%EventEmitter" },
+              { kind: "string" },
+              { kind: "object", className: "%Error" },
+            ]);
+          }
+          for (const text of [
+            "detached.on(errorMonitor, detachMonitor)",
+            "added.on(errorMonitor, addMonitor)",
+            "added.on('error', addedListener)",
+            "removed.on(errorMonitor, removeMonitor)",
+            "removed.on('error', removedListener)",
+            "throwing.on(errorMonitor, throwMonitor)",
+            "throwing.on('error', afterThrow)",
+            "attached.on(errorMonitor, attachMonitor)",
+            "inspected.on(errorMonitor, inspectMonitor)",
+            "coerced.on(errorMonitor, coerceMonitor)",
+          ]) {
+            const callback = authored("emitter.on", text).args[2]!;
+            expect(callback.kind).toBe("closure");
+            if (callback.kind !== "closure") throw new Error("expected native typed listener");
+            const fn = ir.functions.find((candidate) => candidate.name === callback.fnName);
+            expect(fn).toBeDefined();
+            expect(fn!.params.map((param) => param.type)).toEqual([
+              { kind: "object", className: "%Error" },
+            ]);
+            expect(realpathSync(fn!.loc.file)).toBe(realpathSync(entry));
+          }
+        },
+        {
+          optimization,
+          islandSource: `${foreignErrorModule}
+let inspections = 0;
+let coercions = 0;
+export function inspectable(mode) {
+  inspections = 0;
+  coercions = 0;
+  const value = new Error('policy');
+  value[Symbol.for('nodejs.util.inspect.custom')] = () => {
+    inspections++;
+    if (mode !== 'text') throw 'inspect-stop';
+    return 'detached-sentinel';
+  };
+  value[Symbol.toPrimitive] = () => {
+    coercions++;
+    if (mode === 'throw-coerce') throw 59;
+    return 'coerced-sentinel';
+  };
+  return value;
+}
+export function inspectCount() { return inspections; }
+export function coercionCount() { return coercions; }
+`,
+        },
+      );
+    },
+    300_000,
+  );
 
   test("dynamic error monitors determine listener and prototype handling before unhandled throws", async () => {
     await withForeignErrors(
