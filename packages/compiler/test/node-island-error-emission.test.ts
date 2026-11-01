@@ -70,17 +70,21 @@ console.log(dynamic(island.get()), typed(island.get() as Error), expression(), c
 });
 
 test("pure native typed Error instanceof retains its unboxed class test", async () => {
-  const module = await lowered(
-    `function native(value: Error): boolean { return value instanceof TypeError; }
+  const source = `function native(value: Error): boolean { return value instanceof TypeError; }
 console.log(native(new TypeError('native')));
-`,
-    false,
-  );
+`;
+  const module = await lowered(source, false);
   expect(module.nodeIsland).toBeUndefined();
-  const all = nodes(module);
-  expect(all.some((node) => node.kind === "libCall" && node.fn === "dyn.errInstanceof")).toBe(
-    false,
+  // Other module paths may box values; this authored predicate must use
+  // the typed parameter directly instead of the island predicate adapter.
+  const predicates = nodes(module).filter(
+    (node) =>
+      node.kind === "instanceOf" &&
+      (node.loc as { start: number }).start === source.indexOf("value instanceof TypeError"),
   );
-  expect(all.some((node) => node.kind === "dynFrom")).toBe(false);
-  expect(all.some((node) => node.kind === "instanceOf")).toBe(true);
+  expect(predicates).toHaveLength(1);
+  expect(predicates[0]).toMatchObject({
+    className: "%TypeError",
+    value: { kind: "varRef", type: { kind: "object", className: "%Error" } },
+  });
 });
