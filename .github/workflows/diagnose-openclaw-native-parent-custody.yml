@@ -388,6 +388,7 @@ jobs:
           function irEvidence(program, entry) {
             assert.notEqual(program.commonJsEntry, true);
             const map = new Map(program.functions.map(fn => [fn.name, fn]));
+            assert.equal(map.size, program.functions.length, "duplicate native function identity");
             const owners = program.functions.filter(fn => fn.loc?.file === entry && fn.body?.length);
             assert.ok(owners.length);
             const occurrences = (name, source) => {
@@ -403,7 +404,9 @@ jobs:
               if (expr.kind === "dynFrom" || expr.kind === "dynCheck") return resolve(expr.value, owner, seen);
               if (expr.kind === "varRef") {
                 const fn = map.get(owner);
-                const writes = collect(fn.body, node => (node.kind === "varDecl" || node.kind === "assign") && node.localId === expr.localId);
+                // A declaration without an initializer allocates a slot, but does not write its callback value.
+                const writes = collect(fn.body, node => node.localId === expr.localId &&
+                  (node.kind === "assign" || node.kind === "assignExpr" || (node.kind === "varDecl" && node.init !== null)));
                 assert.equal(writes.length, 1, "closure must have one owner-local writer");
                 return resolve(writes[0].init ?? writes[0].value, owner, seen);
               }
@@ -456,19 +459,81 @@ jobs:
             const parent = owners.filter(fn => fn.sourceName === "runParent" || fn.name === "runParent");
             assert.ok(parent.length && parent.some(fn => collect(fn.body, node => node.kind === "libCall" && node.fn === "timers.setInterval").length),
               "compiled parent entry and liveness must remain native");
-            const parentSpawn = parent.flatMap(fn=>collect(fn.body,node=>node.kind==="dynInvoke" && node.method==="spawnOwned"));
-            assert.ok(parentSpawn.length>0,"compiled parent did not call the explicit island spawn");
-            for(const call of parentSpawn){
-              assert.equal(call.loc.file,entry);assert.equal(call.loc.start,fixtureSource.indexOf("transport.spawnOwned("));assert.equal(call.args.length,3);
-            }
             const required = collect(program, node => node.kind === "libCall" && node.fn === "nodeIsland.require");
             assert.equal(required.length, 1);
             assert.equal(required[0].loc.file, entry);
             assert.equal(required[0].loc.start, fixtureSource.indexOf('requireModule("./transport.mjs")'));
+            assert.equal(required[0].args.length, 1);
+            assert.equal(required[0].args[0].kind, "strLit"); assert.equal(required[0].args[0].value, "./transport.mjs");
+            // This frozen fixture lowers property calls to owner-local temporaries and dynCall.
+            // Admit the actual receiver/member dataflow; calleeName alone is only error-message text.
+            const writes = (body, id) => collect(body, node => node.localId === id &&
+              (node.kind === "assign" || node.kind === "assignExpr" || (node.kind === "varDecl" && node.init !== null)));
+            const shape = value => Array.isArray(value) ? value.map(shape) : value && typeof value === "object"
+              ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== "loc" && key !== "type").map(([key, child]) => [key, shape(child)])) : value;
+            const ref = localId => ({ kind: "varRef", localId });
+            const literal = value => ({ kind: "strLit", value });
+            const lib = (fn, args) => ({ kind: "libCall", fn, args });
+            assert.equal(parent.length, 1);
+            const sequences = collect(parent[0].body, node => node.kind === "seqExpr" && node.loc?.file === entry &&
+              node.loc.start === fixtureSource.indexOf("transport.spawnOwned("));
+            assert.equal(sequences.length, 1, "missing authored parent spawn sequence");
+            const sequence = sequences[0], call = sequence.result;
+            assert.ok(parent[0].body.some(stmt => stmt.kind === "exprStmt" && stmt.expr === sequence), "spawn must be a direct parent statement");
+            assert.equal(sequence.stmts.length, 2); assert.equal(call.kind, "dynCall");
+            assert.equal(call.callee.kind, "varRef"); assert.equal(call.receiver?.kind, "varRef");
+            const [receiver, callee] = sequence.stmts;
+            for (const [stmt, use] of [[receiver, call.receiver], [callee, call.callee]]) {
+              assert.equal(stmt.kind, "varDecl"); assert.equal(stmt.localId, use.localId);
+              assert.deepEqual(writes(parent[0].body, use.localId), [stmt], "ambiguous parent-local writer");
+            }
+            assert.notEqual(receiver.localId, callee.localId);
+            assert.equal(receiver.init.kind, "varRef");
+            const transportId = receiver.init.localId;
+            const globals = program.globals.filter(row => row.id === transportId);
+            assert.equal(globals.length, 1); assert.equal(globals[0].name, "transport"); assert.equal(globals[0].mutable, false);
+            const transportWrites = writes(program.functions, transportId);
+            assert.equal(transportWrites.length, 1); assert.equal(transportWrites[0].kind, "assign");
+            assert.equal(transportWrites[0].value, required[0]);
+            const initializers = program.functions.filter(fn => fn.body.includes(transportWrites[0]));
+            assert.equal(initializers.length, 1);
+            const initializer = initializers[0];
+            assert.deepEqual(shape(map.get("%main")?.body), [{ kind: "exprStmt", expr: { kind: "call", callee: initializer.name, args: [] } }]);
+            const parentEntries = collect(program.functions, node => node.kind === "call" && node.callee === parent[0].name);
+            assert.equal(parentEntries.length, 1);
+            const dispatchIndex = initializer.body.findIndex(stmt => collect(stmt, node => node === parentEntries[0]).length);
+            assert.ok(dispatchIndex > initializer.body.indexOf(transportWrites[0]), "transport must initialize before parent dispatch");
+            assert.equal(callee.init.kind, "libCall"); assert.equal(callee.init.fn, "js.toDyn"); assert.equal(callee.init.args.length, 1);
+            const member = callee.init.args[0];
+            assert.equal(member.kind, "call"); assert.deepEqual(shape(member.args), [ref(receiver.localId)]);
+            const property = map.get(member.callee);
+            assert.ok(property); assert.equal(property.params.length, 1); assert.equal(property.body.length, 2);
+            const parameter = property.params[0].localId, bag = property.body[0];
+            assert.equal(bag.kind, "varDecl"); assert.equal(bag.init.kind, "call"); assert.equal(bag.init.args.length, 1);
+            const inner = bag.init.args[0];
+            assert.equal(inner.kind, "call"); assert.deepEqual(shape(inner.args), [ref(parameter)]);
+            for (const adapter of [bag.init, inner]) {
+              const fn = map.get(adapter.callee);
+              assert.ok(fn); assert.equal(fn.params.length, 1);
+              assert.deepEqual(shape(fn.body), [{ kind: "return", value: ref(fn.params[0].localId) }], "property adapter must preserve the receiver");
+            }
+            assert.deepEqual(shape(property.body[1]), { kind: "return", value: lib("js.fromDyn", [{ kind: "ternary",
+              cond: { kind: "dynScalarEq", left: ref(bag.localId), right: ref(parameter) },
+              then: { kind: "dynKeyGet", key: literal("spawnOwned"), value: ref(bag.localId) },
+              else_: lib("dyn.bagGet", [ref(bag.localId), literal("spawnOwned"), ref(parameter)]) }]) });
+            assert.equal(call.loc.file, entry); assert.equal(call.loc.start, sequence.loc.start);
+            assert.equal(call.args.length, 3); assert.equal(call.spreads?.length ?? 0, 0);
+            ["process.env.CUSTODY_CHILD_COMMAND ?? process.execPath", "process.env.CUSTODY_CHILD_ENTRY ?? process.argv[1]",
+              'process.env.CUSTODY_NATIVE === "1"'].forEach((source, index) => {
+              const start = fixtureSource.indexOf(source); assert.ok(start >= 0);
+              assert.deepEqual(call.args[index].loc, { file: entry, start, end: start + source.length });
+            });
+            const parentSpawn = [{ loc: call.loc, kind: call.kind, method: "spawnOwned", property: property.name,
+              receiver: transportId, initializer: initializer.name }];
             const inventory = program.nodeIsland?.modules?.files;
             assert.ok(Array.isArray(inventory));
             verifyModuleRows(inventory.map(row => ({ path: row.path, bytes: row.size, sha256: row.sha256, placeholder: row.placeholder ?? false })));
-            return { nativeEntry: true, signals, timerOwners, exitOwners, parentSpawn:parentSpawn.map(call=>({loc:call.loc,method:call.method})), parentOwners: parent.map(fn => fn.name), explicitRequire: required[0].loc, moduleInventory: inventory };
+            return { nativeEntry: true, signals, timerOwners, exitOwners, parentSpawn, parentOwners: parent.map(fn => fn.name), explicitRequire: required[0].loc, moduleInventory: inventory };
           }
           function verifyModuleRows(rows) {
             const expected = Object.entries(openclaw.files).map(([name,item]) =>
