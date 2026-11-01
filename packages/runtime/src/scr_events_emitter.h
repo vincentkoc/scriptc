@@ -114,10 +114,9 @@ bool scr_emitter_emit_any(ScrEmitter *em, ScrStr *name, ScrDyn *const *args, siz
 bool scr_emitter_emit_error_value(ScrEmitter *em, ScrDyn *const *args, size_t argc,
                                   ScrStr *(*render)(ScrDyn *, double, double));
 ScrEmitter *scr_emitter_off_dyn(ScrEmitter *em, ScrStr *name, const ScrDyn *cb);
-/* The registry's checked-dynamic half (meta-event argument vectors and
- * rebuilt listener values), installed by the first on_any call; NULL in
- * programs that never register a listener through an untyped value.
- * Internal. */
+/* The registry's checked-dynamic half (meta arguments, listener values and
+ * fixed Error arguments), installed by dynamic registrations/error emits.
+ * Typed-only programs do not link these converters. Internal. */
 typedef struct ScrEeDynOps ScrEeDynOps;
 extern SCR_TL const ScrEeDynOps *scr_ee_dyn;
 /* The adapter-mediated registration (the LLVM backend's listeners): the
