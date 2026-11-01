@@ -4,6 +4,8 @@ All notable changes to scriptc will be documented in this file.
 
 ## Unreleased
 
+- Native EventEmitter preserves Node-island Error identity in unhandled throws and typed listeners. Error monitors can add or remove listeners before dispatch; dynamic island payloads use their post-monitor prototype for unhandled-error checks.
+
 - Errors created in Node islands keep their identity through typed callbacks, checked conversions, throws, and promises. Dynamic properties stay on the island object; Error branding and prototype checks remain distinct.
 
 - Cycle collection follows native Error causes, AggregateError lists and disposal SuppressedError snapshots, preserving retained values and reclaiming released cycles without releasing their payloads twice.

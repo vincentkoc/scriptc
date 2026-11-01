@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -21,7 +22,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile, deserializeModule } from "@scriptc/compiler";
+import type { IrExpr } from "../../packages/compiler/src/ir/ir.js";
 import { libnodePack } from "./libnode.js";
 
 const execFileAsync = promisify(execFile);
@@ -298,6 +300,7 @@ export function code() { return kept.code; }
 export function plain() { return { name: 'TypeError', message: 'same', '%error': true }; }
 export function prototypeOnly() { return Object.create(Error.prototype); }
 export function detach(value) { Object.setPrototypeOf(value, null); }
+export function attach(value) { Object.setPrototypeOf(value, Error.prototype); }
 let reads = 0;
 export function guarded() {
   const value = new TypeError('guarded');
@@ -312,6 +315,7 @@ async function withForeignErrors(
   name: string,
   source: string,
   check: (entry: string, binary: string) => Promise<void>,
+  inspectIr?: (ir: ReturnType<typeof deserializeModule>, entry: string) => void,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), `scriptc-${name}-`));
   try {
@@ -324,9 +328,27 @@ async function withForeignErrors(
       outPath: join(dir, "program"),
       sanitize,
       nodeIslands: { mode: "explicit", islands: [island] },
+      ...(inspectIr === undefined ? {} : { emitIr: true }),
     });
     if (!result.ok)
       throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    if (inspectIr !== undefined) {
+      expect(result.islands?.packages).toEqual([]);
+      expect(result.islands?.modules.map((file) => realpathSync(file))).toEqual([
+        realpathSync(island),
+      ]);
+      expect(result.irPath).toBeDefined();
+      const ir = deserializeModule(readFileSync(result.irPath!, "utf8"));
+      const modules = ir.nodeIsland?.modules;
+      expect(modules).toBeDefined();
+      // A package.json scope may accompany the sole executable island source.
+      const sources = modules!.files.filter((file) => /\.[cm]?[jt]sx?$/.test(file.path));
+      expect(sources.map((file) => realpathSync(join(modules!.root, file.path)))).toEqual([
+        realpathSync(island),
+      ]);
+      expect(sources[0]!.placeholder).toBeUndefined();
+      inspectIr(ir, entry);
+    }
     await check(entry, result.binaryPath);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -351,11 +373,324 @@ async function foreignErrorParity(entry: string, binary: string, expected: strin
     encoding: "utf8",
     timeout: 30_000,
   });
-  expect(native.stdout).toBe(node.stdout);
   expect(native.stderr.replace(contextSwitchWarning, "")).toBe(node.stderr);
+  expect(native.stdout, "native stdout").toBe(node.stdout);
+}
+
+function authoredEmitterCall(ir: ReturnType<typeof deserializeModule>, entry: string) {
+  const source = readFileSync(entry, "utf8");
+  const calls: Extract<IrExpr, { kind: "libCall" }>[] = [];
+  JSON.stringify(ir, (_key, value: unknown) => {
+    if (value !== null && typeof value === "object" && "kind" in value && value.kind === "libCall")
+      calls.push(value as Extract<IrExpr, { kind: "libCall" }>);
+    return value;
+  });
+  return (fn: string, text: string) => {
+    const start = source.indexOf(text);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const matches = calls.filter(
+      (call) =>
+        call.fn === fn &&
+        realpathSync(call.loc.file) === realpathSync(entry) &&
+        call.loc.start === start &&
+        call.loc.end === start + text.length,
+    );
+    expect(matches).toHaveLength(1);
+    return matches[0]!;
+  };
+}
+
+function authoredNativeCall(ir: ReturnType<typeof deserializeModule>, entry: string, text: string) {
+  const start = readFileSync(entry, "utf8").indexOf(text);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const calls: Extract<IrExpr, { kind: "call" }>[] = [];
+  JSON.stringify(ir, (_key, value: unknown) => {
+    if (value !== null && typeof value === "object" && "kind" in value && value.kind === "call")
+      calls.push(value as Extract<IrExpr, { kind: "call" }>);
+    return value;
+  });
+  const matches = calls.filter(
+    (call) =>
+      realpathSync(call.loc.file) === realpathSync(entry) &&
+      call.loc.start === start &&
+      call.loc.end === start + text.length,
+  );
+  expect(matches).toHaveLength(1);
+  const call = matches[0]!;
+  const helper = ir.functions.find((fn) => fn.name === call.callee);
+  expect(helper).toBeDefined();
+  expect(call.args.map((arg) => arg.type)).toEqual(helper!.params.map((param) => param.type));
+  return { call, helper: helper! };
+}
+
+function expectDynamicErrorListener(
+  ir: ReturnType<typeof deserializeModule>,
+  entry: string,
+  text: string,
+) {
+  const { call, helper } = authoredNativeCall(ir, entry, text);
+  expect(call.args).toHaveLength(5);
+  const callback = call.args[2]!;
+  expect(callback.kind).toBe("dynFrom");
+  if (callback.kind !== "dynFrom") throw new Error("expected boxed native listener");
+  expect(callback.value.type).toEqual({
+    kind: "func",
+    params: [{ kind: "dyn" }],
+    ret: { kind: "void" },
+  });
+  expect(callback.value.kind).toBe("closure");
+  if (callback.value.kind !== "closure") throw new Error("expected native listener closure");
+  const listenerName = callback.value.fnName;
+  const listener = ir.functions.find((fn) => fn.name === listenerName);
+  expect(listener?.params.map((param) => param.type)).toEqual([{ kind: "dyn" }]);
+  const registration = helper.body.find((stmt) => stmt.kind === "return");
+  expect(registration).toMatchObject({
+    kind: "return",
+    value: { kind: "libCall", fn: "emitter.onDyn" },
+  });
+  if (registration?.kind !== "return" || registration.value?.kind !== "libCall")
+    throw new Error("expected native dynamic registration");
+  const args = registration.value.args;
+  expect(args).toHaveLength(6);
+  for (const [argIndex, paramIndex] of [
+    [0, 0],
+    [1, 1],
+    [2, 2],
+    [4, 3],
+    [5, 4],
+  ])
+    expect(args[argIndex!]).toMatchObject({
+      kind: "varRef",
+      localId: helper.params[paramIndex!]!.localId,
+    });
+  expect(args[3]!.kind).toBe("varRef");
+  if (args[3]!.kind !== "varRef") throw new Error("expected checked adapter local");
+  const adapterId = args[3]!.localId;
+  const adapter = helper.body.filter(
+    (stmt) => stmt.kind === "varDecl" && stmt.localId === adapterId,
+  );
+  expect(adapter).toHaveLength(1);
+  expect(adapter[0]).toMatchObject({
+    kind: "varDecl",
+    init: {
+      kind: "dynCheck",
+      value: { kind: "varRef", localId: helper.params[2]!.localId },
+      type: {
+        kind: "func",
+        params: [{ kind: "object", className: "%Error" }],
+        ret: { kind: "void" },
+      },
+    },
+  });
 }
 
 describe.skipIf(skip)("foreign Error identity", () => {
+  test("native EventEmitter rethrows an unhandled island Error unchanged", async () => {
+    await withForeignErrors(
+      "emitter-error-identity",
+      `
+import { EventEmitter } from 'node:events';
+const emitter = new EventEmitter();
+const value: unknown = island.get();
+try { emitter.emit('error', value); }
+catch (caught) { console.log('same', caught === value); }
+`,
+      (entry, binary) => foreignErrorParity(entry, binary, "same true\n"),
+      (ir, entry) => {
+        const authored = authoredEmitterCall(ir, entry);
+        expect(authored("emitter.new", "new EventEmitter()")).toMatchObject({
+          args: [],
+          type: { kind: "object", className: "%EventEmitter" },
+        });
+        const emit = authored("emitter.emitErrorValue", "emitter.emit('error', value)");
+        expect(emit.args).toHaveLength(2);
+        expect(emit.args[0]!.type).toEqual({ kind: "object", className: "%EventEmitter" });
+        expect(emit.args[1]!.type).toEqual({ kind: "dyn" });
+      },
+    );
+  }, 300_000);
+
+  test("computed error emits adapt fixed listeners without changing payload identity", async () => {
+    await withForeignErrors(
+      "emitter-fixed-error",
+      `
+import { EventEmitter, errorMonitor } from 'node:events';
+function emitNamed(e: EventEmitter, name: string, value: unknown): boolean { return e.emit(name, value); }
+const emitter = new EventEmitter();
+const value: unknown = island.get();
+const retained: Error[] = [];
+function monitor(error: Error): void { retained.push(error); console.log('monitor', error === value); }
+function listener(this: EventEmitter, error: Error): void { retained.push(error); console.log('listener', error === value, this === emitter); }
+function dynamicListener(error: unknown): void { console.log('dynamic-listener', error === value); }
+emitter.on(errorMonitor, monitor);
+emitter.on('error', listener);
+emitter.on('error', dynamicListener);
+console.log('handled', emitNamed(emitter, 'error', value));
+emitter.removeAllListeners();
+console.log('retained', retained[0] === value, retained[1] === value, retained[0].message, retained[1].message);
+const nativeEmitter = new EventEmitter();
+const nativeError = new Error('native');
+nativeEmitter.on('error', (error: Error): void => { console.log('native', error === nativeError, error.message); });
+console.log('native-handled', emitNamed(nativeEmitter, 'error', nativeError));
+const zero = new EventEmitter();
+const guarded: unknown = island.guarded();
+zero.on(errorMonitor, (): void => { console.log('zero-monitor'); });
+zero.on('error', (): void => { console.log('zero-listener'); });
+console.log('zero-handled', emitNamed(zero, 'error', guarded));
+console.log('zero-reads', island.readCount());
+const throwing = new EventEmitter();
+throwing.once('error', (error: Error): void => { console.log('typed-throw', error === value, throwing.listenerCount('error') === 0); throw 'typed-stop'; });
+try { emitNamed(throwing, 'error', value); }
+catch (caught) { console.log('typed-caught', caught === 'typed-stop'); }
+console.log('typed-remaining', throwing.listenerCount('error'));
+`,
+      (entry, binary) =>
+        foreignErrorParity(
+          entry,
+          binary,
+          "monitor true\nlistener true true\ndynamic-listener true\nhandled true\nretained true true same same\nnative true native\nnative-handled true\nzero-monitor\nzero-listener\nzero-handled true\nzero-reads 0\ntyped-throw true true\ntyped-caught true\ntyped-remaining 0\n",
+        ),
+      (ir, entry) => {
+        const authored = authoredEmitterCall(ir, entry);
+        for (const text of ["emitter.on(errorMonitor, monitor)", "emitter.on('error', listener)"]) {
+          const call = authored("emitter.on", text);
+          expect(call.args[2]!.type).toMatchObject({
+            kind: "func",
+            params: [{ kind: "object", className: "%Error" }],
+          });
+        }
+        for (const text of [
+          "zero.on(errorMonitor, (): void => { console.log('zero-monitor'); })",
+          "zero.on('error', (): void => { console.log('zero-listener'); })",
+        ])
+          expect(authored("emitter.on", text).args[2]!.type).toMatchObject({
+            kind: "func",
+            params: [],
+          });
+        expectDynamicErrorListener(ir, entry, "emitter.on('error', dynamicListener)");
+        const { call, helper } = authoredNativeCall(
+          ir,
+          entry,
+          "emitNamed(emitter, 'error', value)",
+        );
+        expect(call.args[2]!.type).toEqual({ kind: "dyn" });
+        const emit = authored("emitter.emitAny", "e.emit(name, value)");
+        expect(helper.body).toContainEqual(
+          expect.objectContaining({ kind: "return", value: emit }),
+        );
+        expect(emit.args.map((arg) => arg.type)).toEqual([
+          { kind: "object", className: "%EventEmitter" },
+          { kind: "string" },
+          { kind: "dyn" },
+        ]);
+      },
+    );
+  }, 300_000);
+
+  test("dynamic error monitors determine listener and prototype handling before unhandled throws", async () => {
+    await withForeignErrors(
+      "emitter-error-monitors",
+      `
+import { EventEmitter, errorMonitor } from 'node:events';
+const added = new EventEmitter();
+const addedValue: unknown = island.fresh();
+added.on(errorMonitor, (error: unknown): void => {
+  console.log('add-monitor', error === addedValue);
+  added.on('error', (seen: unknown): void => { console.log('added-listener', seen === addedValue); });
+});
+console.log('add-result', added.emit('error', addedValue));
+const removed = new EventEmitter();
+const removedValue: unknown = island.fresh();
+function removedListener(error: unknown): void { console.log('unexpected-listener', error === removedValue); }
+removed.on('error', removedListener);
+removed.on(errorMonitor, (error: unknown): void => {
+  console.log('remove-monitor', error === removedValue);
+  removed.off('error', removedListener);
+});
+try { removed.emit('error', removedValue); }
+catch (caught) { console.log('removed-caught', caught === removedValue); }
+const throwing = new EventEmitter();
+const throwingValue: unknown = island.fresh();
+throwing.on(errorMonitor, (error: unknown): void => { console.log('throw-monitor', error === throwingValue); throw 37; });
+throwing.on('error', (error: unknown): void => { console.log('unexpected-after-throw', error === throwingValue); });
+try { throwing.emit('error', throwingValue); }
+catch (caught) { console.log('monitor-caught', caught === 37); }
+const detachedByMonitor = new EventEmitter();
+const toDetach: unknown = island.fresh();
+detachedByMonitor.on(errorMonitor, (error: unknown): void => { console.log('detach-monitor', error === toDetach); island.detach(error); });
+try { detachedByMonitor.emit('error', toDetach); }
+catch (caught) { const error = caught as any; console.log('detached-by-monitor', error.code, error.context === toDetach); }
+const attachedByMonitor = new EventEmitter();
+const toAttach: unknown = island.fresh();
+island.detach(toAttach);
+attachedByMonitor.on(errorMonitor, (error: unknown): void => { console.log('attach-monitor', error === toAttach); island.attach(error); });
+try { attachedByMonitor.emit('error', toAttach); }
+catch (caught) { console.log('attached-by-monitor', caught === toAttach); }
+const prototypeEmitter = new EventEmitter();
+const prototype: unknown = island.prototypeOnly();
+console.log('prototype', Error.isError(prototype), prototype instanceof Error);
+try { prototypeEmitter.emit('error', prototype); }
+catch (caught) { console.log('prototype-caught', caught === prototype); }
+const detachedEmitter = new EventEmitter();
+const detached: unknown = island.fresh();
+island.detach(detached);
+console.log('detached', Error.isError(detached), detached instanceof Error);
+try { detachedEmitter.emit('error', detached); }
+catch (caught) { const error = caught as any; console.log('detached-caught', error.code, error.context === detached); }
+`,
+      (entry, binary) =>
+        foreignErrorParity(
+          entry,
+          binary,
+          "add-monitor true\nadded-listener true\nadd-result true\nremove-monitor true\nremoved-caught true\nthrow-monitor true\nmonitor-caught true\ndetach-monitor true\ndetached-by-monitor ERR_UNHANDLED_ERROR true\nattach-monitor true\nattached-by-monitor true\nprototype false true\nprototype-caught true\ndetached true false\ndetached-caught ERR_UNHANDLED_ERROR true\n",
+        ),
+      (ir, entry) => {
+        const authored = authoredEmitterCall(ir, entry);
+        for (const text of [
+          "added.emit('error', addedValue)",
+          "removed.emit('error', removedValue)",
+          "throwing.emit('error', throwingValue)",
+          "detachedByMonitor.emit('error', toDetach)",
+          "attachedByMonitor.emit('error', toAttach)",
+          "prototypeEmitter.emit('error', prototype)",
+          "detachedEmitter.emit('error', detached)",
+        ]) {
+          const call = authored("emitter.emitErrorValue", text);
+          expect(call.args).toHaveLength(2);
+          expect(call.args[1]!.type).toEqual({ kind: "dyn" });
+        }
+        expectDynamicErrorListener(ir, entry, "removed.on('error', removedListener)");
+      },
+    );
+  }, 300_000);
+
+  test("dynamic error listeners and monitors do not materialize island Error properties", async () => {
+    await withForeignErrors(
+      "emitter-lazy-error",
+      `
+import { EventEmitter, errorMonitor } from 'node:events';
+const emitter = new EventEmitter();
+const value: unknown = island.guarded();
+function monitor(error: unknown): void { console.log('monitor', error === value); }
+function listener(error: unknown): void { console.log('listener', error === value); }
+emitter.on(errorMonitor, monitor);
+emitter.on('error', listener);
+console.log('handled', emitter.emit('error', value));
+console.log('reads', island.readCount());
+`,
+      (entry, binary) =>
+        foreignErrorParity(entry, binary, "monitor true\nlistener true\nhandled true\nreads 0\n"),
+      (ir, entry) => {
+        const authored = authoredEmitterCall(ir, entry);
+        for (const text of ["emitter.on(errorMonitor, monitor)", "emitter.on('error', listener)"])
+          expectDynamicErrorListener(ir, entry, text);
+        expect(
+          authored("emitter.emitErrorValue", "emitter.emit('error', value)").args[1]!.type,
+        ).toEqual({ kind: "dyn" });
+      },
+    );
+  }, 300_000);
+
   test("returned, caught, callback and promise Errors keep their island identity", async () => {
     await withForeignErrors(
       "error-identity",

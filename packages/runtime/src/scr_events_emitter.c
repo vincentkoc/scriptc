@@ -419,15 +419,22 @@ static ScrDyn *scr_ee_dyn_removed(ScrEmitter *em, const ScrEeEntry *e) {
   return scr_ee_entry_dyn(e);
 }
 
-/* The checked-dynamic half of the registry, installed by the first
- * registration through an untyped value (scr_emitter_on_any): only such
- * listeners take the meta events' untyped argument vector, so programs
- * without untyped emitter calls never reach, or link, this half. */
+/* A fixed Error listener needs an owned typed argument, but dynamic
+ * listeners must keep the original value without reading its properties. */
+static ScrError *scr_ee_dyn_error_arg(const ScrDyn *value) {
+  return value && scr_dyn_ref_is_error(value) ? scr_error_from_dyn(value) : NULL;
+}
+
+/* Dynamic registrations and error emits install this half. Keeping the
+ * converters behind hooks lets typed-only programs omit the dynamic ABI. */
 struct ScrEeDynOps {
   bool (*emit_meta)(ScrEmitter *em, ScrStr *meta, ScrStr *name, const ScrDyn *fn);
   ScrDyn *(*removed)(ScrEmitter *em, const struct ScrEeEntry *e);
+  ScrError *(*error_arg)(const ScrDyn *value); /* +1, or NULL for a non-Error. */
 };
-static const ScrEeDynOps scr_ee_dyn_ops = { &scr_ee_dyn_emit_meta, &scr_ee_dyn_removed };
+static const ScrEeDynOps scr_ee_dyn_ops = {
+  &scr_ee_dyn_emit_meta, &scr_ee_dyn_removed, &scr_ee_dyn_error_arg
+};
 /* External linkage on purpose: the optimizer must not prove the hook's
  * value from this unit's stores and inline the dynamic half back in. */
 SCR_TL const ScrEeDynOps *scr_ee_dyn = NULL;
@@ -1086,6 +1093,13 @@ struct ScrEeMessage {
   ScrDyn *decoded;
 };
 
+static void scr_ee_invoke_fixed(ScrEeEntry *entry, ...) {
+  va_list ap;
+  va_start(ap, entry);
+  entry->inv(entry->cb, ap);
+  va_end(ap);
+}
+
 static bool scr_ee_emit_core(ScrEmitter *em, ScrStr *name, va_list *ap_template,
                              ScrDyn *const *flex_args, size_t flex_argc, ScrEeMessage *message) {
   if (name->len == 5 && memcmp(name->data, "error", 5) == 0) {
@@ -1159,6 +1173,20 @@ static bool scr_ee_emit_core(ScrEmitter *em, ScrStr *name, va_list *ap_template,
       va_copy(ap, *ap_template);
       e->inv(e->cb, ap);
       va_end(ap);
+    } else if (flex_args && e->inv && scr_ee_dyn &&
+               (scr_ee_is_name(name, "error") || scr_ee_is_error_monitor(name))) {
+      /* Convert only when this fixed listener runs, after once removal and
+       * earlier listeners. A pending throw still releases the temporary. */
+      if (e->inv == &scr_ee_inv_fixed0) {
+        scr_ee_invoke_fixed(e); /* No payload read, including Error getters. */
+      } else {
+        ScrError *err = scr_ee_dyn->error_arg(flex_argc ? flex_args[0] : NULL);
+        if (!scr_exc_pending()) {
+          if (err) scr_ee_invoke_fixed(e, err);
+          else scr_ee_listener_mismatch(name, false);
+        }
+        scr_error_release(err);
+      }
     } else {
       scr_ee_listener_mismatch(name, ap_template != NULL);
     }
@@ -1299,35 +1327,31 @@ static void scr_ee_unhandled_error(const ScrDyn *er) {
  * ERR_UNHANDLED_ERROR message; without it only primitive payloads render. */
 static bool scr_ee_emit_error_dyn(ScrEmitter *em, ScrStr *name, ScrDyn *const *args, size_t argc,
                                   ScrStr *(*render)(ScrDyn *, double, double)) {
-  const ScrDyn *er = argc ? args[0] : scr_dyn_undefined();
-  ScrError *err = scr_dyn_err_instanceof(er, SCR_ERR_ERROR) ? scr_errdyn_err_of(er) : NULL;
-  bool had = false;
-  if (!scr_ee_has(em->reg, "error")) {
-    scr_ee_emit_mixed_va(em, SCR_EE_ERROR_MONITOR, args, argc, err != NULL, err);
-    if (!scr_exc_pending()) {
-      if (err) {
-        scr_dyn_throw(scr_dyn_retain((ScrDyn *)er));
-      } else if (render) {
-        ScrStr *shown = render((ScrDyn *)er, 0, 2);
-        if (scr_exc_pending()) {
-          /* A throwing inspect: Node quotes the payload's string conversion
-           * instead, whose own throw propagates. */
-          if (shown) scr_str_release(shown);
-          scr_exc_clear();
-          shown = scr_dyn_string_coerce_js(er);
-        }
-        if (shown) {
-          scr_ee_throw_unhandled(shown->data, shown->len, er);
-          scr_str_release(shown);
-        }
-      } else {
-        scr_ee_unhandled_error(er);
+  scr_ee_dyn = &scr_ee_dyn_ops;
+  bool had = scr_ee_emit_core(em, name, NULL, args ? args : scr_ee_no_args, argc, NULL);
+  if (!had && !scr_exc_pending()) {
+    const ScrDyn *er = argc ? args[0] : scr_dyn_undefined();
+    /* Monitors can change both listeners and the payload's prototype.
+     * Unhandled policy uses current membership, not typed extraction. */
+    if (scr_dyn_err_instanceof(er, SCR_ERR_ERROR)) {
+      scr_dyn_throw(scr_dyn_retain((ScrDyn *)er));
+    } else if (render) {
+      ScrStr *shown = render((ScrDyn *)er, 0, 2);
+      if (scr_exc_pending()) {
+        /* A throwing inspect: Node quotes the payload's string conversion
+         * instead, whose own throw propagates. */
+        if (shown) scr_str_release(shown);
+        scr_exc_clear();
+        shown = scr_dyn_string_coerce_js(er);
       }
+      if (shown) {
+        scr_ee_throw_unhandled(shown->data, shown->len, er);
+        scr_str_release(shown);
+      }
+    } else {
+      scr_ee_unhandled_error(er);
     }
-  } else {
-    had = scr_ee_emit_mixed_va(em, name, args, argc, err != NULL, err);
   }
-  scr_error_release(err);
   return had;
 }
 
@@ -1366,6 +1390,8 @@ bool scr_emitter_emit_any(ScrEmitter *em, ScrStr *name, ScrDyn *const *args, siz
       ScrStr *s = argc && args[0]->kind == SCR_DYN_STR ? args[0]->v.str : NULL;
       return scr_ee_emit_mixed_va(em, name, args, argc, s != NULL, s);
     }
+  } else {
+    scr_ee_dyn = &scr_ee_dyn_ops;
   }
   return scr_ee_emit_core(em, name, NULL, args ? args : scr_ee_no_args, argc, NULL);
 }
@@ -1373,37 +1399,23 @@ bool scr_emitter_emit_any(ScrEmitter *em, ScrStr *name, ScrDyn *const *args, siz
 /* Handle event registries use checked callbacks for every tuple, including
  * errors. Keep this separate from the statically typed Error ABI above. */
 bool scr_emitter_emit_error_flex(ScrEmitter *em, ScrDyn *error) {
-  if (!scr_ee_has(em->reg, "error")) {
-    scr_ee_emit_error_monitor(em, NULL, &error, 1);
-    if (scr_exc_pending()) return false;
-    scr_dyn_throw(scr_dyn_retain(error));
-    return false;
-  }
   ScrStr *name = scr_str_new("error", 5);
   bool had = scr_ee_emit_core(em, name, NULL, &error, 1, NULL);
   scr_str_release(name);
+  if (!had && !scr_exc_pending()) scr_dyn_throw(scr_dyn_retain(error));
   return had;
 }
 
 /* emit('error', err) — Node's special event: with no 'error' listener the
  * payload THROWS (catchable; uncaught exits 1 with the error report).
  * err is borrowed; the throw takes its own +1. */
-static void scr_ee_emit_error_monitor_va(ScrEmitter *em, ...) {
-  va_list ap;
-  va_start(ap, em);
-  scr_ee_emit_error_monitor(em, &ap, NULL, 0);
-  va_end(ap);
-}
-
 bool scr_emitter_emit_error(ScrEmitter *em, ScrStr *name, ScrError *err) {
-  if (!scr_ee_has(em->reg, "error")) {
-    scr_ee_emit_error_monitor_va(em, err);
-    if (scr_exc_pending()) return false;
+  bool had = scr_ee_emit_va(em, name, err);
+  if (!had && !scr_exc_pending()) {
     scr_throw_obj(scr_error_retain(err), &scr_error_retain_v, &scr_error_release_v,
                   scr_error_trace_arg());
-    return false;
   }
-  return scr_ee_emit_va(em, name, err);
+  return had;
 }
 
 /* ── introspection ────────────────────────────────────────────────────── */
