@@ -376,7 +376,7 @@ async function foreignErrorParity(entry: string, binary: string, expected: strin
     timeout: 30_000,
   });
   expect(native.stderr.replace(contextSwitchWarning, "")).toBe(node.stderr);
-  expect(native.stdout, "native stdout").toBe(node.stdout);
+  expect(native.stdout, `native stdout ${JSON.stringify(native.stdout)}`).toBe(node.stdout);
 }
 
 function authoredEmitterCall(ir: ReturnType<typeof deserializeModule>, entry: string) {
