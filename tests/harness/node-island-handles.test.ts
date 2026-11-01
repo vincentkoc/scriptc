@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -21,7 +22,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile, deserializeModule } from "@scriptc/compiler";
+import type { IrExpr } from "../../packages/compiler/src/ir/ir.js";
 import { libnodePack } from "./libnode.js";
 
 const execFileAsync = promisify(execFile);
@@ -312,6 +314,7 @@ async function withForeignErrors(
   name: string,
   source: string,
   check: (entry: string, binary: string) => Promise<void>,
+  inspectIr?: (ir: ReturnType<typeof deserializeModule>, entry: string) => void,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), `scriptc-${name}-`));
   try {
@@ -324,9 +327,27 @@ async function withForeignErrors(
       outPath: join(dir, "program"),
       sanitize,
       nodeIslands: { mode: "explicit", islands: [island] },
+      ...(inspectIr === undefined ? {} : { emitIr: true }),
     });
     if (!result.ok)
       throw new Error(result.diagnostics.map((d) => `${d.code}: ${d.message}`).join("\n"));
+    if (inspectIr !== undefined) {
+      expect(result.islands?.packages).toEqual([]);
+      expect(result.islands?.modules.map((file) => realpathSync(file))).toEqual([
+        realpathSync(island),
+      ]);
+      expect(result.irPath).toBeDefined();
+      const ir = deserializeModule(readFileSync(result.irPath!, "utf8"));
+      const modules = ir.nodeIsland?.modules;
+      expect(modules).toBeDefined();
+      // A package.json scope may accompany the sole executable island source.
+      const sources = modules!.files.filter((file) => /\.[cm]?[jt]sx?$/.test(file.path));
+      expect(sources.map((file) => realpathSync(join(modules!.root, file.path)))).toEqual([
+        realpathSync(island),
+      ]);
+      expect(sources[0]!.placeholder).toBeUndefined();
+      inspectIr(ir, entry);
+    }
     await check(entry, result.binaryPath);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -356,6 +377,55 @@ async function foreignErrorParity(entry: string, binary: string, expected: strin
 }
 
 describe.skipIf(skip)("foreign Error identity", () => {
+  test("native EventEmitter rethrows an unhandled island Error unchanged", async () => {
+    await withForeignErrors(
+      "emitter-error-identity",
+      `
+import { EventEmitter } from 'node:events';
+const emitter = new EventEmitter();
+const value: unknown = island.get();
+try { emitter.emit('error', value); }
+catch (caught) { console.log('same', caught === value); }
+`,
+      (entry, binary) => foreignErrorParity(entry, binary, "same true\n"),
+      (ir, entry) => {
+        const source = readFileSync(entry, "utf8");
+        const calls: Extract<IrExpr, { kind: "libCall" }>[] = [];
+        JSON.stringify(ir, (_key, value: unknown) => {
+          if (
+            value !== null &&
+            typeof value === "object" &&
+            "kind" in value &&
+            value.kind === "libCall"
+          )
+            calls.push(value as Extract<IrExpr, { kind: "libCall" }>);
+          return value;
+        });
+        const authored = (fn: string, text: string) => {
+          const start = source.indexOf(text);
+          expect(start).toBeGreaterThanOrEqual(0);
+          const matches = calls.filter(
+            (call) =>
+              call.fn === fn &&
+              realpathSync(call.loc.file) === realpathSync(entry) &&
+              call.loc.start === start &&
+              call.loc.end === start + text.length,
+          );
+          expect(matches).toHaveLength(1);
+          return matches[0]!;
+        };
+        expect(authored("emitter.new", "new EventEmitter()")).toMatchObject({
+          args: [],
+          type: { kind: "object", className: "%EventEmitter" },
+        });
+        const emit = authored("emitter.emitErrorValue", "emitter.emit('error', value)");
+        expect(emit.args).toHaveLength(2);
+        expect(emit.args[0]!.type).toEqual({ kind: "object", className: "%EventEmitter" });
+        expect(emit.args[1]!.type).toEqual({ kind: "dyn" });
+      },
+    );
+  }, 300_000);
+
   test("returned, caught, callback and promise Errors keep their island identity", async () => {
     await withForeignErrors(
       "error-identity",
