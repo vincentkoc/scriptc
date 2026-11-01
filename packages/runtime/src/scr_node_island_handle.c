@@ -485,6 +485,8 @@ static ScrDyn *nh_from_node(const ScrNodeValue *v) {
   }
 }
 
+static void nh_error_info(uint32_t handle, ScrNodeErrorInfo *info);
+
 /* The ScrError of an island Error handle (+1): the one already pinned to
  * it, else a new one of the nearest intrinsic class, pinned. */
 static ScrError *nh_error_of(const ScrNodeValue *v) {
@@ -495,7 +497,7 @@ static ScrError *nh_error_of(const ScrNodeValue *v) {
     return scr_error_retain(pinned);
   }
   ScrNodeErrorInfo info;
-  nh_bridge()->error_info(ref->id, &info);
+  nh_error_info(ref->id, &info);
   ScrStr *message = nh_str(info.message ? info.message : "", info.message_len);
   ScrError *e = scr_error_new((int)info.kind, message);
   scr_str_release(message);
@@ -807,7 +809,7 @@ static bool nh_to_node(ScrDyn *v, ScrNodeValue *out, NhKeep *keep) {
 
 enum {
   NH_LOAD, NH_GET, NH_SET, NH_HAS, NH_DEL, NH_INVOKE, NH_INVOKE_METHOD, NH_CONSTRUCT,
-  NH_INSTANCEOF, NH_KEYS, NH_THEN,
+  NH_INSTANCEOF, NH_KEYS, NH_THEN, NH_ERROR_INFO,
 };
 
 typedef struct {
@@ -820,6 +822,7 @@ typedef struct {
   size_t argc;
   uint32_t token;
   ScrNodeValue *out;
+  ScrNodeErrorInfo *error_info;
   int threw;
 } NhCall;
 
@@ -838,6 +841,7 @@ static void nh_call_job(void *p) {
   case NH_INSTANCEOF: c->threw = b->instance_of(c->a, c->h, c->out); break;
   case NH_KEYS: c->threw = b->own_keys(c->h, c->mode, c->out); break;
   case NH_THEN: c->threw = b->then(c->a, c->token, c->out); break;
+  case NH_ERROR_INFO: b->error_info(c->h, c->error_info); break;
   }
 }
 
@@ -845,6 +849,15 @@ static int nh_run(NhCall *c) {
   scr_ni_shared_refresh();
   scr_ni_on_node_stack(nh_call_job, c);
   return c->threw;
+}
+
+/* ErrorInfo can run getters and collect, so it must use Node's stack too.
+ * Callers keep the handle alive and consume its bridge-owned strings before
+ * the next bridge entry. */
+static void nh_error_info(uint32_t handle, ScrNodeErrorInfo *info) {
+  (void)nh_bridge();
+  NhCall c = {.op = NH_ERROR_INFO, .h = handle, .error_info = info};
+  (void)nh_run(&c);
 }
 
 static int nh_then(const ScrNodeValue *value, uint32_t token, ScrNodeValue *thrown) {
@@ -1571,7 +1584,7 @@ bool scr_ni_report_uncaught(ScrError *error) {
   const ScrNodeBridge *bridge = scr_ni_bridge_loaded();
   if (ref == NULL || ref->id == 0 || bridge == NULL) return false;
   ScrNodeErrorInfo info;
-  bridge->error_info(ref->id, &info);
+  nh_error_info(ref->id, &info);
   if (info.stack == NULL) return false;
   if (info.arrow != NULL && info.arrow_len > 0) {
     fwrite(info.arrow, 1, info.arrow_len, stderr);
