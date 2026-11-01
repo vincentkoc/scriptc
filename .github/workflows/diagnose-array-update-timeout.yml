@@ -1,0 +1,621 @@
+name: Diagnose array update timeout
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-array-update-timeout.yml]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: diagnose-array-update-timeout
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: macos-15
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: 8b9f7981e9198831474bbbe2eb47c48407daa380
+          persist-credentials: false
+      - name: Verify frozen source
+        run: |
+          test "$(git rev-parse HEAD)" = 8b9f7981e9198831474bbbe2eb47c48407daa380
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.0
+          cache: pnpm
+      - name: Authenticate original macOS native artifact
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 <<'DOWNLOAD'
+          import base64, hashlib, json, os, shutil, stat, tarfile, urllib.error, urllib.parse, urllib.request, zipfile
+          from pathlib import Path, PurePosixPath
+          BASE = Path(os.environ["RUNNER_TEMP"])
+          OUT, WORK = BASE / "array-update-timeout-proof", BASE / "array-update-timeout-work"
+          SOURCE = Path(os.environ["GITHUB_WORKSPACE"])
+          ORIGIN = {"workflow": "5fed39a85f7f342cef8d2140da11a765ffda046d", "run": "41257029033", "attempt": "1", "job": 124702332619, "source": "8b9f7981e9198831474bbbe2eb47c48407daa380"}
+          ARTIFACT = 13063817961
+          ZIP_SHA = "7d690ac3345d40c7a4d097cd879179b536415dd80980ea84aa88088cc3ffbe05"
+          CONSUMER = {"workflow": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"]}
+          OUT.mkdir()
+          WORK.mkdir(mode=0o700)
+          with (WORK / "owner.json").open("x") as marker:
+              marker.write(json.dumps(CONSUMER, sort_keys=True) + "\n")
+          receipt = {"origin": ORIGIN, "consumer": CONSUMER, "verified": False}
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+          def safe_name(name):
+              path = PurePosixPath(name)
+              assert name and "\\" not in name and "\0" not in name, "invalid archive path characters"
+              assert not path.is_absolute() and ".." not in path.parts, "absolute or parent archive path"
+              assert path.as_posix() == name.rstrip("/") and path.parts, "noncanonical archive path"
+              return path
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, newurl):
+                  return None
+          stage = "metadata"
+          try:
+              token = os.environ.pop("GH_TOKEN")
+              opener = urllib.request.build_opener(NoRedirect)
+              headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "scriptc-array-update-timeout-diagnostic"}
+              def api(path):
+                  with opener.open(urllib.request.Request("https://api.github.com/repos/vincentkoc/scriptc/" + path, headers=headers), timeout=120) as response:
+                      raw = response.read(1024**2 + 1)
+                  assert len(raw) <= 1024**2, "API response exceeds budget"
+                  return json.loads(raw)
+              metadata = api(f"actions/artifacts/{ARTIFACT}")
+              assert metadata["id"] == ARTIFACT and metadata["name"] == "native-darwin-arm64" and metadata["expired"] is False, "artifact identity or expiry mismatch"
+              assert metadata["size_in_bytes"] == 58756782 and metadata["digest"] == "sha256:" + ZIP_SHA, "artifact ZIP metadata mismatch"
+              assert str(metadata["workflow_run"]["id"]) == ORIGIN["run"] and metadata["workflow_run"]["head_sha"] == ORIGIN["workflow"], "artifact producer mismatch"
+              stage = "job"
+              job = api(f"actions/jobs/{ORIGIN['job']}")
+              assert job["run_id"] == int(ORIGIN["run"]) and job["head_sha"] == ORIGIN["workflow"], "native job producer mismatch"
+              assert job["conclusion"] == "success" and job["status"] == "completed", "native producer did not complete successfully"
+              assert job["name"] == "build (macOS arm64 native packages)", "native job name mismatch"
+              assert all(step["conclusion"] in ("success", "skipped") for step in job["steps"]), "native job step failed"
+              stage = "producer-workflow"
+              definition = api("contents/.github/workflows/ci.yml?ref=5fed39a85f7f342cef8d2140da11a765ffda046d")
+              assert definition["encoding"] == "base64", "producer workflow encoding mismatch"
+              definition_bytes = base64.b64decode(definition["content"])
+              assert hashlib.sha256(definition_bytes).hexdigest() == "e6047a8521e791c590321c4c627d80ad48b81e3095355e8510f19153c70ac188", "producer workflow identity mismatch"
+              receipt["producerWorkflowSha256"] = "e6047a8521e791c590321c4c627d80ad48b81e3095355e8510f19153c70ac188"
+              stage = "download"
+              try:
+                  response = opener.open(urllib.request.Request(f"https://api.github.com/repos/vincentkoc/scriptc/actions/artifacts/{ARTIFACT}/zip", headers=headers), timeout=120)
+              except urllib.error.HTTPError as error:
+                  assert error.code == 302, "artifact redirect refused"
+                  location = error.headers.get("Location", "")
+                  error.close()
+                  parsed = urllib.parse.urlsplit(location)
+                  assert parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password, "invalid artifact storage redirect"
+                  response = opener.open(urllib.request.Request(location), timeout=120)
+              archive = WORK / "native.zip"
+              size = 0
+              with response, archive.open("xb") as output:
+                  while block := response.read(1024 * 1024):
+                      size += len(block)
+                      assert size <= 128 * 1024**2, "ZIP download exceeds budget"
+                      output.write(block)
+              assert size == 58756782 and digest(archive) == ZIP_SHA, "downloaded ZIP identity mismatch"
+              tar_path = WORK / "native-darwin-arm64.tar.gz"
+              stage = "zip"
+              with zipfile.ZipFile(archive) as bundle:
+                  entries = bundle.infolist()
+                  assert len(entries) == 1 and entries[0].filename == tar_path.name, "ZIP member inventory mismatch"
+                  item = entries[0]
+                  assert stat.S_IFMT(item.external_attr >> 16) in (0, stat.S_IFREG) and not item.flag_bits & 1, "unsafe ZIP member type"
+                  assert 0 < item.file_size <= 256 * 1024**2, "ZIP expansion exceeds budget"
+                  with bundle.open(item) as stream, tar_path.open("xb") as output:
+                      shutil.copyfileobj(stream, output, 1024 * 1024)
+                  assert tar_path.stat().st_size == item.file_size, "ZIP entry size mismatch"
+              allowed = ["packages/llvm-darwin-arm64/bin", "packages/runtime-darwin-arm64/artifacts", "packages/runtime-darwin-arm64/runtime-pack.json"]
+              files, seen = [], set()
+              stage = "tar"
+              with tarfile.open(tar_path, "r:gz") as bundle:
+                  members = bundle.getmembers()
+                  assert 0 < len(members) <= 20000 and sum(item.size for item in members) <= 2 * 1024**3, "tar inventory exceeds budget"
+                  for item in members:
+                      name = safe_name(item.name).as_posix()
+                      assert name not in seen, "duplicate tar member"
+                      seen.add(name)
+                      assert any(name == prefix or name.startswith(prefix + "/") for prefix in allowed), "tar member outside native artifact roots"
+                      assert item.isdir() or item.isfile(), "links and special files are not admitted"
+                      assert not item.mode & 0o7000, "unsafe tar permissions"
+                      target = SOURCE / name
+                      assert not target.is_symlink() and not target.exists(), "native artifact would overwrite an existing path"
+                      assert all(not parent.is_symlink() for parent in target.parents if parent != SOURCE.parent), "symlink in extraction parent"
+                  for item in members:
+                      target = SOURCE / item.name
+                      if item.isdir():
+                          target.mkdir(parents=True, exist_ok=True)
+                          continue
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with bundle.extractfile(item) as stream, target.open("xb") as output:
+                          shutil.copyfileobj(stream, output, 1024 * 1024)
+                      target.chmod(item.mode & 0o777)
+                      assert target.stat().st_size == item.size, "tar entry size mismatch"
+                      files.append({"path": item.name, "bytes": item.size, "sha256": digest(target)})
+              receipt.update({"artifact": ARTIFACT, "name": metadata["name"], "zipBytes": size, "zipSha256": ZIP_SHA, "tarSha256": digest(tar_path), "files": sorted(files, key=lambda row: row["path"]), "verified": True})
+              archive.unlink()
+              tar_path.unlink()
+          except Exception as error:
+              # HTTP exception text can contain signed storage URLs; never publish it.
+              receipt["failureType"] = type(error).__name__
+              receipt["failureStage"] = stage
+              if isinstance(error, urllib.error.HTTPError):
+                  receipt["httpStatus"] = error.code
+              if isinstance(error, AssertionError):
+                  receipt["admissionReason"] = str(error)
+              print("[array-update-timeout-download] FAILED (exit 1)")
+              raise SystemExit(1)
+          finally:
+              (OUT / "native-origin.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+          DOWNLOAD
+      - name: Prepare owned replay observer
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/array-update-timeout-proof"
+          cat > "$RUNNER_TEMP/array-update-timeout-proof/observe.py" <<'OBSERVER'
+          import ctypes, errno, hashlib, json, os, struct, subprocess, sys
+          group = int(sys.argv[1])
+          assert group > 1 and group != os.getpgrp()
+          libc = ctypes.CDLL(None, use_errno=True)
+          libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+          libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int),ctypes.c_uint,ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t]
+          libproc.proc_pidpath.argtypes = [ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
+          def snapshot():
+              raw=subprocess.check_output(["/bin/ps","-axo","pid=,ppid=,pgid=,lstart=,stat="],timeout=5).decode()
+              rows=[]
+              for line in raw.splitlines():
+                  v=line.split()
+                  if len(v) == 9 and int(v[2]) == group:
+                      rows.append(dict(pid=int(v[0]),ppid=int(v[1]),pgid=int(v[2]),started=" ".join(v[3:8]),state=v[8]))
+              assert len(rows)<=128
+              return rows
+          rows=snapshot()
+          for row in rows:
+              try:
+                  buf=ctypes.create_string_buffer(4096)
+                  assert libproc.proc_pidpath(row["pid"],buf,4096)>0
+                  row["executable"]=os.fsdecode(buf.value)
+                  mib=(ctypes.c_int*3)(1,49,row["pid"])
+                  args=ctypes.create_string_buffer(256*1024)
+                  size=ctypes.c_size_t(len(args))
+                  assert libc.sysctl(mib,3,args,ctypes.byref(size),None,0)==0
+                  raw=args.raw[:size.value]
+                  argc=struct.unpack_from("=i",raw,0)[0]
+                  assert 0<argc<=4096
+                  pos=raw.index(b"\0",4)+1
+                  while pos<len(raw) and raw[pos]==0: pos+=1
+                  argv=[]
+                  for _ in range(argc):
+                      end=raw.index(b"\0",pos); argv.append(os.fsdecode(raw[pos:end])); pos=end+1
+                  # Do not inspect or retain the environment that follows argv.
+                  row["argv"]=argv
+                  assert sum(len(os.fsencode(x)) for x in argv)<=128*1024
+                  now=next((x for x in snapshot() if x["pid"]==row["pid"]),None)
+                  assert now is not None and all(now[k]==row[k] for k in ("ppid","pgid","started"))
+                  row["identityStable"]=True
+              except Exception as error:
+                  now=next((x for x in snapshot() if x["pid"]==row["pid"]),None)
+                  row["identityStable"]=False
+                  row["vanished"]=now is None
+                  row["failureType"]=type(error).__name__
+          print(json.dumps(rows,separators=(",",":")))
+          OBSERVER
+          cat > "$RUNNER_TEMP/array-update-timeout-proof/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { dirname, join, relative, resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const root=process.env.GITHUB_WORKSPACE, out=join(process.env.RUNNER_TEMP,"array-update-timeout-proof"), work=join(process.env.RUNNER_TEMP,"array-update-timeout-work");
+          const self=resolve(process.argv[1]), CAP=16*1024*1024;
+          const sourceHead="8b9f7981e9198831474bbbe2eb47c48407daa380";
+          const sourceTree="9551757de6aa3a1c0e091c815190ae9627de038b", sourcePins={"AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/harness/shard.ts":"8ef5234e8fcf13672e7e1d774eaa4ff58e264c06e85be16e5f77eda5a66467bd","tests/harness/suite-lock.mjs":"78b5fd5c64f3795ac49b377e1f52faafd185134bebe391d363b07dd01fe09c31","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","tests/harness/jsx-oracle.ts":"c4642f02da794f548bebe8d6e23ec4b48380e25cc803c4154c47dc1bfede76f8","tests/harness/comptime-shim.mjs":"473ebd84ff1746a9fe54dd4f02bf18e09bf276f50a06d11436e1fc9c1ba4d551","tests/harness/corpus-costs.json":"e844cc7a06d29c7838149e6330ceb53e09f1819ce07c81e97844784a6eb5fca0","tests/corpus/array-element-compound-updates.ts":"8050d74e756a650bfb4d42de7287b96d0415e3f57b7fdfb54191510140e8e787","packages/threads/package.json":"6e8700d46f14ba241f3a1e2745c138b6c4af1403b4a74f014d7e748bb20d9c9f","packages/threads/index.js":"70cdc4b21aa17cb0ed65d903d5564ed580e38fb81bcad3468148dd5fd8247c77","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","packages/compiler/src/timing.ts":"8e9c891fe1a77996572e435eb29f84db9175bd19738f61449e4722908e25e749","packages/compiler/src/backend/native-codegen.ts":"68429627544ae0ea37d3822ac3a9fa381051f75df9fd6a082e36231dfa7a7a5f","packages/compiler/src/backend/native-tools.ts":"65eef43fd0c7c3096664a6692b918edd632530bee11f0402640afbd710b6196a","packages/compiler/src/backend/native/process.ts":"341c216690b7f5d401786f46e80e5bba3c7f8b5c22896d1d0c047e5f328c75ea","packages/compiler/src/backend/native/executable.ts":"3a6fe5c8bfaefe6978bddac84c6495efc1df5cabbc0c3b7c6af75a6d791b9d1a","packages/compiler/src/backend/native/session.ts":"b82407816ed96933fee39c9cd5dd7f47bb0be6a4a025bd1841e7c3ca2baf56ce","packages/compiler/src/backend/native/tool-identity.ts":"2d239087986b664aff948f9a8fa18ac2ada65b0102cd65e3fe9472147deb4cb8","packages/compiler/src/backend/native/helper-identity-record.ts":"848cc2b71f312adf512c0f3eaa10df117b0dbe96cdd9eab96f0aba239ce826be","packages/compiler/src/backend/native/runtime-inputs.ts":"0bed0fc0f98fcd0212e67032fa61de94d2e926a8ee9c5c7fbbc6a24c91972788","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/backend/cache-root.ts":"7a9e30aa817aea4b45bf8866d5b53677872885ce5b9f43536ca94f9bb677e628","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/runtime-darwin-arm64/package.json":"955755aff1488955fb3181895559ed72ed9cc2f1103ef7a3fcbbee9dff94ecd0","packages/runtime-darwin-arm64/scripts/verify.mjs":"758b2fef508d2a2ff23ce43a709adb15166461aac66ece808578abea85d2f357","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/llvm-darwin-arm64/package.json":"aa242a8579d99df616078e805e7b7441c94e3867dd8f722ed32929fba4b4e383","native/llvm-codegen/src/main.cpp":"22c13ad337cccd043b3a6e477e84454090d849c0578826823c3e6b413e9f708e",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/libnode.json":"af6fc033baae9d327edd68e350590d0ba16f434b4bb744e769bf49edb39acb93","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/scripts/verify.mjs":"051fd399d29bddc8f757213ee00d5f6c1d200755266b0ebe86b7603462de503a"};
+          const nativeInputSha256="35ebd589a5df0336f1219abfd535c91fe9c15bfd3a62af36e74303e7c63e436b";
+          const consumerIdentity={workflow:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT};
+          const fixture="tests/corpus/array-element-compound-updates.ts", harness="tests/harness/llvm-differential.test.ts";
+          const invocation={command:"pnpm",args:["test",harness,"-t","array-element-compound-updates\\.ts$","--reporter=verbose"],env:{SCRIPTC_TEST_SHARD:"5/5",SCRIPTC_TEST_WORKERS:"4",SCRIPTC_TIMING:"1"},testTimeoutMs:300000,outerDiagnosticSeconds:420};
+          const digest=b=>createHash("sha256").update(b).digest("hex"), hash=p=>digest(readFileSync(p)), json=p=>JSON.parse(readFileSync(p,"utf8"));
+          const save=(name,value)=>writeFileSync(join(out,name),JSON.stringify(value,null,2)+"\n");
+          const record=p=>({path:relative(out,p),bytes:statSync(p).size,sha256:hash(p)});
+          function capture(command,args=[],cwd=root){
+            const r=spawnSync(command,args,{cwd,encoding:"utf8",timeout:30000,maxBuffer:4*1024*1024});
+            assert.equal(r.error,undefined,command+" launch failed");assert.equal(r.status,0,command+" failed: "+r.stderr);return r.stdout.trim();
+          }
+          function verifyWorkOwner(){
+            const s=lstatSync(work);assert.ok(s.isDirectory()&&!s.isSymbolicLink());assert.equal(s.mode&0o777,0o700);
+            const p=join(work,"owner.json");assert.ok(lstatSync(p).isFile()&&!lstatSync(p).isSymbolicLink());
+            assert.deepEqual(json(p),consumerIdentity);return consumerIdentity;
+          }
+          function source(){
+            assert.equal(capture("git",["rev-parse","HEAD"]),sourceHead);
+            assert.equal(capture("git",["rev-parse","HEAD^{tree}"]),sourceTree);
+            assert.equal(capture("git",["status","--porcelain=v1","--untracked-files=all"]),"");
+            const pins=Object.fromEntries(Object.keys(sourcePins).map(p=>[p,hash(join(root,p))]));assert.deepEqual(pins,sourcePins);
+            return {head:sourceHead,tree:sourceTree,clean:true,pins};
+          }
+          function nativeInputs(){
+            const rows=capture("git",["ls-tree","-r","--full-tree","HEAD"]).split("\n").filter(row=>{
+              const p=row.split("\t")[1];return p.startsWith("native/llvm-codegen/") || /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(p) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(p) ||
+                [".node-version","package.json","pnpm-lock.yaml","pnpm-workspace.yaml","packages/compiler/package.json","packages/compiler/src/backend/runtime-abi.ts"].includes(p);
+            });
+            assert.equal(rows.length,1053);assert.equal(digest(rows.join("\n")),nativeInputSha256);
+            return {count:rows.length,treeRowsSha256:nativeInputSha256,disk:rows.map(r=>({path:r.split("\t")[1],sha256:hash(join(root,r.split("\t")[1]))}))};
+          }
+          function nativeFiles(){
+            const origin=json(join(out,"native-origin.json"));assert.equal(origin.verified,true);
+            assert.deepEqual(origin.origin,{workflow:"5fed39a85f7f342cef8d2140da11a765ffda046d",run:"41257029033",attempt:"1",job:124702332619,source:sourceHead});
+            assert.deepEqual(origin.consumer,consumerIdentity);assert.equal(origin.artifact,13063817961);
+            assert.equal(origin.zipSha256,"7d690ac3345d40c7a4d097cd879179b536415dd80980ea84aa88088cc3ffbe05");
+            assert.ok(origin.files.length>0);
+            for(const item of origin.files){const p=join(root,item.path);assert.ok(lstatSync(p).isFile()&&!lstatSync(p).isSymbolicLink());assert.equal(statSync(p).size,item.bytes);assert.equal(hash(p),item.sha256);}
+            return origin.files;
+          }
+          function tool(command,args){
+            const path=realpathSync(capture("/bin/sh",["-c",'command -v "$1"',"identity",command]));
+            const result=spawnSync(command,args,{encoding:"utf8",timeout:30000,maxBuffer:1024*1024});assert.equal(result.error,undefined);assert.equal(result.status,0);return {path,sha256:hash(path),version:(result.stdout+result.stderr).trim()};
+          }
+          function tools(){
+            const sdk=capture("xcrun",["--sdk","macosx","--show-sdk-path"]);
+            return {node:tool(process.execPath,["--version"]),pnpm:tool("pnpm",["--version"]),python:tool("python3",["--version"]),
+              ld:tool("ld",["-v"]),clang:tool("clang",["--version"]),sample:{path:"/usr/bin/sample",sha256:hash("/usr/bin/sample")},
+              xcode:capture("xcodebuild",["-version"]),developerDirectory:capture("xcode-select",["-p"]),
+              sdk:{path:sdk,version:capture("xcrun",["--sdk","macosx","--show-sdk-version"]),settingsSha256:hash(join(sdk,"SDKSettings.json"))},
+              swVers:capture("sw_vers"),uname:capture("uname",["-a"]),imageOS:process.env.ImageOS??null,imageVersion:process.env.ImageVersion??null};
+          }
+          function environment(){
+            for(const key of ["SCRIPTC_LLVM_TEST_MODE","SCRIPTC_SAN","SCRIPTC_NO_CACHE","SCRIPTC_CACHE_DIR","SCRIPTC_LLVM_HELPER","SCRIPTC_CC","SCRIPTC_TARGET","SCRIPTC_TEST_OPTIMIZATION","SCRIPTC_CPU_DISPATCH","SCRIPTC_LEGACY_C_PIPELINE"]){
+              assert.equal(process.env[key],undefined,"noncanonical override: "+key);
+            }
+            return {...invocation.env,omitted:["SCRIPTC_LLVM_TEST_MODE","SCRIPTC_SAN","SCRIPTC_NO_CACHE","SCRIPTC_CACHE_DIR"],cache:"unchanged vitest default; fresh hosted checkout, no historical compiler cache"};
+          }
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_LIBNODE"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              let nextObservation = 0;
+                while (!exited && !stopReason && Date.now() < deadline) {
+                  if (label === "replay" && Date.now() >= nextObservation) {
+                    try { await observe(child.pid, started, result, false); }
+                    catch (error) { result.observerError = String(error); }
+                    nextObservation = Date.now() + 1000;
+                  }
+                  await delay(100);
+                }
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                    if (label === "replay" && members.length) {
+                      try { await observe(child.pid, started, result, true); }
+                      catch (error) { result.observerError = String(error); }
+                      members = groupMembers(child.pid);
+                    }
+                    // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+
+          const observed=new Map(), samples=new Set();
+          let monitorBytes=0;
+          const helperObservations=[];
+          function processSnapshot(group){
+            const raw=capture("python3",[join(out,"observe.py"),String(group)]);const rows=JSON.parse(raw);assert.ok(Array.isArray(rows)&&rows.length<=128);
+            for(const row of rows)assert.ok(row.pid>1&&row.pgid===group);
+            return rows;
+          }
+          function writeObservation(value){
+            const raw=Buffer.from(JSON.stringify(value)+"\n");monitorBytes+=raw.length;assert.ok(monitorBytes<=CAP,"process telemetry exceeds bound");
+            const fd=openSync(join(out,"process-observations.jsonl"),"a");try{writeAll(fd,raw);}finally{closeSync(fd);}
+          }
+          async function observe(group,started,result,final){
+            const rows=processSnapshot(group), elapsedMs=Date.now()-started;
+            for(const row of rows){
+              const id=row.pid+":"+row.started, serialized=JSON.stringify(row);
+              if(observed.get(id)!==serialized){writeObservation({elapsedMs,final,...row});observed.set(id,serialized);}
+              if(!row.identityStable){if(!row.vanished)result.observerError="live process identity/argv unavailable";continue;}
+              const helper=join(root,"packages/llvm-darwin-arm64/bin/scriptc-llvm-codegen");
+              if(row.executable!==realpathSync(helper))continue;
+              const argv=row.argv;assert.ok(Array.isArray(argv));
+              const inputIndex=argv.indexOf("--input"), levelIndex=argv.indexOf("--opt-level");
+              if(inputIndex<0||levelIndex<0)continue; // version/probe calls are recorded but are not the case compiler.
+              const sourceIndex=argv.indexOf("--source-path"), input=argv[inputIndex+1], level=argv[levelIndex+1];
+              const binding=sourceIndex>=0&&argv[sourceIndex+1]===join(root,fixture);
+              const receipt={elapsedMs,pid:row.pid,ppid:row.ppid,pgid:row.pgid,started:row.started,executable:row.executable,argv,optLevel:level,caseSourceMatched:binding};
+              if(!binding){writeObservation({...receipt,unboundHelper:true});continue;}
+              helperObservations.push(receipt);
+              if(!existsSync(input)){writeObservation({...receipt,inputCapture:"input already removed after process snapshot"});continue;}
+              assert.ok(input.startsWith(root+"/")&&lstatSync(input).isFile()&&!lstatSync(input).isSymbolicLink(),"helper input outside the case checkout");
+              assert.ok(statSync(input).size<=128*1024*1024,"helper input exceeds hash budget");
+              if(!observed.has("input:"+id)){
+                receipt.input={path:input,bytes:statSync(input).size,sha256:hash(input)};
+                writeObservation(receipt);observed.set("input:"+id,JSON.stringify(receipt));
+              }
+              const logs=["replay.stdout.log","replay.stderr.log"].filter(p=>existsSync(join(out,p))).map(p=>readFileSync(join(out,p),"utf8")).join("\n");
+              if((final||elapsedMs>=280000||/Test timed out in 300000ms/.test(logs))&&!samples.has(id)){
+                samples.add(id);
+                const again=processSnapshot(group).find(x=>x.pid===row.pid);
+                if(!again||!again.identityStable||again.started!==row.started||again.executable!==row.executable||JSON.stringify(again.argv)!==JSON.stringify(argv)){
+                  writeObservation({...receipt,sample:"identity changed or exited before sample"});continue;
+                }
+                const copy=join(out,"helper-input-"+row.pid+".ll");copyFileSync(input,copy);
+                assert.equal(hash(copy),hash(input));receipt.inputAtSample=record(copy);
+                receipt.sample=await run("sample-"+row.pid,"/usr/bin/sample",[String(row.pid),"1","10"],10);
+                receipt.samplePurpose="one-second stack observation of this identity-checked group member; not a compiler timeout extension";
+                writeObservation(receipt);
+                result.samples=(result.samples??[]).concat(receipt);
+              requireSuccess(receipt.sample);
+              }
+            }
+          }
+          function cachePaths(){
+            return ["release","dev"].map(mode=>{
+              const entry=join(root,fixture),key=createHash("sha256").update(entry).update(readFileSync(entry)).update("plain").update("llvm-"+mode).update("").digest("hex").slice(0,16);
+              return {mode,dir:join(root,"node_modules/.cache/scriptc-tests",key),binary:join(root,"node_modules/.cache/scriptc-tests",key,"program-llvm-"+mode)};
+            });
+          }
+          function retainedOutputs(){
+            return cachePaths().map(item=>{
+              const artifacts=[];
+              if(existsSync(item.dir)){
+                for(const name of readdirSync(item.dir).sort()){
+                  const p=join(item.dir,name),s=lstatSync(p);
+                  if(s.isFile()&&!s.isSymbolicLink()){
+                    assert.ok(s.size<=128*1024*1024,"case artifact exceeds retention budget");
+                    const dest=join(out,item.mode+"-"+name);copyFileSync(p,dest);assert.equal(hash(dest),hash(p));artifacts.push(record(dest));
+                  }
+                }
+              }
+              return {...item,binaryPresent:existsSync(item.binary),artifacts};
+            });
+          }
+          function parseReplay(step){
+            const text=["stdout","stderr"].map(k=>readFileSync(join(out,step[k].path),"utf8")).join("\n").replace(/\x1b\[[0-9;]*m/g,"");
+            const timing=text.split("\n").flatMap(line=>{const at=line.indexOf("scriptc timing ");if(at<0)return[];return[JSON.parse(line.slice(at+15))];});
+            save("timing.json",timing);
+            const results=text.split("\n").filter(line=>/^\s*[✓✔√×✗]\s+tests\/harness\/llvm-differential\.test\.ts\s+>/.test(line)&&/>\s+array-element-compound-updates\.ts(?:\s|$)/.test(line));
+            const terminal=results.filter(line=>/release\+dev/.test(line));
+            const timeout=/Test timed out in 300000ms/.test(text);
+            const counts=/\bTests\s+(1 (?:passed|failed))\s*\|\s*972 skipped\s*\(973\)/.exec(text);
+            const exactInventory=results.length===1&&terminal.length===1&&/\(973 programs, release\+dev/.test(terminal[0])&&counts!==null;
+            const onePass=exactInventory&&/^\s*[✓✔√]/.test(terminal[0])&&counts[1]==="1 passed";
+            const oneFailure=exactInventory&&/^\s*[×✗]/.test(terminal[0])&&counts[1]==="1 failed";
+            return {selectedCase:fixture,expectedInventory:{selectedExecuted:1,filteredSkipped:972,total:973},observedCountSummary:counts?.[0]??null,exactInventory,selectedResultLines:results,oneSelectedTerminal:onePass||oneFailure,onePass,oneFailure,timeoutObserved:timeout,
+              completedCompilations:timing.filter(x=>x.phase==="complete").length,
+              helperModeObservation:{release:helperObservations.filter(x=>x.optLevel==="2"),dev:helperObservations.filter(x=>x.optLevel==="0"),bothWitnessed:helperObservations.some(x=>x.optLevel==="2")&&helperObservations.some(x=>x.optLevel==="0")},timingArtifact:record(join(out,"timing.json")),
+              modeOrder:"release then dev from unchanged harness; timing records do not label mode; owned helper argv records --opt-level when observed"};
+          }
+          async function libnode(){
+            const path=process.env.SCRIPTC_LIBNODE;assert.ok(path&&path.startsWith("/"),"canonical libnode action did not provide a pack");
+            const {readLibnodePack}=await import(pathToFileURL(join(root,"packages/compiler/dist/node-islands/libnode-pack.js")));
+            const pack=await readLibnodePack(path,{verifyHashes:true});assert.ok(pack,"libnode pack invalid");
+            assert.equal(pack.manifest.platform,"darwin");assert.equal(pack.manifest.arch,"arm64");assert.equal(pack.manifest.nodeVersion,"24.22.0");assert.equal(pack.manifest.bridgeAbi,10);
+            const rows=Object.entries(pack.manifest.files).map(([name,item])=>{
+              assert.equal(name, name.split("/").at(-1));const p=join(path,name);assert.equal(statSync(p).size,item.size);assert.equal(hash(p),item.sha256);return {name,bytes:item.size,sha256:item.sha256};
+            });
+            return {path,manifestSha256:hash(join(path,"manifest.json")),manifest:pack.manifest,files:rows,route:"unchanged canonical libnode composite"};
+          }
+          async function prepare(){
+            verifyWorkOwner();
+            const report={schema:1,consumer:consumerIdentity,sourceHead,invocation,original:{run:41257029033,job:124703614922,workflow:"5fed39a85f7f342cef8d2140da11a765ffda046d",outcome:"300000ms case timeout; orphan helper PID27897 was not bound to a case/phase"},
+              runnerSha256:hash(self),observerSha256:hash(join(out,"observe.py")),diagnosticComplete:false,isolatedPass:false,fullQualification:false,rootCauseEstablished:false};
+            save("summary.json",report);
+            try{
+              assert.equal(process.platform,"darwin");assert.equal(process.arch,"arm64");assert.equal(process.version,"v24.22.0");
+              report.sourceBefore=source();report.nativeInputsBefore=nativeInputs();report.nativeBefore=nativeFiles();report.toolsBefore=tools();environment();
+              assert.equal(report.toolsBefore.pnpm.version,"11.1.3");save("summary.json",report);
+              report.install=await run("install","pnpm",["install","--frozen-lockfile"],600);requireSuccess(report.install);
+              assert.deepEqual(nativeFiles(),report.nativeBefore);
+              report.helper=JSON.parse(capture(join(root,"packages/llvm-darwin-arm64/bin/scriptc-llvm-codegen"),["version","--format=json"]));
+              assert.equal(report.helper.ok,true);assert.equal(report.helper.protocol_version,"1");
+              assert.equal(report.helper.llvm_version,"22.1.8");assert.match(report.helper.host_triple,/^(arm64|aarch64)-apple-/);
+              report.runtimeVerify=await run("runtime-verify",process.execPath,["packages/runtime-darwin-arm64/scripts/verify.mjs"],60);requireSuccess(report.runtimeVerify);
+              copyFileSync(join(root,"packages/runtime-darwin-arm64/runtime-pack.json"),join(out,"runtime-pack.json"));
+              report.runtimeManifest=record(join(out,"runtime-pack.json"));
+              report.build=await run("workspace-build","pnpm",["build"],600);requireSuccess(report.build);
+              assert.deepEqual(nativeFiles(),report.nativeBefore);assert.deepEqual(source(),report.sourceBefore);
+              report.prepared=true;
+            }catch(error){report.preparationFailure=String(error);process.exitCode=1;}
+            finally{save("summary.json",report);}
+          }
+          async function replay(){
+            verifyWorkOwner();const report=json(join(out,"summary.json"));
+            try{
+              assert.equal(report.prepared,true);assert.deepEqual(source(),report.sourceBefore);assert.deepEqual(nativeFiles(),report.nativeBefore);
+              report.environment=environment();report.libnodeBefore=await libnode();report.cacheBefore=cachePaths().map(x=>({...x,exists:existsSync(x.dir)}));
+              assert.ok(report.cacheBefore.every(x=>!x.exists),"case cache already exists before the sole replay");
+              save("summary.json",report);
+              report.replay=await run("replay",invocation.command,invocation.args,invocation.outerDiagnosticSeconds,{...invocation.env,SCRIPTC_LIBNODE:process.env.SCRIPTC_LIBNODE});
+              report.parsed=parseReplay(report.replay);report.outputs=retainedOutputs();
+              report.libnodeAfter=await libnode();assert.deepEqual(report.libnodeAfter,report.libnodeBefore);
+              report.sourceAfter=source();report.nativeAfter=nativeFiles();report.nativeInputsAfter=nativeInputs();report.toolsAfter=tools();
+              assert.deepEqual(report.sourceAfter,report.sourceBefore);assert.deepEqual(report.nativeAfter,report.nativeBefore);assert.deepEqual(report.nativeInputsAfter,report.nativeInputsBefore);assert.deepEqual(report.toolsAfter,report.toolsBefore);
+              report.inputsReadback=true;
+              const step=report.replay;
+              const stored=["stdout","stderr"].every(k=>step[k].bytes===step[k].observedBytes&&step[k].sha256===step[k].observedSha256&&step[k].complete);
+              report.diagnosticComplete=report.parsed.oneSelectedTerminal&&step.status==="exited"&&step.signal===null&&stored&&step.storageComplete&&step.streamsClosed&&step.drained&&!step.observerError;
+              report.executionComplete=report.diagnosticComplete&&!step.forcedCleanup;
+              report.observation=!report.diagnosticComplete?"incomplete":report.parsed.timeoutObserved?"harness-timeout-observed":report.parsed.oneFailure?"test-failure-observed":"isolated-pass";
+              report.isolatedPass=report.diagnosticComplete&&report.parsed.onePass&&step.code===0&&!step.forcedCleanup&&report.parsed.completedCompilations===2&&report.outputs.every(x=>x.binaryPresent);
+              if(report.isolatedPass)requireSuccess(step);else process.exitCode=1;
+            }catch(error){report.failure=String(error);process.exitCode=1;}
+            finally{
+              report.limitations=["A fresh isolated checkout does not recreate 972 preceding cases or contention.","The combined unchanged test retains one 300000ms timeout across release then dev.","Short-lived helper processes can fall between passive observations.","No isolated outcome resolves the original full-CI root cause or establishes full qualification."];
+              save("summary.json",report);
+            }
+          }
+          function finalize(){
+            let report=existsSync(join(out,"summary.json"))?json(join(out,"summary.json")):{schema:1,consumer:consumerIdentity,isolatedPass:false,diagnosticComplete:false,fullQualification:false,rootCauseEstablished:false};
+            try{
+              verifyWorkOwner();assert.ok(allDrained(),"a spawned process group lacks a drain/close receipt");
+              if(report.sourceBefore){assert.deepEqual(source(),report.sourceBefore);assert.deepEqual(nativeFiles(),report.nativeBefore);assert.deepEqual(nativeInputs(),report.nativeInputsBefore);report.finalReadback=true;}
+              rmSync(work,{recursive:true});assert.ok(!existsSync(work));report.cleanupPassed=true;
+            }catch(error){report.cleanupPassed=false;report.cleanupFailure=String(error);}
+            report.finalPassed=report.isolatedPass===true&&report.inputsReadback===true&&report.finalReadback===true&&report.cleanupPassed===true;
+            report.fullQualification=false;report.rootCauseEstablished=false;
+            save("summary.json",report);
+            save("manifest.json",readdirSync(out).filter(n=>n!=="manifest.json"&&lstatSync(join(out,n)).isFile()).sort().map(n=>record(join(out,n))));
+            if(!report.finalPassed){console.error("[array-update-timeout] FAILED (exit 1)");process.exitCode=1;}
+          }
+          if(process.argv[2]==="--child")await childMain();
+          else if(process.argv[2]==="--prepare")await prepare();
+          else if(process.argv[2]==="--replay")await replay();
+          else if(process.argv[2]==="--finalize")finalize();
+          else throw new Error("unknown diagnostic phase");
+          RUNNER
+          node --check "$RUNNER_TEMP/array-update-timeout-proof/runner.mjs"
+      - name: Frozen install and canonical workspace build
+        run: node "$RUNNER_TEMP/array-update-timeout-proof/runner.mjs" --prepare
+      - uses: ./.github/actions/libnode
+      - name: Sole combined release and dev replay
+        run: node "$RUNNER_TEMP/array-update-timeout-proof/runner.mjs" --replay
+      - name: Verify readbacks and drain owned groups
+        if: always()
+        run: node "$RUNNER_TEMP/array-update-timeout-proof/runner.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: array-update-timeout-proof
+          path: ${{ runner.temp }}/array-update-timeout-proof
+          if-no-files-found: error
+          retention-days: 1
