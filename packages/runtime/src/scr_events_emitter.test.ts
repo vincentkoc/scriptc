@@ -26,6 +26,7 @@ test("direct dynamic errorMonitor adapts fixed Error and zero-argument listeners
         ...(process.platform === "linux" ? ["-D_GNU_SOURCE"] : []),
         join(import.meta.dirname, "scr_events_emitter.test.c"),
         join(import.meta.dirname, "scr_events_emitter.c"),
+        join(import.meta.dirname, "scr_dyn_handle.c"),
         ...EXECUTABLE_RUNTIME_SOURCES.map((name) => join(import.meta.dirname, name)),
         ...(process.platform === "linux" ? ["-lm"] : []),
         "-o",
