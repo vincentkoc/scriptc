@@ -1,0 +1,607 @@
+name: Qualify node island Error identity
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/qualify-node-island-error-identity.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-node-island-error-identity-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 3e85ecfc9f3e245a63c31b74f48b32925f5ab83f
+
+jobs:
+  diagnose:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    env:
+      PROOF_CAPACITY_NAME: node-island-error-identity-capacity
+      DIAGNOSTIC_SOURCE: 3e85ecfc9f3e245a63c31b74f48b32925f5ab83f
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
+      - uses: ./.github/actions/llvm-linux
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Prepare owned qualification runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/node-island-error-identity.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync, symlinkSync, readlinkSync } from "node:fs";
+          import { basename, join, relative } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self = fileURLToPath(import.meta.url), root = process.cwd();
+          const out = join(process.env.RUNNER_TEMP, "node-island-error-identity-proof");
+          const work = join(process.env.RUNNER_TEMP, "node-island-error-identity-work");
+          const head = process.env.SOURCE_SHA;
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: head, platform: process.platform };
+          const CAP = 16 * 1024 * 1024;
+          const sourcePins = {".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9",".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44",".oxfmtrc.jsonc":"39e3e80a4b4aaabdac8b12e5a56ebc6f130a99c271d8e0bc1965a68dff0b60fb",".oxlintrc.jsonc":"8b843dbb8fbf3620f77f82c107e5e4834d3b991f4e6b8fdcb2c6d9d078bf5161","AGENTS.md":"11ccf7ab2f85791a40e8f497959e4e94df067807d1ac93ad23c7737578bd334c","CHANGELOG.md":"582a833099225bb514c5b3a3a74293b6ddadaed4e03abe3aff95a2db6339c89c","CONTRIBUTING.md":"d2893ad8866f976b26eeb4463cb1eae046dc059ac4d140c27ee039d3ee9d8e7a","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/backend/llvm/dyn.test.ts":"58686b931862ce72469e459dbf2e23cd4373044dd378b6d4f6a9821290449980","packages/compiler/src/backend/llvm/dyn.ts":"55dcb307a231bc567ca3d08c50cb144d9a7ec590953049ecb6d3c93cb9b8c5e8","packages/compiler/src/backend/llvm/expr-dynamic.ts":"0f6a897df0ab00074aba39564875842b091e24df6fe95e82d719210d7d4405a1","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/cli/output-options.ts":"f67105fb66f3d95a679c7fe8be81939e6349a128731fe5563b5b9891c3b6a316","packages/compiler/src/diagnostics/diagnostic.ts":"f6151c4b9c3ef455225d3c431b0105c26b550c466175ac7b0a8152dfa50fb9a3","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/frontend/lowering/builtins/environment.ts":"096afd3dd58d041ebea6c565b5245acb9b93a7bd8afecabca8c9a2916b241c7a","packages/compiler/src/frontend/lowering/builtins/process.ts":"c6a0ce9b6a0160cc3fca75f1be0db85f9d46ad492c63631dcebdc4cfc56bb793","packages/compiler/src/frontend/lowering/caught-value-dispatch.ts":"2b5979c747e290892e58f0af504c5916444f60231179d9d4f1d97e1a7279badb","packages/compiler/src/frontend/lowering/containers/bytes.ts":"50c15a2c8bfd0715b8791ed2abd967aad30dced0c4b5be079c87053b0a54a3c2","packages/compiler/src/frontend/lowering/expressions/binary.ts":"9afd4d2410dfcfda9eb2f8b9ac369e8126f3c670f59828c9b239534db6f23b72","packages/compiler/src/frontend/lowering/lower-calls.ts":"81a1f47b90a76649b3a1ec5eb7c6ba3fd5e0c61d047e855b5c4a933bbf855bb5","packages/compiler/src/frontend/lowering/lower-classes.ts":"261a5c3578f2591bf4dddb18e283e12fc48698d93a34c28c33ff59ec0cf07b47","packages/compiler/src/frontend/lowering/lower-exprs.ts":"21912d733d3728c8c28d821951ac10d6bb686fb7ae16dc3bd2132fe9bb16e03f","packages/compiler/src/frontend/lowering/lower-functions.ts":"96d8855867decc59426dba062221d7526527478120cf3b784442c38bf18367ae","packages/compiler/src/frontend/lowering/lower-modules.ts":"e0c52ed22a75d9e686521035fd034ab4e651abe12d2a0208b77893f4c8133ffe","packages/compiler/src/frontend/lowering/lower-node-island.ts":"cf8237c7258fd533b6d591ebf07eaeffb01b1edad3f3e67176243f29d8715574","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"17a1144990227554d0018284bfc9cd443bf64c167ed983722a53a32ce857bbba","packages/compiler/src/frontend/lowering/lower-stmts.ts":"d7357f9f7384a03072e27008d9f3913fbeeead7326d44830435ff76a71a395a7","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","packages/compiler/src/ir/ir.ts":"4083cf2a5b697c98938d50fb2434b95dba8ad3135bf1aed1e9a782717817382b","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/compiler/test/node-island-error-emission.test.ts":"a8d7d4d265a525e1c9887cec103273dc47e0a7886268619e08cffaa67216f7d4","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/scripts/cache-key.mjs":"a949852965733eff702f2abc164e2466684e68d4b8726f6c98d0c6883cf875c3","packages/libnode-common/scripts/verify.mjs":"051fd399d29bddc8f757213ee00d5f6c1d200755266b0ebe86b7603462de503a","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime/src/scr_async.c":"6a990cc466361828bd82bd688fc3811da23b876df223fb5d0214c496ca855198","packages/runtime/src/scr_bytes.c":"5c49016bef3e37ec3c9ccca98650bf588b2eea69bac9e0fd4f979b55d6325a94","packages/runtime/src/scr_error.c":"217bda2be5bf907120f9c2e432af5ab71040f6e10127ae69139971dd080bf753","packages/runtime/src/scr_events.c":"0f27965c4237b688841d14df5c71e8c87c34f0c0311569f40d35208ae5cd294e","packages/runtime/src/scr_json.c":"cb6eb34d6723a6074be1ff7f2c4e4a4e8a0cb62ace9cd0fd99f0024fcb4b11fb","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_lib.h":"83a688df501afd1115baaeff931c61bcb8973cd505acd8f59bca5a18cadafdbc","packages/runtime/src/scr_node_bridge.h":"ba7341a77633ab992e2059ec3377292a7d524fa8c30156cc8c50532c97f50d16","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/runtime/src/scr_node_island.h":"aa94ab7b3c8899325cb77605bfb142823b7c50198d8d918e1a320ac42925d570","packages/runtime/src/scr_node_island_export.c":"ee93fa6046a8430bd6eb812058af06b6f0261a351b6e66cd13245afb66851c0d","packages/runtime/src/scr_node_island_handle.c":"4f34dc673574abd8fffd2b02ad03d12acd0378bd9364dbbba2833b8eeb886f39","packages/runtime/src/scr_node_island_host.cjs":"e853e03ceaa0ef422c7554da29d15d7f8c6bfab1c9668a837b2f8e4f68ca6913","packages/runtime/src/scr_regex.c":"a6790257bf0e56e575e18d1119fc276ff355135ceb693d2d9b3d268b5e47a1c7","packages/runtime/src/scr_regex.h":"3deb5f58aab84c525e6f6016d680d08eaac3f3f77483fa26894427ba9dd46746","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","tests/corpus/6813-node-island-handle-errors/lib.cjs":"e08ee02a7ae8f77fff0ebfaa3fa7da769becc3fb178271d6c460a6cc8848450c","tests/corpus/6813-node-island-handle-errors/main.mjs":"d1addaac0f233b60ca045c1e71d0e12bd18be3da39ca9bf9bf0d53c62c87cb8d","tests/corpus/6814-node-island-handle-bytes/lib.cjs":"3cc51c20ac4f08e99b30a02aaece0ba15fd7bc322c5b2da0258fe8af195e24c4","tests/corpus/6814-node-island-handle-bytes/main.mjs":"d9cf0abf4bb9b20bd25728b981307296c188a935d5df93919db266cd1ab681c9","tests/corpus/6819-caught-instanceof-dynamic-payloads.ts":"e5c0dd1d3c4dbe12a70e402f43335b08dfecab0bfc9c0893d30cc7b14cb203b3","tests/corpus/8602-promise-payload-identity.ts":"987e6eb4930b64b96c2c20969190a33b581334983f818f085843899162bc180a","tests/harness/corpus-costs.json":"e844cc7a06d29c7838149e6330ceb53e09f1819ce07c81e97844784a6eb5fca0","tests/harness/differential.test.ts":"593a0f5ad44cbed9d8d75b7565abe31e38497db9f4ff3a05f8079a4032a7424c","tests/harness/jsx-oracle.ts":"c4642f02da794f548bebe8d6e23ec4b48380e25cc803c4154c47dc1bfede76f8","tests/harness/libnode.ts":"c2feb9a246d9f333411f1c54c299af07002e9e81a575a73b08eb6b69f5f04d9a","tests/harness/llvm-differential.test.ts":"b2348d38fae94ff638054a99048a90cc440d079559eb580287973b54f96736d1","tests/harness/node-island-handles.test.ts":"ae608b85236cff5fba4cba6e988465c1bbade7ace94793a19e4241b06a2a6db2","tests/harness/oracle-env.ts":"f16a4f44e97d1cb16a43421c20886effebf1b478d2d02ccebcaf13f7aa6fdcf6","tests/harness/shard.ts":"8ef5234e8fcf13672e7e1d774eaa4ff58e264c06e85be16e5f77eda5a66467bd","vitest.config.ts":"96064c247379f195187a4eb99c1d5a62d64d41bb436d8e9fa5cbb8cd02b25f32"};
+          const sourceFiles = Object.keys(sourcePins);
+          const nativeExpected = {"count": 1053, "sha256": "1e26de01630f6bf975a536ceca330bb537b3a22366c3ce9551b54d501a50336c"};
+          const gateSpecs = [{"id":"compiler-plain","flavor":"plain","files":["packages/compiler/src/backend/llvm/dyn.test.ts","packages/compiler/test/node-island-error-emission.test.ts"],"filter":null,"expectedByFile":{"packages/compiler/src/backend/llvm/dyn.test.ts":["Error union matching checks the brand without extracting a typed mirror","checked Error extraction keeps the native cache fast path and admits branded handles"],"packages/compiler/test/node-island-error-emission.test.ts":["authored island Error instanceof uses one value-aware predicate for every operand form","pure native typed Error instanceof retains its unboxed class test"]},"kind":"units"},{"id":"handles-plain","flavor":"plain","files":["tests/harness/node-island-handles.test.ts"],"filter":"^foreign Error identity ","expectedByFile":{"tests/harness/node-island-handles.test.ts":["foreign Error identity returned, caught, callback and promise Errors keep their island identity","foreign Error identity Error branding and prototype membership do not read island properties","foreign Error identity checked Error conversions reject non-Error island handles","foreign Error identity released typed Error mirrors do not root island handles"]},"kind":"handles"},{"id":"differential-plain","flavor":"plain","files":["tests/harness/differential.test.ts"],"filter":"(?:6813\\-node\\-island\\-handle\\-errors/main\\.mjs|6819\\-caught\\-instanceof\\-dynamic\\-payloads\\.ts|8602\\-promise\\-payload\\-identity\\.ts)$","tests":["6813-node-island-handle-errors/main.mjs","6819-caught-instanceof-dynamic-payloads.ts","8602-promise-payload-identity.ts"],"kind":"differential"},{"id":"llvm-differential-plain","flavor":"plain","files":["tests/harness/llvm-differential.test.ts"],"filter":"(?:6813\\-node\\-island\\-handle\\-errors/main\\.mjs|6819\\-caught\\-instanceof\\-dynamic\\-payloads\\.ts|8602\\-promise\\-payload\\-identity\\.ts)$","tests":["6813-node-island-handle-errors/main.mjs","6819-caught-instanceof-dynamic-payloads.ts","8602-promise-payload-identity.ts"],"kind":"llvm-differential"},{"id":"compiler-san","flavor":"san","files":["packages/compiler/src/backend/llvm/dyn.test.ts","packages/compiler/test/node-island-error-emission.test.ts"],"filter":null,"expectedByFile":{"packages/compiler/src/backend/llvm/dyn.test.ts":["Error union matching checks the brand without extracting a typed mirror","checked Error extraction keeps the native cache fast path and admits branded handles"],"packages/compiler/test/node-island-error-emission.test.ts":["authored island Error instanceof uses one value-aware predicate for every operand form","pure native typed Error instanceof retains its unboxed class test"]},"kind":"units"},{"id":"handles-san","flavor":"san","files":["tests/harness/node-island-handles.test.ts"],"filter":"^foreign Error identity ","expectedByFile":{"tests/harness/node-island-handles.test.ts":["foreign Error identity returned, caught, callback and promise Errors keep their island identity","foreign Error identity Error branding and prototype membership do not read island properties","foreign Error identity checked Error conversions reject non-Error island handles","foreign Error identity released typed Error mirrors do not root island handles"]},"kind":"handles"},{"id":"differential-san","flavor":"san","files":["tests/harness/differential.test.ts"],"filter":"(?:6813\\-node\\-island\\-handle\\-errors/main\\.mjs|6819\\-caught\\-instanceof\\-dynamic\\-payloads\\.ts|8602\\-promise\\-payload\\-identity\\.ts)$","tests":["6813-node-island-handle-errors/main.mjs","6819-caught-instanceof-dynamic-payloads.ts","8602-promise-payload-identity.ts"],"kind":"differential"},{"id":"llvm-differential-san","flavor":"san","files":["tests/harness/llvm-differential.test.ts"],"filter":"(?:6813\\-node\\-island\\-handle\\-errors/main\\.mjs|6819\\-caught\\-instanceof\\-dynamic\\-payloads\\.ts|8602\\-promise\\-payload\\-identity\\.ts)$","tests":["6813-node-island-handle-errors/main.mjs","6819-caught-instanceof-dynamic-payloads.ts","8602-promise-payload-identity.ts"],"kind":"llvm-differential"}];
+          const knownTitles = {"tests/harness/node-island-handles.test.ts":["Node island handles handles the program dropped are released","Node island handles island member calls and assignments evaluate in JavaScript's order","Node island handles requireModule() loads Node's built-in modules","Node island handles a package marked native never runs in a Node island","Node island handles a package whose fences may never run stays native","Node island handles a fence in module code makes a Node island, with the ES modules importing it","Node island handles without islands, a package's deferred refusals refuse at run time","Node island handles an island array that contradicts its declaration throws at the crossing","Node island handles an island record that contradicts its declaration throws at the crossing","Node island handles an island package ships with the program","foreign Error identity returned, caught, callback and promise Errors keep their island identity","foreign Error identity Error branding and prototype membership do not read island properties","foreign Error identity checked Error conversions reject non-Error island handles","foreign Error identity released typed Error mirrors do not root island handles"],"packages/compiler/src/backend/llvm/dyn.test.ts":["Error union matching checks the brand without extracting a typed mirror","checked Error extraction keeps the native cache fast path and admits branded handles"],"packages/compiler/test/node-island-error-emission.test.ts":["authored island Error instanceof uses one value-aware predicate for every operand form","pure native typed Error instanceof retains its unboxed class test"]};
+          const siblings = ["6813-node-island-handle-errors/main.mjs","6819-caught-instanceof-dynamic-payloads.ts","8602-promise-payload-identity.ts"];
+          const corpusExpected = {"count":4855,"sha256":"a9f1c9f94b13b99bc4652efcc49e6808d4cdfaa28c1ccbfb179e5e70d575f76a"};
+          const fixtureSpecs = [{"id":"error-identity","body":"\nconst value: unknown = island.get();\nconst other: unknown = island.fresh();\nconsole.log('returned', value === island.get(), value !== other);\nconst typed = value as Error;\nconst again = value as Error;\nconst nullable = value as Error | null;\nconsole.log('checked', typed === again, (typed as unknown) === value, (nullable as unknown) === value);\nconsole.log('echo', island.echo(typed) === value, island.same(typed, typed));\ntry { island.fail(); } catch (caught) {\n  console.log('caught', caught === value, caught instanceof Error, caught instanceof TypeError);\n  try { throw caught; } catch (rethrown) { console.log('rethrow', rethrown === value); }\n}\ntry { throw value; } catch (caught) {\n  console.log('native-throw', caught === value, caught instanceof Error);\n  try { island.rethrow(caught); } catch (rethrown) { console.log('island-rethrow', rethrown === value); }\n}\nfunction accept(error: Error): boolean { return (error as unknown) === value; }\nfunction acceptNullable(error: Error | null): boolean { return error === null || (error as unknown) === value; }\nconsole.log('callback', island.call(accept), island.call(acceptNullable), island.callNull(acceptNullable));\nconst fulfilled = island.fulfill() as Promise<Error>;\nconsole.log('fulfilled', ((await fulfilled) as unknown) === value);\nconst rejected = island.reject() as Promise<Error>;\ntry { await rejected; } catch (caught) { console.log('rejected', caught === value, caught instanceof Error); }\nconst dynamic: any = value;\ndynamic.code = 'native';\nconsole.log('write', island.code() === 'native');\nisland.write('island');\nconsole.log('read', dynamic.code === 'island');\nisland.detach(typed);\nconsole.log('typed-prototype', typed instanceof Error, typed instanceof TypeError);\ntry { throw typed; } catch (caught) {\n  console.log('caught-prototype', caught === value, caught instanceof Error, caught instanceof TypeError);\n}\n","files":{"main.mts":"import * as island from './island.mjs';\n\nconst value: unknown = island.get();\nconst other: unknown = island.fresh();\nconsole.log('returned', value === island.get(), value !== other);\nconst typed = value as Error;\nconst again = value as Error;\nconst nullable = value as Error | null;\nconsole.log('checked', typed === again, (typed as unknown) === value, (nullable as unknown) === value);\nconsole.log('echo', island.echo(typed) === value, island.same(typed, typed));\ntry { island.fail(); } catch (caught) {\n  console.log('caught', caught === value, caught instanceof Error, caught instanceof TypeError);\n  try { throw caught; } catch (rethrown) { console.log('rethrow', rethrown === value); }\n}\ntry { throw value; } catch (caught) {\n  console.log('native-throw', caught === value, caught instanceof Error);\n  try { island.rethrow(caught); } catch (rethrown) { console.log('island-rethrow', rethrown === value); }\n}\nfunction accept(error: Error): boolean { return (error as unknown) === value; }\nfunction acceptNullable(error: Error | null): boolean { return error === null || (error as unknown) === value; }\nconsole.log('callback', island.call(accept), island.call(acceptNullable), island.callNull(acceptNullable));\nconst fulfilled = island.fulfill() as Promise<Error>;\nconsole.log('fulfilled', ((await fulfilled) as unknown) === value);\nconst rejected = island.reject() as Promise<Error>;\ntry { await rejected; } catch (caught) { console.log('rejected', caught === value, caught instanceof Error); }\nconst dynamic: any = value;\ndynamic.code = 'native';\nconsole.log('write', island.code() === 'native');\nisland.write('island');\nconsole.log('read', dynamic.code === 'island');\nisland.detach(typed);\nconsole.log('typed-prototype', typed instanceof Error, typed instanceof TypeError);\ntry { throw typed; } catch (caught) {\n  console.log('caught-prototype', caught === value, caught instanceof Error, caught instanceof TypeError);\n}\n","island.mjs":"\nlet kept = new TypeError('same');\nexport function get() { return kept; }\nexport function fresh() { return new TypeError('same'); }\nexport function same(a, b) { return a === b; }\nexport function echo(value) { return value; }\nexport function fail() { throw kept; }\nexport function rethrow(value) { throw value; }\nexport function call(fn) { return fn(kept); }\nexport function callWith(fn, value) { return fn(value); }\nexport function callNull(fn) { return fn(null); }\nexport function fulfill() { return Promise.resolve(kept); }\nexport function reject() { return Promise.reject(kept); }\nexport function write(value) { kept.code = value; }\nexport function code() { return kept.code; }\nexport function plain() { return { name: 'TypeError', message: 'same', '%error': true }; }\nexport function prototypeOnly() { return Object.create(Error.prototype); }\nexport function detach(value) { Object.setPrototypeOf(value, null); }\nlet reads = 0;\nexport function guarded() {\n  const value = new TypeError('guarded');\n  Object.defineProperty(value, 'name', { get() { reads++; return 'TypeError'; } });\n  Object.defineProperty(value, 'code', { get() { reads++; return 'CODE'; } });\n  return value;\n}\nexport function readCount() { return reads; }\n"},"expected":"returned true true\nchecked true true true\necho true true\ncaught true true true\nrethrow true\nnative-throw true true\nisland-rethrow true\ncallback true true true\nfulfilled true\nrejected true true\nwrite true\nread true\ntyped-prototype false false\ncaught-prototype true false false\n"},{"id":"error-brand","body":"\nconst value: unknown = island.guarded();\nconsole.log('brand', Error.isError(value), value instanceof Error, value instanceof TypeError);\nconsole.log('repeat', value === island.echo(value), island.same(value, value));\nfunction acceptUnknown(error: unknown): boolean { return Error.isError(error); }\nconsole.log('callback', island.callWith(acceptUnknown, value));\nconst detached: unknown = island.guarded();\nisland.detach(detached);\nconsole.log('detached', Error.isError(detached), detached instanceof Error, detached instanceof TypeError);\nconst prototype: unknown = island.prototypeOnly();\nconsole.log('prototype', Error.isError(prototype), prototype instanceof Error);\nconst spoof: unknown = island.plain();\nconsole.log('spoof', Error.isError(spoof), spoof instanceof Error);\nconsole.log('calls', island.echo(value) instanceof Error, island.echo(detached) instanceof Error);\nconsole.log('reads', island.readCount());\n","files":{"main.mts":"import * as island from './island.mjs';\n\nconst value: unknown = island.guarded();\nconsole.log('brand', Error.isError(value), value instanceof Error, value instanceof TypeError);\nconsole.log('repeat', value === island.echo(value), island.same(value, value));\nfunction acceptUnknown(error: unknown): boolean { return Error.isError(error); }\nconsole.log('callback', island.callWith(acceptUnknown, value));\nconst detached: unknown = island.guarded();\nisland.detach(detached);\nconsole.log('detached', Error.isError(detached), detached instanceof Error, detached instanceof TypeError);\nconst prototype: unknown = island.prototypeOnly();\nconsole.log('prototype', Error.isError(prototype), prototype instanceof Error);\nconst spoof: unknown = island.plain();\nconsole.log('spoof', Error.isError(spoof), spoof instanceof Error);\nconsole.log('calls', island.echo(value) instanceof Error, island.echo(detached) instanceof Error);\nconsole.log('reads', island.readCount());\n","island.mjs":"\nlet kept = new TypeError('same');\nexport function get() { return kept; }\nexport function fresh() { return new TypeError('same'); }\nexport function same(a, b) { return a === b; }\nexport function echo(value) { return value; }\nexport function fail() { throw kept; }\nexport function rethrow(value) { throw value; }\nexport function call(fn) { return fn(kept); }\nexport function callWith(fn, value) { return fn(value); }\nexport function callNull(fn) { return fn(null); }\nexport function fulfill() { return Promise.resolve(kept); }\nexport function reject() { return Promise.reject(kept); }\nexport function write(value) { kept.code = value; }\nexport function code() { return kept.code; }\nexport function plain() { return { name: 'TypeError', message: 'same', '%error': true }; }\nexport function prototypeOnly() { return Object.create(Error.prototype); }\nexport function detach(value) { Object.setPrototypeOf(value, null); }\nlet reads = 0;\nexport function guarded() {\n  const value = new TypeError('guarded');\n  Object.defineProperty(value, 'name', { get() { reads++; return 'TypeError'; } });\n  Object.defineProperty(value, 'code', { get() { reads++; return 'CODE'; } });\n  return value;\n}\nexport function readCount() { return reads; }\n"},"expected":"brand true true true\nrepeat true true\ncallback true\ndetached true false false\nprototype false true\nspoof false false\ncalls true false\nreads 0\n"}];
+          const fixtureRows = [{"path":"error-brand/expected.stdout.log","bytes":142,"sha256":"6775d628e4d115ad49197f6eab1842f60fcea5ef3196c8ab1d72c1abdd30c250"},{"path":"error-brand/island.mjs","bytes":1229,"sha256":"1495f6b4c851a0f57b60476e52448158218a121f81d221120dc78dc24d242cbc"},{"path":"error-brand/main.mts","bytes":959,"sha256":"835107cc7ea43904b4a79710127627065a731ba1d4e5fa9d86057b0f41b29f50"},{"path":"error-identity/expected.stdout.log","bytes":276,"sha256":"87d7aff1b039c9e90038c522ba64c868cff64de2a18ad1da530cef5935bce4f1"},{"path":"error-identity/island.mjs","bytes":1229,"sha256":"1495f6b4c851a0f57b60476e52448158218a121f81d221120dc78dc24d242cbc"},{"path":"error-identity/main.mts","bytes":1927,"sha256":"2345bc71a02e46746a359a14ee1e2da8242beca80939f28cf88bc8289421b60a"}];
+          const mutationSpec = {"path":"packages/runtime/src/scr_json.c","originalSha256":"cb6eb34d6723a6074be1ff7f2c4e4a4e8a0cb62ace9cd0fd99f0024fcb4b11fb","mutatedSha256":"fb7b1ad6a31a198ad0ca967b54784cffc1dc8fe287962b39252a500948c22a08","before":"    if (foreign) return foreign;","after":"    if (foreign) scr_dyn_release(foreign);","purpose":"Disable only canonical foreign Error reboxing; retain all API symbols and release the temporary handle before the native-cache fallback."};
+          const fixtureOrigin = {source: "3e85ecfc9f3e245a63c31b74f48b32925f5ab83f", file: "tests/harness/node-island-handles.test.ts", sha256: sourcePins["tests/harness/node-island-handles.test.ts"], extraction: "literal foreignErrorModule and the two withForeignErrors bodies/expected outputs; no test module execution"};
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          const capture = (command, args = []) => {
+            const value = spawnSync(command, args, { cwd: root, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.error, undefined, command + " launcher failed"); assert.equal(value.status, 0, command + ": " + value.stderr);
+            return value.stdout.trim();
+          };
+          const escape = text => text.replace(/[.*+?^$()|[\]{}\\]/g, char => "\\" + char);
+          const normalize = text => text.replace(/^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext functions and may produce false positives in some cases!\n/gm, "");
+          function verifyWorkOwner() {
+            const info = lstatSync(work); assert.ok(info.isDirectory() && !info.isSymbolicLink()); assert.equal(info.mode & 0o777, 0o700);
+            assert.deepEqual(json(join(work, "owner.json")), owner);
+          }
+          function source() {
+            assert.equal(head, "3e85ecfc9f3e245a63c31b74f48b32925f5ab83f"); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const tree = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]);
+            assert.equal(digest(tree), "15fa6c1a9b670157bb7489828998d13bafee1b3fe5ea4ac7f352fb851240b76d");
+            const pins = Object.fromEntries(sourceFiles.map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(pins, sourcePins);
+            return { head, clean: true, treeSha256: digest(tree), files: pins };
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const path = row.slice(row.indexOf("\t") + 1);
+              return path.startsWith("native/llvm-codegen/") || /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(path) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(path) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(path);
+            });
+            assert.equal(rows.length, nativeExpected.count); assert.equal(digest(rows.join("\n")), nativeExpected.sha256);
+            return { rows, sha256: digest(rows.join("\n")), disk: rows.map(row => { const path = row.split("\t")[1]; return { path, sha256: hash(join(root, path)) }; }) };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a,b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink()); if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile()); return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function nativeFiles(target) {
+            return ["packages/llvm-" + target + "/bin", "packages/runtime-" + target + "/artifacts"].flatMap(path => files(join(root, path)).map(row => ({ ...row, path: path + "/" + row.path })))
+              .concat([{ path: "packages/runtime-" + target + "/runtime-pack.json", sha256: hash(join(root, "packages/runtime-" + target + "/runtime-pack.json")) }]);
+          }
+          function tool(command, args = ["--version"]) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            const result = spawnSync(command, args, { encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(result.error, undefined); assert.equal(result.status, 0);
+            return { path, sha256: hash(path), version: (result.stdout + result.stderr).trim() };
+          }
+          function tools() {
+            const common = { node: tool(process.execPath), pnpm: tool("pnpm"), clang: tool("clang"), ld: tool("ld", process.platform === "darwin" ? ["-v"] : ["--version"]), nm: tool("nm") };
+            if (process.platform === "darwin") {
+              const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+              return { ...common, dsymutil: tool("dsymutil"), dwarfdump: tool("dwarfdump"), lldb: tool("lldb"),
+                sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]), settingsSha256: hash(join(sdk, "SDKSettings.json")) },
+                xcode: capture("xcodebuild", ["-version"]), developer: capture("xcode-select", ["-p"]), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+            }
+            return { ...common, llvm: tool("llvm-config", ["--version"]), zig: tool("zig", ["version"]), cxx: tool("g++"), strip: tool("strip"), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+          }
+          function makeEnvironment(id, sanitize) {
+            const dir = join(work, id); mkdirSync(dir, { mode: 0o700 });
+            for (const name of ["cache", "tmp", "xdg"]) mkdirSync(join(dir, name), { mode: 0o700 });
+            return { SCRIPTC_SAN: sanitize ? "1" : "", SCRIPTC_TEST_WORKERS: "1", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1",
+              SCRIPTC_CACHE_DIR: join(dir, "cache"), TMPDIR: join(dir, "tmp"), XDG_CACHE_HOME: join(dir, "xdg") };
+          }
+
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function retain(path, name) { const to = join(out, name); copyFileSync(path, to); return record(to); }
+          function readOutput(step, stream) { return readFileSync(join(out, step[stream].path), "utf8"); }
+          function validateCompile(step, entry, artifact, island) {
+            requireSuccess(step);
+            const data=JSON.parse(readOutput(step,"stdout"));
+            assert.equal(data.schema,"scriptc-diagnostics");assert.equal(data.schemaVersion,1);
+            assert.equal(data.command,"build");assert.equal(data.entry,entry);assert.equal(data.artifact,artifact);
+            assert.equal(data.phase,"complete");assert.equal(data.success,true);assert.ok(Array.isArray(data.diagnostics));
+            assert.equal(data.diagnostics.filter(row=>row.severity==="error").length,0);
+            const notes=data.diagnostics.filter(row=>row.code==="SC8001");
+            assert.equal(notes.length,1);assert.equal(notes[0].file,island);
+            assert.equal(notes[0].severity,"warning");
+            assert.ok(notes[0].message.startsWith("module '"+island+"' runs in a Node island:"));
+            return data;
+          }
+
+          const harnessLink = join(root, "node_modules/.cache/scriptc-tests");
+          function scrub(value) {
+            let text=String(value);
+            for(const [path,label] of [[work,"<work>"],[root,"<source>"],[process.env.RUNNER_TEMP,"<runner-temp>"]])text=text.split(path).join(label);
+            return text;
+          }
+          function corpusTitles(spec) {
+            const names=capture("git",["ls-tree","-r","--name-only","HEAD"]).split("\n")
+              .filter(p=>/^tests\/corpus\/(?:[^/]+\.(?:ts|js|mjs|cjs)|[^/]+\/main\.(?:ts|js|mjs|cjs))$/.test(p))
+              .map(p=>p.slice("tests/corpus/".length)).sort();
+            assert.equal(names.length,corpusExpected.count);assert.equal(digest(names.join("\n")),corpusExpected.sha256);
+            const suite=(spec.kind==="llvm-differential"?"llvm differential corpus":"differential corpus")+
+              " ("+names.length+" programs"+(spec.kind==="llvm-differential"?", release+dev":"")+(spec.flavor==="san"?", sanitized":"")+")";
+            return names.map(name=>({title:name,ancestors:[suite],name:suite+" "+name}));
+          }
+          function expectedGate(spec) {
+            return spec.tests?Object.fromEntries(spec.files.map(file=>[file,corpusTitles(spec).filter(row=>spec.tests.includes(row.title)).map(row=>row.name)])):spec.expectedByFile;
+          }
+          function verifyGateData(spec,data,collection) {
+            const expected=expectedGate(spec), key=(file,name)=>file+"\u0000"+name;
+            const fileOf=value=>{const matches=spec.files.filter(file=>value===file||value.endsWith("/"+file));assert.equal(matches.length,1,"unexpected test file");return matches[0];};
+            assert.ok(Array.isArray(data.testResults));assert.ok(Array.isArray(collection));
+            const expectedKeys=Object.entries(expected).flatMap(([file,names])=>names.map(name=>key(file,name))).sort();
+            const rows=data.testResults.flatMap(suite=>suite.assertionResults.map(row=>{
+              assert.ok(Array.isArray(row.ancestorTitles)&&typeof row.title==="string");
+              assert.equal(row.fullName,[...row.ancestorTitles,row.title].join(" "));
+              return {file:fileOf(suite.name),name:row.fullName,title:row.title,ancestors:row.ancestorTitles,status:row.status};
+            }));
+            assert.equal(new Set(rows.map(row=>key(row.file,row.name))).size,rows.length,"duplicate test result");
+            assert.deepEqual([...new Set(data.testResults.map(suite=>fileOf(suite.name)))].sort(),[...spec.files].sort());
+            for(const file of spec.files){
+              const known=spec.tests?corpusTitles(spec).map(row=>row.name):knownTitles[file];
+              assert.deepEqual(rows.filter(row=>row.file===file).map(row=>row.name).sort(),[...known].sort(),"frozen complete registration inventory differs");
+            }
+            const selected=rows.filter(row=>expectedKeys.includes(key(row.file,row.name)));
+            assert.deepEqual(selected.map(row=>key(row.file,row.name)).sort(),expectedKeys,"missing selected test");
+            assert.ok(selected.every(row=>row.status==="passed"),"selected test skipped or failed");
+            assert.ok(rows.filter(row=>!expectedKeys.includes(key(row.file,row.name))).every(row=>["pending","skipped","todo"].includes(row.status)),"unexpected executed test");
+            const selectedCollected=selected.map(row=>key(row.file,[...row.ancestors,row.title].join(" > "))).sort();
+            const inventory=collection.map(row=>key(fileOf(row.file),row.name)).sort();
+            assert.equal(new Set(inventory).size,inventory.length);assert.deepEqual(inventory,selectedCollected,"collected selected inventory mismatch");
+            assert.equal(data.success,true);assert.equal(data.numFailedTests,0);assert.equal(data.numFailedTestSuites,0);
+            assert.equal(data.numPassedTests,selected.length);assert.equal(data.numTotalTests,rows.length);
+            return {selected,selectedCount:selected.length,unselectedCount:rows.length-selected.length,completeRegisteredCount:rows.length};
+          }
+          async function gate(spec,packRoot) {
+            const env={...makeEnvironment(spec.id,spec.flavor==="san"),SCRIPTC_LIBNODE:packRoot,ASAN_OPTIONS:"detect_leaks=0"};
+            const args=[...spec.files,...(spec.filter?["-t",spec.filter]:[])];
+            const collection=join(out,spec.id+".collection.json"),result=join(out,spec.id+".tests.json");
+            const row={id:spec.id,flavor:spec.flavor,passed:false};
+            try{
+              row.collect=await run(spec.id+"-collect","pnpm",["exec","vitest","list",...args,"--json="+collection],180,env);requireSuccess(row.collect);
+              row.collection=record(collection);
+              row.execute=await run(spec.id+"-test","pnpm",["test",...args,"--reporter=json","--outputFile="+result],1800,env);
+              if(existsSync(result))row.result=record(result);
+              requireSuccess(row.execute);row.inventory=verifyGateData(spec,json(result),json(collection));row.passed=true;
+            }catch(error){row.error=scrub(error.stack??error);}
+            return row;
+          }
+          function makeFixtures() {
+            const base=join(work,"fixtures");mkdirSync(base,{mode:0o700});
+            const text=readFileSync(join(root,fixtureOrigin.file),"utf8");
+            for(const spec of fixtureSpecs){
+              assert.ok(text.includes("const foreignErrorModule = `"+spec.files["island.mjs"]+"`;"));
+              assert.ok(text.includes('"'+spec.id+'",\n      `'+spec.body+'`,\n'));
+              assert.ok(text.includes(JSON.stringify(spec.expected)));
+              const dir=join(base,spec.id);mkdirSync(dir,{mode:0o700});
+              for(const [path,bytes] of Object.entries({...spec.files,"expected.stdout.log":spec.expected}))writeFileSync(join(dir,path),bytes,{flag:"wx"});
+            }
+            assert.deepEqual(files(base),fixtureRows);
+            const retained=join(out,"fixtures");mkdirSync(retained);
+            for(const spec of fixtureSpecs){mkdirSync(join(retained,spec.id));for(const path of [...Object.keys(spec.files),"expected.stdout.log"])copyFileSync(join(base,spec.id,path),join(retained,spec.id,path));}
+            assert.deepEqual(files(retained),fixtureRows);return base;
+          }
+          function restoreMutation() {
+            const receipt=join(work,"mutation.json");if(!existsSync(receipt))return {needed:false};
+            assert.ok(allDrained(),"refuse source restore while owned processes may live");
+            const journal=json(receipt);assert.deepEqual(journal.owner,owner);assert.deepEqual(journal.spec,mutationSpec);
+            const backup=join(work,"scr_json.original.c"),target=join(root,mutationSpec.path);
+            assert.equal(hash(backup),mutationSpec.originalSha256);
+            const current=hash(target);assert.ok([mutationSpec.originalSha256,mutationSpec.mutatedSha256].includes(current),"unknown mutation bytes; retain scratch");
+            if(current===mutationSpec.mutatedSha256)copyFileSync(backup,target);
+            assert.equal(hash(target),mutationSpec.originalSha256);const readback=source();
+            const value={needed:true,restored:true,beforeSha256:current,afterSha256:hash(target),source:readback};save("mutation-restored.json",value);return value;
+          }
+          function mutationOutput(stdout,stderr) {
+            assert.equal(normalize(stderr),"","mutation must not pass via runtime crash or sanitizer finding");
+            const expected=fixtureSpecs[0].expected.trimEnd().split("\n"),actual=stdout.trimEnd().split("\n");
+            assert.equal(stdout.endsWith("\n"),true);assert.equal(actual.length,expected.length);
+            for(let n=0;n<expected.length;n++){
+              const want=expected[n].split(" "),got=actual[n].split(" ");
+              assert.equal(got[0],want[0]);assert.equal(got.length,want.length);assert.ok(got.slice(1).every(value=>value==="true"||value==="false"));
+            }
+            assert.equal(actual[0],"returned true true");
+            assert.equal(actual[1],"checked true false false");
+            assert.equal(actual[3],"caught false true true");
+            assert.notEqual(stdout,fixtureSpecs[0].expected);
+            return {kind:"canonical-rebox-disabled",checked:actual[1],caught:actual[3],lineCount:actual.length,stdoutSha256:digest(stdout),normalizedStderrSha256:digest(normalize(stderr))};
+          }
+          async function mutation(base,packRoot,pack,readLibnodePack) {
+            const row={id:"foreign-error-rebox-disabled",passed:false,sanitize:true,apiPreserved:true};
+            try{
+              assert.ok(allDrained());source();
+              const target=join(root,mutationSpec.path),original=readFileSync(target,"utf8");
+              assert.equal(digest(original),mutationSpec.originalSha256);assert.equal(original.split(mutationSpec.before).length,2);
+              const changed=original.replace(mutationSpec.before,mutationSpec.after);assert.equal(digest(changed),mutationSpec.mutatedSha256);
+              copyFileSync(target,join(work,"scr_json.original.c"));
+              writeFileSync(join(work,"mutation.json"),JSON.stringify({owner,spec:mutationSpec}),{flag:"wx"});
+              writeFileSync(target,changed);assert.equal(hash(target),mutationSpec.mutatedSha256);
+              row.source={path:mutationSpec.path,originalSha256:mutationSpec.originalSha256,mutatedSha256:hash(target)};
+              const spec=fixtureSpecs[0],entry=join(base,spec.id,"main.mts"),island=join(base,spec.id,"island.mjs");
+              const dir=join(work,"mutation-output");mkdirSync(dir,{mode:0o700});const binary=join(dir,"program");
+              const env={...makeEnvironment("mutation-cache",true),SCRIPTC_LIBNODE:packRoot,ASAN_OPTIONS:"detect_leaks=0"};
+              const args=["packages/cli/dist/main.js","build",entry,"--print=diagnostics","--node-islands=explicit","--node-island="+island,"-o",binary,"--keep-llvm","--libnode=beside","--sanitize"];
+              row.command={command:process.execPath,args,sanitize:true,sourceRuntimeRequired:true,cache:"separate empty owned cache"};
+              row.compile=await run("mutation-compile",process.execPath,args,600,env);
+              row.diagnostics=validateCompile(row.compile,entry,binary,island);
+              row.llvm=retain(join(dir,"main.ll"),"mutation.ll");
+              assert.deepEqual(readFileSync(binary).subarray(0,4),Buffer.from([127,69,76,70]));row.binary={bytes:statSync(binary).size,sha256:hash(binary)};
+              assert.deepEqual(readLibnodePack(binary+".libnode",{verifyHashes:true}).manifest,pack.manifest);
+              const moduleRows=files(binary+".libnode/modules");
+              assert.deepEqual(moduleRows,[{path:"island.mjs",bytes:Buffer.byteLength(spec.files["island.mjs"]),sha256:digest(spec.files["island.mjs"])}]);
+              row.deployment=files(binary+".libnode");
+              row.execution=await run("mutation-execute",binary,[],30,{...env,SCRIPTC_LIBNODE:""});requireSuccess(row.execution);
+              row.witness=mutationOutput(readOutput(row.execution,"stdout"),readOutput(row.execution,"stderr"));
+              assert.equal(hash(binary),row.binary.sha256);assert.deepEqual(files(binary+".libnode"),row.deployment);assert.equal(hash(target),mutationSpec.mutatedSha256);
+              row.passed=true;
+            }catch(error){row.error=scrub(error.stack??error);}
+            finally{try{row.restoration=restoreMutation();assert.equal(row.restoration.restored,true);}catch(error){row.passed=false;row.restoreError=scrub(error.stack??error);}}
+            return row;
+          }
+          async function main() {
+            delete process.env.FORCE_COLOR;
+            const report=json(join(out,"summary.json"));verifyWorkOwner();let verifyInputs;
+            try{
+              assert.deepEqual(source(),report.sourceBefore);report.nativeInputs=nativeInputs();
+              report.nativeBefore=nativeFiles("linux-x64-gnu");report.toolsBefore=tools();report.installedLockSha256=hash("node_modules/.pnpm/lock.yaml");
+              assert.equal(process.version,"v24.22.1");assert.equal(report.toolsBefore.pnpm.version,"11.1.3");assert.equal(report.toolsBefore.llvm.version,"22.1.8");assert.equal(report.toolsBefore.zig.version,"0.16.0");
+              report.helper=JSON.parse(capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen",["version","--format=json"]));
+              assert.equal(report.helper.ok,true);assert.equal(report.helper.protocol_version,"1");assert.equal(report.helper.llvm_version,"22.1.8");
+              assert.equal(report.helper.scriptc_package_version,json("packages/llvm-linux-x64-gnu/package.json").version);
+              report.runtimeManifest=retain("packages/runtime-linux-x64-gnu/runtime-pack.json","runtime-pack.json");
+              const changedTs=["packages/compiler/src/backend/llvm/dyn.test.ts","packages/compiler/src/backend/llvm/dyn.ts","packages/compiler/src/backend/llvm/expr-dynamic.ts","packages/compiler/src/frontend/lowering/lower-node-island.ts","packages/compiler/test/node-island-error-emission.test.ts","tests/harness/node-island-handles.test.ts"];
+              report.format=await run("format","pnpm",["exec","oxfmt","--check",...changedTs,"CHANGELOG.md"],180,makeEnvironment("format",false));requireSuccess(report.format);
+              report.lint=await run("lint","pnpm",["exec","oxlint","--deny-warnings",...changedTs],180,makeEnvironment("lint",false));requireSuccess(report.lint);
+              report.build=await run("workspace-build","pnpm",["build"],600,makeEnvironment("build",false));requireSuccess(report.build);
+              assert.deepEqual(nativeFiles("linux-x64-gnu"),report.nativeBefore);
+              report.distBefore=["packages/compiler/dist","packages/cli/dist"].flatMap(path=>files(join(root,path)).map(row=>({...row,path:path+"/"+row.path})));
+              const {readLibnodePack}=await import(pathToFileURL(join(root,"packages/compiler/dist/node-islands/libnode-pack.js")));
+              const packRoot=join(work,"libnode");assert.equal(existsSync(packRoot),false);
+              report.libnodeFetch=await run("libnode-fetch",process.execPath,["packages/libnode-common/fetch-dev-pack.mjs","--out",packRoot],600,makeEnvironment("libnode-fetch",false));requireSuccess(report.libnodeFetch);
+              const pack=readLibnodePack(packRoot,{verifyHashes:true});assert.equal(pack.manifest.nodeVersion,"24.22.1");assert.equal(pack.manifest.bridgeAbi,10);assert.equal(pack.manifest.platform,"linux");assert.equal(pack.manifest.arch,"x64");
+              report.libnode={manifest:pack.manifest,manifestFile:retain(join(packRoot,"manifest.json"),"libnode-manifest.json"),files:files(packRoot),route:"explicit checksum-pinned Node 24.22.1 development pack with this source bridge",developmentPin:sourcePins["packages/libnode-common/dev-pack.json"]};
+              process.env.SCRIPTC_LIBNODE=packRoot;
+              const base=makeFixtures();report.fixtures={origin:fixtureOrigin,files:fixtureRows};
+              const cacheParent=join(root,"node_modules/.cache");mkdirSync(cacheParent,{recursive:true});
+              assert.equal(existsSync(harnessLink),false);try{lstatSync(harnessLink);assert.fail("existing harness link");}catch(error){if(error.code!=="ENOENT")throw error;}
+              const harnessOutput=join(work,"harness-output");mkdirSync(harnessOutput,{mode:0o700});symlinkSync(harnessOutput,harnessLink);report.harnessLinkCreated=true;save("summary.json",report);
+              verifyInputs=async()=>{
+                requireSuccess(await run("verify-runtime-after",process.execPath,["packages/runtime-linux-x64-gnu/scripts/verify.mjs"],120));
+                assert.deepEqual(nativeFiles("linux-x64-gnu"),report.nativeBefore);assert.deepEqual(nativeInputs(),report.nativeInputs);
+                assert.deepEqual(readLibnodePack(packRoot,{verifyHashes:true}).manifest,pack.manifest);assert.deepEqual(files(packRoot),report.libnode.files);
+                assert.deepEqual(["packages/compiler/dist","packages/cli/dist"].flatMap(path=>files(join(root,path)).map(row=>({...row,path:path+"/"+row.path}))),report.distBefore);
+                assert.equal(hash("node_modules/.pnpm/lock.yaml"),report.installedLockSha256);assert.deepEqual(tools(),report.toolsBefore);
+                assert.deepEqual(files(base),fixtureRows);assert.deepEqual(source(),report.sourceBefore);report.inputsVerifiedAfter=true;
+              };
+              const capacity=join(process.env.RUNNER_TEMP,process.env.PROOF_CAPACITY_NAME,"capacity.py");assert.equal(hash(capacity),"13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");requireSuccess(await run("pre-proof-capacity","python3",[capacity,"pre-proof"],60));
+              for(const spec of fixtureSpecs){
+                const row={id:spec.id,command:process.execPath,args:[join(base,spec.id,"main.mts")]};report.oracles.push(row);save("summary.json",report);
+                row.execution=await run(spec.id+"-node",process.execPath,row.args,30,makeEnvironment(spec.id+"-oracle",false));requireSuccess(row.execution);
+                assert.equal(readOutput(row.execution,"stdout"),spec.expected);assert.equal(readOutput(row.execution,"stderr"),"");row.passed=true;
+              }
+              for(const spec of gateSpecs){report.gates.push(await gate(spec,packRoot));save("summary.json",report);assert.ok(allDrained(),"test custody unresolved");}
+              assert.ok(report.gates.every(row=>row.passed),"candidate focused gate failed; mutation not attempted");
+              report.mutation=await mutation(base,packRoot,pack,readLibnodePack);save("summary.json",report);assert.equal(report.mutation.passed,true,"mutation did not reproduce the specific identity regression");
+              report.selectedTestPasses=report.gates.reduce((sum,row)=>sum+row.inventory.selectedCount,0);assert.equal(report.selectedTestPasses,28);
+              report.preCleanupComplete=report.oracles.length===2&&report.oracles.every(row=>row.passed)&&report.gates.length===8&&report.gates.every(row=>row.passed)&&report.mutation.passed;
+            }catch(error){report.error=scrub(error.stack??error);}
+            finally{
+              try{report.restoration=restoreMutation();assert.ok(verifyInputs,"preparation did not complete");await verifyInputs();report.sourceAfter=source();}catch(error){report.readbackError=scrub(error.stack??error);}
+              save("summary.json",report);
+            }
+            assert.equal(report.preCleanupComplete,true,"focused qualification incomplete");assert.equal(report.inputsVerifiedAfter,true);
+          }
+          function initialize(){
+            assert.equal(head,"3e85ecfc9f3e245a63c31b74f48b32925f5ab83f");assert.equal(process.platform,"linux");assert.equal(process.arch,"x64");assert.equal(process.version,"v24.22.1");
+            mkdirSync(work,{mode:0o700});writeFileSync(join(work,"owner.json"),JSON.stringify(owner),{flag:"wx",mode:0o600});mkdirSync(out,{mode:0o700});copyFileSync(self,join(out,"runner.mjs"));
+            save("summary.json",{schemaVersion:1,...owner,runnerSha256:hash(self),sourceBefore:source(),scope:{focusedTests:16,siblingTests:12,totalSelected:28,gates:8,freshRetainedNodeOracles:2,apiPreservingSanMutations:1},
+              limitations:["Focused Linux qualification of foreign/island-origin Error boxing and authored membership only; no native-origin promotion, bridge ABI change, complete NI8, or production adoption claim.","Tests execute their pinned Node controls; the two identity/brand fixture oracles also retain separate raw streams. Typed snapshot field freshness is outside this repair.","Sibling suites retain their canonical behavior, including the differential suite's existing retry. LLVM sibling rows must cover release and dev.","Only the exact ASan swapcontext line is normalized by the direct mutation witness. Embedded Node uses detect_leaks=0; the new lifetime row checks bounded live handles at 200/2000 conversions.","The mutation preserves helper APIs and runs only under SAN, which compiles runtime source instead of using the candidate runtime pack. Compile failures, signals, sanitizer findings and unrelated output failures do not count as reproduction.","No original-source or parent owned-payload proof is rerun."],oracles:[],gates:[],focusedQualificationComplete:false,fullQualification:false,productionAdoption:false});
+          }
+          function finalize(){
+            const report=json(join(out,"summary.json")),cleanup={passed:false,retained:true};
+            try{
+              verifyWorkOwner();assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k=>[k,report[k]])),owner);assert.ok(allDrained(),"owned process custody unresolved");
+              cleanup.restoration=restoreMutation();assert.equal(hash(self),report.runnerSha256);cleanup.source=source();assert.deepEqual(cleanup.source,report.sourceBefore);
+              if(report.harnessLinkCreated){assert.ok(lstatSync(harnessLink).isSymbolicLink());assert.equal(readlinkSync(harnessLink),join(work,"harness-output"));rmSync(harnessLink);}
+              rmSync(work,{recursive:true});cleanup.passed=true;cleanup.retained=false;rmSync(self);cleanup.payloadRemoved=true;
+            }catch(error){cleanup.error=scrub(error.stack??error);}
+            report.cleanup=cleanup;report.focusedQualificationComplete=report.preCleanupComplete===true&&report.inputsVerifiedAfter===true&&cleanup.passed;
+            report.fullQualification=false;report.productionAdoption=false;save("summary.json",report);save("artifact-manifest.json",files(out).filter(row=>row.path!=="artifact-manifest.json"));
+            assert.equal(report.focusedQualificationComplete,true,"focused qualification incomplete");
+          }
+          if(process.argv[2]!=="--probe"){
+            try{if(process.argv[2]==="--init")initialize();else if(process.argv[2]==="--finalize")finalize();else if(process.argv[2]==="--child")await childMain();else await main();}
+            catch(error){process.stderr.write(scrub(error.stack??error)+"\n[node-island-error-identity] FAILED (exit 1)\n");process.exitCode=1;}
+          }
+          RUNNER
+          node "$RUNNER_TEMP/node-island-error-identity.mjs" --init
+      - name: Qualify foreign Error identity and mutation witness
+        run: |
+          ulimit -c 0
+          node "$RUNNER_TEMP/node-island-error-identity.mjs"
+      - name: Verify custody and remove owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/node-island-error-identity.mjs"
+          node "$RUNNER_TEMP/node-island-error-identity.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: node-island-error-identity
+          path: ${{ runner.temp }}/node-island-error-identity-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: node-island-error-identity-capacity
+          path: ${{ runner.temp }}/node-island-error-identity-capacity
+          if-no-files-found: error
+          retention-days: 1
