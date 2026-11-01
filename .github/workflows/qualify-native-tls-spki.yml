@@ -1,4 +1,4 @@
-name: Qualify native TLS SPKI policy
+name: Mutation-check native TLS SPKI policy
 
 on:
   push:
@@ -47,6 +47,7 @@ jobs:
         shell: python
         run: |
           import ctypes
+          import difflib
           import hashlib
           import json
           import os
@@ -55,16 +56,18 @@ jobs:
           import subprocess
           import sys
           import time
+          import re
 
           # Own orphaned compiler/test children until they have been reaped.
           assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
           root = Path.cwd()
-          out = Path(os.environ["RUNNER_TEMP"]) / "native-tls-spki-proof"
+          out = Path(os.environ["RUNNER_TEMP"]) / "native-tls-spki-mutations"
           out.mkdir(mode=0o700)
           report = {
               "source": os.environ["SOURCE_SHA"], "workflow": os.environ["GITHUB_SHA"],
               "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              "scope": "native TLS policy C tests on Linux", "qualificationComplete": False,
+              "scope": "native TLS policy negative controls on Linux", "qualificationComplete": False,
+              "positiveRun": 41254383693, "mutations": [],
               "complete": False, "steps": [],
           }
           def digest(data):
@@ -109,10 +112,10 @@ jobs:
               cancellation = signum
           signal.signal(signal.SIGTERM, interrupted)
           signal.signal(signal.SIGINT, interrupted)
-          def execute(name, args, env=None, limit=600):
+          def execute(name, args, env=None, limit=600, expected_exit=0):
               if cancellation:
                   raise RuntimeError("cancelled before " + name)
-              row = {"name": name, "args": args, "timeoutSeconds": limit}
+              row = {"name": name, "args": args, "timeoutSeconds": limit, "expectedExit": expected_exit}
               report["steps"].append(row)
               save()
               started = time.monotonic()
@@ -162,7 +165,7 @@ jobs:
                                   "sha256": digest(p.read_bytes())} for p in streams]
               save()
               print(json.dumps(row), flush=True)
-              if row["exitCode"] != 0 or row["timedOut"] or row["forcedCleanup"] or not row["drained"] or cancellation:
+              if row["exitCode"] != expected_exit or row["timedOut"] or row["forcedCleanup"] or not row["drained"] or cancellation:
                   for path in streams:
                       print(path.read_bytes()[-12000:].decode(errors="replace"), flush=True)
                   raise RuntimeError(name + " failed; full streams retained")
@@ -173,31 +176,60 @@ jobs:
               before = source_inputs()
               (out / "source-inputs.json").write_text(json.dumps(before, sort_keys=True, indent=2) + "\n")
               report["tools"] = {name: capture([name, "--version"]) for name in ("node", "pnpm", "clang")}
-              execute("format", ["pnpm", "exec", "oxfmt", "--check", "packages/runtime/test/tls-spki.test.ts"])
-              execute("lint", ["pnpm", "exec", "oxlint", "--deny-warnings", "packages/runtime/test/tls-spki.test.ts"])
-              cases = [
-                  "valid", "blocked-leaf-required", "blocked-leaf-optional", "blocked-intermediate",
-                  "blocked-selected-root", "blocked-unused-anchor", "unrelated-blocked-peer-valid",
-                  "unrelated-blocked-peer-invalid-required", "unrelated-blocked-peer-invalid-optional",
-                  "server-secondary-eku", "server-secondary-eku-required", "hostname-only", "valid-client",
-                  "blocked-client-required", "blocked-client-optional", "hash-error", "client-secondary-eku", "verify-none",
+              target = Path("packages/runtime/src/scr_tls.c")
+              original = target.read_bytes()
+              source = original.decode()
+              start = source.index("  /* mbedTLS visits root to leaf.")
+              end = source.index("  if (depth == 0 && t->cli != NULL", start)
+              assert "t->vrfy_peer_spki = scr_tls_check_peer_spkis(crt);" in source[start:end]
+              fallback = "    result = t->vrfy_peer_spki;\n"
+              assert source.count(fallback) == 1
+              mutants = [
+                  ("callback", source[:start] + source[end:], "blocked-leaf-required", "client rejection event counts"),
+                  ("fallback", source.replace(fallback, "    result = SCR_TLS_SPKI_ALLOWED;\n"),
+                   "server-secondary-eku", "typed authorizationError"),
               ]
-              # Pinned Vitest 3.2.7 quotes $name and truncates strings to 38 chars.
-              displayed = [name if len(name) <= 38 else name[:37] + "\u2026" for name in cases]
-              expected = {"TLS SPKI policy controls"} | {
-                  f"TLS SPKI '{name}' version {version}" for name in displayed for version in (12, 13)}
-              for flavor in ("plain", "san"):
-                  result_path = out / (flavor + ".vitest.json")
-                  execute(flavor, ["pnpm", "test", "packages/runtime/test/tls-spki.test.ts", "--reporter=verbose",
-                                   "--reporter=json", "--outputFile=" + str(result_path)],
-                          {"SCRIPTC_SAN": "1" if flavor == "san" else "0", "UBSAN_OPTIONS": "halt_on_error=1"})
-                  result = json.loads(result_path.read_text())
-                  assertions = [item for suite in result["testResults"] for item in suite["assertionResults"]]
-                  assert len(assertions) == len(expected) == result["numPassedTests"] == result["numTotalTests"]
-                  assert {item["title"] for item in assertions} == expected
-                  assert all(item["status"] == "passed" for item in assertions)
-                  report[flavor] = {"passed": len(assertions), "skipped": result["numPendingTests"]}
-                  assert report[flavor]["skipped"] == 0
+              for label, mutant, case, failure in mutants:
+                  row = {"name": label, "case": case, "requiredNativeAssertion": failure,
+                         "beforeSha256": digest(original), "mutantSha256": digest(mutant.encode()), "accepted": False}
+                  report["mutations"].append(row)
+                  (out / (label + ".patch")).write_text("".join(difflib.unified_diff(
+                      source.splitlines(keepends=True), mutant.splitlines(keepends=True),
+                      fromfile="a/" + str(target), tofile="b/" + str(target))))
+                  first_step = len(report["steps"])
+                  try:
+                      target.write_text(mutant)
+                      assert digest(target.read_bytes()) == row["mutantSha256"]
+                      result_path = out / (label + ".vitest.json")
+                      pattern = "TLS SPKI '" + case + "' version (12|13)$"
+                      execute(label, ["pnpm", "test", "packages/runtime/test/tls-spki.test.ts", "-t", pattern,
+                                      "--reporter=verbose", "--reporter=json", "--outputFile=" + str(result_path)],
+                              {"SCRIPTC_SAN": "0"}, expected_exit=1)
+                      result = json.loads(result_path.read_text())
+                      assertions = [item for suite in result["testResults"] for item in suite["assertionResults"]]
+                      failed = [item for item in assertions if item["status"] == "failed"]
+                      expected = {f"TLS SPKI '{case}' version {version}" for version in (12, 13)}
+                      assert len(assertions) == result["numTotalTests"] == 37
+                      assert result["numFailedTests"] == len(failed) == 2
+                      assert result["numPassedTests"] == 0 and result["numPendingTests"] == 35
+                      assert {item["title"] for item in failed} == expected
+                      for item in failed:
+                          detail = "\n".join(item["failureMessages"])
+                          version = item["title"].rsplit(" ", 1)[1]
+                          assert "FAIL: " + failure in detail
+                          assert re.search(r"Command failed: [^\n]*/test_tls_spki " + re.escape(case) + " " + version + " ", detail), detail
+                      row["accepted"] = True
+                  finally:
+                      drained = all("group" not in step or step.get("drained") is True
+                                    for step in report["steps"][first_step:])
+                      if drained:
+                          target.write_bytes(original)
+                          row["restored"] = target.read_bytes() == original
+                      else:
+                          row["restored"] = False
+                          row["restorationRefused"] = "mutation child drainage unresolved"
+                      save()
+                      assert row["restored"]
               assert not cancellation, "cancelled before proof completion"
               report["complete"] = True
           except BaseException as error:
@@ -226,7 +258,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: native-tls-spki-proof
-          path: ${{ runner.temp }}/native-tls-spki-proof
+          name: native-tls-spki-mutations
+          path: ${{ runner.temp }}/native-tls-spki-mutations
           if-no-files-found: error
           retention-days: 7
