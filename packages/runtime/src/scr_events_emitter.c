@@ -1319,6 +1319,31 @@ static void scr_ee_unhandled_error(const ScrDyn *er) {
   scr_str_release(message);
 }
 
+/* Monitors can change both listeners and the payload's prototype. Both
+ * typed island Errors and dynamic payloads use current membership after
+ * dispatch, not the earlier typed extraction. */
+static void scr_ee_unhandled_value(const ScrDyn *er,
+                                    ScrStr *(*render)(ScrDyn *, double, double)) {
+  if (scr_dyn_err_instanceof(er, SCR_ERR_ERROR)) {
+    scr_dyn_throw(scr_dyn_retain((ScrDyn *)er));
+  } else if (render) {
+    ScrStr *shown = render((ScrDyn *)er, 0, 2);
+    if (scr_exc_pending()) {
+      /* A throwing inspect: Node quotes the payload's string conversion
+       * instead, whose own throw propagates. */
+      if (shown) scr_str_release(shown);
+      scr_exc_clear();
+      shown = scr_dyn_string_coerce_js(er);
+    }
+    if (shown) {
+      scr_ee_throw_unhandled(shown->data, shown->len, er);
+      scr_str_release(shown);
+    }
+  } else {
+    scr_ee_unhandled_error(er);
+  }
+}
+
 /* emit('error', ...) through an untyped value: errorMonitor first; with no
  * 'error' listener an Error payload throws itself and anything else throws
  * ERR_UNHANDLED_ERROR, Node's contract; otherwise listeners receive the
@@ -1331,26 +1356,7 @@ static bool scr_ee_emit_error_dyn(ScrEmitter *em, ScrStr *name, ScrDyn *const *a
   bool had = scr_ee_emit_core(em, name, NULL, args ? args : scr_ee_no_args, argc, NULL);
   if (!had && !scr_exc_pending()) {
     const ScrDyn *er = argc ? args[0] : scr_dyn_undefined();
-    /* Monitors can change both listeners and the payload's prototype.
-     * Unhandled policy uses current membership, not typed extraction. */
-    if (scr_dyn_err_instanceof(er, SCR_ERR_ERROR)) {
-      scr_dyn_throw(scr_dyn_retain((ScrDyn *)er));
-    } else if (render) {
-      ScrStr *shown = render((ScrDyn *)er, 0, 2);
-      if (scr_exc_pending()) {
-        /* A throwing inspect: Node quotes the payload's string conversion
-         * instead, whose own throw propagates. */
-        if (shown) scr_str_release(shown);
-        scr_exc_clear();
-        shown = scr_dyn_string_coerce_js(er);
-      }
-      if (shown) {
-        scr_ee_throw_unhandled(shown->data, shown->len, er);
-        scr_str_release(shown);
-      }
-    } else {
-      scr_ee_unhandled_error(er);
-    }
+    scr_ee_unhandled_value(er, render);
   }
   return had;
 }
@@ -1406,12 +1412,27 @@ bool scr_emitter_emit_error_flex(ScrEmitter *em, ScrDyn *error) {
   return had;
 }
 
-/* emit('error', err) — Node's special event: with no 'error' listener the
- * payload THROWS (catchable; uncaught exits 1 with the error report).
- * err is borrowed; the throw takes its own +1. */
+#ifdef SCR_NODE_ISLANDS
+static ScrStr *scr_ee_inspect_error(ScrDyn *value, double recurse, double depth) {
+  return scr_ni_inspect(value, recurse, depth);
+}
+#endif
+
+/* emit('error', err): after monitors, an unhandled native Error throws
+ * itself; island Errors follow current prototype membership. err is
+ * borrowed; the pending exception takes its own +1. */
 bool scr_emitter_emit_error(ScrEmitter *em, ScrStr *name, ScrError *err) {
   bool had = scr_ee_emit_va(em, name, err);
   if (!had && !scr_exc_pending()) {
+#ifdef SCR_NODE_ISLANDS
+    /* Only foreign mirrors have a handle; native Errors avoid dynamic boxing. */
+    ScrDyn *value = scr_ni_dyn_ops ? scr_ni_dyn_ops->error_value(err) : NULL;
+    if (value) {
+      scr_ee_unhandled_value(value, &scr_ee_inspect_error);
+      scr_dyn_release(value);
+      return had;
+    }
+#endif
     scr_throw_obj(scr_error_retain(err), &scr_error_retain_v, &scr_error_release_v,
                   scr_error_trace_arg());
   }

@@ -4,6 +4,10 @@ All notable changes to scriptc will be documented in this file.
 
 ## Unreleased
 
+- Node-island Error conversion and uncaught reporting run property access on Node's stack, avoiding V8 fatal errors when those accesses trigger garbage collection.
+
+- Typed `EventEmitter.emit('error', error)` rechecks Node-island Error prototypes after error monitors run, preserving Node's `ERR_UNHANDLED_ERROR` message and the original payload as `context` when a monitor detaches the prototype.
+
 - Native EventEmitter preserves Node-island Error identity in unhandled throws and typed listeners. Error monitors can add or remove listeners before dispatch; dynamic island payloads use their post-monitor prototype for unhandled-error checks.
 
 - Errors created in Node islands keep their identity through typed callbacks, checked conversions, throws, and promises. Dynamic properties stay on the island object; Error branding and prototype checks remain distinct.

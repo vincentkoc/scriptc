@@ -285,11 +285,12 @@ export function variantsFor(source) {
     withJsObjectModel(variants);
   }
   // util.inspect and instanceof of Node island handles; Node's report for
-  // an uncaught island error.
+  // an uncaught island error and an unhandled emitter Error payload.
   if (
     source === "scr_inspect.c" ||
     source === "scr_dyn_builtin_class.c" ||
-    source === "scr_exception.c"
+    source === "scr_exception.c" ||
+    source === "scr_events_emitter.c"
   ) {
     variants.push({
       id: "node-island",

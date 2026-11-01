@@ -73,6 +73,29 @@ test("web streams and Node islands select an async build that defines both", () 
   ).toEqual([]);
 });
 
+test("typed emitter Error policy selects the Node island runtime variant", () => {
+  expect(variantsFor("scr_events_emitter.c")).toEqual([
+    { id: "default", when: {}, defines: [] },
+    { id: "node-island", when: { nodeIsland: true }, defines: ["SCR_NODE_ISLANDS"] },
+  ]);
+  expect(selected("scr_events_emitter.c", { nodeIsland: false, workers: false })).toMatchObject({
+    id: "default",
+    defines: [],
+  });
+  expect(selected("scr_events_emitter.c", { nodeIsland: true, workers: false })).toMatchObject({
+    id: "node-island",
+    defines: ["SCR_NODE_ISLANDS"],
+  });
+  expect(selected("scr_events_emitter.c", { nodeIsland: false, workers: true })).toMatchObject({
+    id: "default-workers",
+    defines: ["SCR_WORKERS"],
+  });
+  expect(selected("scr_events_emitter.c", { nodeIsland: true, workers: true })).toMatchObject({
+    id: "node-island-workers",
+    defines: ["SCR_NODE_ISLANDS", "SCR_WORKERS"],
+  });
+});
+
 test("a file read whose bytes the program can observe selects the branded build", () => {
   const plain = { workers: false, watchFile: false, fsBufferBrand: false };
   // Alone, the brand selects its own build.
