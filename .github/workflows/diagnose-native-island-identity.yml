@@ -419,7 +419,7 @@ jobs:
             moduleRows(spec,inventory.map(row=>({path:row.path,bytes:row.size,sha256:row.sha256})));
             assert.notEqual(inventory[0].placeholder,true);
             const loads=mainFunctions.flatMap(fn=>collect(fn.body,n=>n.kind==="libCall"&&n.fn==="nodeIsland.require"));
-            assert.ok(loads.some(n=>n.args[0]?.kind==="strLit"&&n.args[0].value==="island.mjs"),"selected island load missing");
+            assert.ok(loads.some(n=>n.args[0]?.kind==="strLit"&&n.args[0].value==="./island.mjs"),"selected island load missing");
             const globals=new Set((program.globals??[]).map(g=>g.id));
             function bindingWrites(fn,localId){
               return collect(fn.body,n=>["varDecl","assign","assignExpr"].includes(n.kind)&&n.localId===localId)
@@ -471,8 +471,12 @@ jobs:
                       assert.equal(value.kind,"bytesNew");assert.equal(value.source.kind,"arrayLit");
                       assert.deepEqual(value.source.elems.map(n=>n.value),[1,2,3]);assert.equal(slice(value),"new Uint8Array([1, 2, 3])");
                     }else{
-                      assert.equal(value.kind,"libCall");assert.equal(value.fn,"buffer.poolFromStr");
-                      assert.equal(value.args[0].value,"abc");assert.equal(slice(value),"Buffer.from('abc')");
+                      assert.equal(value.kind,"libCall");assert.equal(value.fn,"buffer.brand");assert.equal(value.args.length,1);
+                      const pool=value.args[0];assert.equal(pool.kind,"libCall");assert.equal(pool.fn,"buffer.poolFromStr");
+                      assert.deepEqual(pool.type,value.type);assert.equal(pool.args.length,2);
+                      assert.equal(pool.args[0].kind,"strLit");assert.equal(pool.args[0].value,"abc");
+                      assert.equal(pool.args[1].kind,"strLit");assert.equal(pool.args[1].value,"utf8");
+                      assert.equal(slice(value),"Buffer.from('abc')");
                     }
                     assert.equal(second.kind,"bytesIntrinsic");assert.equal(second.method,"subarray");
                     assert.deepEqual(second.type,{kind:"bytes",elem:"u8"});
@@ -489,7 +493,7 @@ jobs:
             }
             function namespace(value,fn,seen=new Set()){
               value=unbox(value,fn);
-              if(value.kind==="libCall"&&value.fn==="nodeIsland.require")return value.args[0]?.value==="island.mjs";
+              if(value.kind==="libCall"&&value.fn==="nodeIsland.require")return value.args[0]?.value==="./island.mjs";
               if(value.kind==="varRef"&&globals.has(value.localId)){
                 if(seen.has(value.localId))return false;const next=new Set([...seen,value.localId]);
                 const writes=functions.flatMap(owner=>bindingWrites(owner,value.localId).map(value=>({owner,value})));
@@ -532,6 +536,56 @@ jobs:
               if(node.kind==="bin")assert.equal(node.op,"===");else assert.notEqual(node.negated,true);
               const actual=unbox(node.right,fn);assert.equal(actual.kind,"varRef");assert.equal(actual.localId,fn.params.find(p=>p.name==="value").localId);
             }
+            // These source writes lower through native class dispatch. Admit only
+            // the complete setter body and an identity-preserving property adapter.
+            function validatedWrite(node,expected){
+              if(node.kind==="libCall"){assert.equal(node.fn,expected.operation);return node;}
+              assert.equal(node.kind,"call");const helper=byName.get(node.callee);
+              assert.ok(helper&&reachable.has(helper.name));
+              function synchronous(fn){
+                for(const key of ["async","generator","captures","jsEntry"])assert.equal(fn[key],undefined);
+              }
+              synchronous(helper);assert.deepEqual(helper.returnType,{kind:"void"});
+              assert.equal(helper.params.length,expected.operation==="dyn.keySet"?2:3);
+              assert.equal(node.args.length,helper.params.length);
+              helper.params.forEach(p=>{assert.deepEqual(p.type,{kind:"dyn"});assert.equal(bindingWrites(helper,p.localId).length,0);});
+              const ids=helper.params.map(p=>p.localId);assert.equal(new Set(ids).size,ids.length);
+              function shape(x){
+                if(x===null)return null;
+                switch(x.kind){
+                  case "varRef":return ids.includes(x.localId)?["p",ids.indexOf(x.localId)]:["local",x.localId];
+                  case "strLit":return ["str",x.value];
+                  case "exprStmt":return shape(x.expr);
+                  case "return":return ["ret",shape(x.value)];
+                  case "libCall":return ["lib",x.fn,x.args.map(shape)];
+                  case "call":{
+                    const f=byName.get(x.callee);assert.ok(f&&reachable.has(f.name));synchronous(f);
+                    assert.equal(x.args.length,1);assert.equal(f.params.length,1);
+                    assert.deepEqual(f.params[0].type,{kind:"dyn"});assert.deepEqual(f.returnType,{kind:"dyn"});
+                    assert.equal(f.body.length,1);assert.equal(f.body[0].kind,"return");
+                    const v=f.body[0].value;assert.equal(v.kind,"varRef");assert.equal(v.localId,f.params[0].localId);
+                    assert.equal(bindingWrites(f,f.params[0].localId).length,0);
+                    return ["bag",x.args.map(shape)];
+                  }
+                  case "if":return ["if",shape(x.cond),x.then.map(shape),x.else_===null?null:x.else_.map(shape)];
+                  case "dynTest":assert.notEqual(x.negated,true);return ["test",x.test,shape(x.value)];
+                  case "varDecl":return ["let",x.localId,shape(x.init)];
+                  default:assert.fail("unsupported write helper node "+x.kind);
+                }
+              }
+              const p0=["p",0],p1=["p",1],p2=["p",2],bag=["bag",[p0]],ret=["ret",null];
+              if(expected.operation==="dyn.keySet"){
+                assert.deepEqual(helper.body.map(shape),[["lib","dyn.keySet",[bag,["str","code"],p1]],ret]);
+                return {kind:"libCall",fn:expected.operation,args:[node.args[0],{kind:"strLit",value:"code"},node.args[1]],loc:node.loc};
+              }
+              assert.deepEqual(helper.body.map(shape),[
+                ["if",["test","symbol",p1],[["lib","dyn.keySetComputed",[bag,p1,p2]],ret],null],
+                ["if",["test","nullish",p0],[["lib","dyn.keySetComputed",[p0,p1,p2]],ret],null],
+                ["let","key.string",["lib","dyn.toStringCoerce",[p1]]],
+                ["lib","dyn.keySet",[bag,["local","key.string"],p2]],ret,
+              ]);
+              return {kind:"libCall",fn:expected.operation,args:node.args,loc:node.loc};
+            }
             const writes=[];
             const expectedWrites=spec.id==="error-identity"
               ?[{text:"value.code = 'NATIVE'",receiver:"value",key:"code",value:"NATIVE",operation:"dyn.keySet"}]
@@ -539,7 +593,8 @@ jobs:
                 {text:"view[1] = 11",receiver:"view",key:1,value:11,operation:"dyn.keySetComputed"}];
             for(const expected of expectedWrites){
               let found=0;
-              for(const fn of probes)for(const node of collect(fn.body,n=>n.kind==="libCall"&&n.fn===expected.operation&&slice(n)===expected.text)){
+              for(const fn of probes)for(const raw of collect(fn.body,n=>["libCall","call"].includes(n.kind)&&slice(n)===expected.text)){
+                const node=validatedWrite(raw,expected);
                 assert.equal(node.args.length,3);
                 const receiver=unbox(node.args[0],fn),key=unbox(node.args[1],fn),value=unbox(node.args[2],fn);
                 assert.equal(receiver.kind,"varRef");assert.equal(receiver.localId,fn.params.find(p=>p.name===expected.receiver).localId);
