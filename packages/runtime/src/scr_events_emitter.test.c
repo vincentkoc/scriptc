@@ -8,7 +8,7 @@
 static unsigned calls;
 static ScrError *expected;
 
-static void monitor(ScrClosure *self, ScrError *error) {
+static void monitor(ScrClosure *self, void *error) {
   (void)self;
   assert(error == expected);
   calls++;
