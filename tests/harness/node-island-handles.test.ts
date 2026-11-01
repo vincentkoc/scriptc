@@ -357,6 +357,43 @@ async function withForeignErrors(
   }
 }
 
+// Use the full-collection recipe from node-island/gc-cycles.cjs inside the
+// accessor itself, so allocation pressure cannot decide whether the seam runs.
+const foreignErrorGcModule = `
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+setFlagsFromString('--expose-gc');
+const fullGc = runInNewContext('gc');
+setFlagsFromString('--no-expose-gc');
+let collections = 0;
+let reportArmed = false;
+export function make() {
+  const value = new TypeError('forced gc');
+  Object.defineProperty(value, 'stack', { value: 'TypeError: forced gc' });
+  Object.defineProperty(value, 'message', { get() {
+    fullGc();
+    collections++;
+    return 'forced gc';
+  } });
+  return value;
+}
+export function collectionCount() { return collections; }
+export function same(a, b) { return a === b; }
+export function call(callback) { return callback(make()); }
+export function makeReport() {
+  const value = new TypeError('report sentinel');
+  Object.defineProperty(value, 'stack', { get() {
+    if (reportArmed) {
+      fullGc();
+      console.log('report collected');
+    }
+    return 'TypeError: report sentinel';
+  } });
+  return value;
+}
+export function armReport() { reportArmed = true; }
+`;
+
 const foreignErrorEnv = { ...process.env };
 delete foreignErrorEnv["FORCE_COLOR"];
 const contextSwitchWarning =
@@ -402,7 +439,12 @@ function authoredEmitterCall(ir: ReturnType<typeof deserializeModule>, entry: st
   };
 }
 
-function authoredNativeCall(ir: ReturnType<typeof deserializeModule>, entry: string, text: string) {
+function authoredNativeCall(
+  ir: ReturnType<typeof deserializeModule>,
+  entry: string,
+  text: string,
+  spanLength = text.length,
+) {
   const start = readFileSync(entry, "utf8").indexOf(text);
   expect(start).toBeGreaterThanOrEqual(0);
   const calls: Extract<IrExpr, { kind: "call" }>[] = [];
@@ -415,7 +457,7 @@ function authoredNativeCall(ir: ReturnType<typeof deserializeModule>, entry: str
     (call) =>
       realpathSync(call.loc.file) === realpathSync(entry) &&
       call.loc.start === start &&
-      call.loc.end === start + text.length,
+      call.loc.end === start + spanLength,
   );
   expect(matches).toHaveLength(1);
   const call = matches[0]!;
@@ -423,6 +465,90 @@ function authoredNativeCall(ir: ReturnType<typeof deserializeModule>, entry: str
   expect(helper).toBeDefined();
   expect(call.args.map((arg) => arg.type)).toEqual(helper!.params.map((param) => param.type));
   return { call, helper: helper! };
+}
+
+function inspectErrorInfo(
+  ir: ReturnType<typeof deserializeModule>,
+  entry: string,
+  mode: "checked conversion" | "nested typed callback" | "report",
+) {
+  const source = readFileSync(entry, "utf8");
+  const errorType = { kind: "object", className: "%Error" };
+  const authored = authoredEmitterCall(ir, entry);
+  if (mode === "nested typed callback") {
+    const invoke = authored("nodeIsland.invoke", "island.call(accept)");
+    expect(invoke.args[1]).toMatchObject({ kind: "strLit", value: "call" });
+    const args = invoke.args[2];
+    expect(args?.kind).toBe("dynArrLit");
+    if (args?.kind !== "dynArrLit") throw new Error("expected island callback arguments");
+    expect(args.elems).toHaveLength(1);
+    const callback = args.elems[0];
+    expect(callback?.kind).toBe("dynFrom");
+    if (callback?.kind !== "dynFrom" || callback.value.kind !== "closure")
+      throw new Error("expected boxed native callback closure");
+    const callbackName = callback.value.fnName;
+    const accept = ir.functions.find((fn) => fn.name === callbackName);
+    expect(accept).toBeDefined();
+    expect(accept!.params.map((param) => param.type)).toEqual([errorType]);
+    expect(realpathSync(accept!.loc.file)).toBe(realpathSync(entry));
+    expect(source.slice(accept!.loc.start, accept!.loc.end)).toBe(
+      "function accept(error: Error): string { return error.message; }",
+    );
+    // Error property dispatch keeps the receiver's location, not the member's.
+    const { call } = authoredNativeCall(ir, entry, "error.message", "error".length);
+    expect(call.callee).toBe("%error.message.read");
+    expect(call.args).toMatchObject([
+      { kind: "varRef", localId: accept!.params[0]!.localId, type: errorType },
+    ]);
+    expect(accept!.body.find((stmt) => stmt.kind === "return")).toMatchObject({
+      kind: "return",
+      value: call,
+    });
+    return;
+  }
+
+  const cast = "value as Error";
+  const start = source.indexOf(cast);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const extractions = ir.functions.flatMap((fn) =>
+    fn.body.flatMap((stmt, index) => {
+      if (stmt.kind !== "assign" && stmt.kind !== "varDecl") return [];
+      const value = stmt.kind === "assign" ? stmt.value : stmt.init;
+      if (
+        value?.kind !== "dynCheck" ||
+        realpathSync(value.loc.file) !== realpathSync(entry) ||
+        value.loc.start !== start ||
+        value.loc.end !== start + cast.length
+      )
+        return [];
+      return [{ fn, index, localId: stmt.localId, value }];
+    }),
+  );
+  expect(extractions).toHaveLength(1);
+  const extraction = extractions[0]!;
+  expect(extraction.value.type).toEqual(errorType);
+  expect(extraction.value.value).toMatchObject({ kind: "varRef", type: { kind: "dyn" } });
+  if (mode === "checked conversion") {
+    const { call } = authoredNativeCall(ir, entry, "error.message", "error".length);
+    expect(call.callee).toBe("%error.message.read");
+    expect(call.args).toMatchObject([
+      { kind: "varRef", localId: extraction.localId, type: errorType },
+    ]);
+  } else {
+    const arm = authored("nodeIsland.invoke", "island.armReport()");
+    expect(arm.args[1]).toMatchObject({ kind: "strLit", value: "armReport" });
+    const armIndex = extraction.fn.body.findIndex(
+      (stmt) => stmt.kind === "exprStmt" && stmt.expr === arm,
+    );
+    expect(armIndex).toBeGreaterThan(extraction.index);
+    const throwIndex = extraction.fn.body.findIndex((stmt) => stmt.kind === "throw");
+    expect(throwIndex).toBeGreaterThan(armIndex);
+    expect(extraction.fn.body[throwIndex]).toMatchObject({
+      kind: "throw",
+      value: { kind: "varRef", localId: extraction.localId, type: errorType },
+      loc: { start: source.indexOf("throw error;"), end: source.indexOf("throw error;") + 12 },
+    });
+  }
 }
 
 function expectDynamicErrorListener(
@@ -939,6 +1065,96 @@ check(42);
         expect(result.stdout).toBe("direct rejected true\nunion rejected true\n".repeat(3));
         expect(result.stderr.replace(contextSwitchWarning, "")).toBe("");
       },
+    );
+  }, 300_000);
+
+  test.each([
+    [
+      "checked conversion",
+      `
+const value: unknown = island.make();
+const error = value as Error;
+console.log('message', error.message);
+console.log('same', island.same(error, value));
+console.log('collections', island.collectionCount());
+`,
+      "message forced gc\nsame true\ncollections 1\n",
+    ],
+    [
+      "nested typed callback",
+      `
+function accept(error: Error): string { return error.message; }
+console.log('nested', island.call(accept));
+console.log('collections', island.collectionCount());
+`,
+      "nested forced gc\ncollections 1\n",
+    ],
+  ] as const)(
+    "Error metadata getters collect during %s on Node's stack",
+    async (name, source, expected) => {
+      await withForeignErrors(
+        `error-info-gc-${name.replaceAll(" ", "-")}`,
+        source,
+        (entry, binary) => foreignErrorParity(entry, binary, expected),
+        (ir, entry) => inspectErrorInfo(ir, entry, name),
+        { islandSource: foreignErrorGcModule },
+      );
+    },
+    300_000,
+  );
+
+  test("uncaught island Error reporting collects after typed extraction", async () => {
+    await withForeignErrors(
+      "error-report-gc",
+      `
+const value: unknown = island.makeReport();
+const error = value as Error;
+island.armReport();
+console.log('armed');
+throw error;
+`,
+      async (_entry, binary) => {
+        // The cast reads the stack before arming. Only the final uncaught
+        // report can collect afterward; the second marker follows the GC.
+        const manifest = JSON.parse(
+          readFileSync(join(libnodePack()!, "manifest.json"), "utf8"),
+        ) as {
+          nodeVersion: string;
+        };
+        expect(manifest.nodeVersion).toMatch(/^\d+\.\d+\.\d+$/);
+        const failure: unknown = await execFileAsync(binary, [], {
+          env: foreignErrorEnv,
+          encoding: "utf8",
+          timeout: 30_000,
+        }).then(
+          () => {
+            throw new Error("expected an uncaught island Error");
+          },
+          (error: unknown) => error,
+        );
+        const result = failure as {
+          code: number | string;
+          signal: string | null;
+          killed: boolean;
+          stdout: string;
+          stderr: string;
+        };
+        const { code, signal, killed, stdout, stderr } = result;
+        expect(
+          failure,
+          `native outcome ${JSON.stringify({ code, signal, killed, stdout, stderr })}`,
+        ).toMatchObject({
+          code: 1,
+          signal: null,
+          killed: false,
+        });
+        expect(result.stdout).toBe("armed\nreport collected\n");
+        expect(result.stderr.replace(contextSwitchWarning, "")).toBe(
+          `TypeError: report sentinel\n\nNode.js v${manifest.nodeVersion}\n`,
+        );
+      },
+      (ir, entry) => inspectErrorInfo(ir, entry, "report"),
+      { islandSource: foreignErrorGcModule },
     );
   }, 300_000);
 
