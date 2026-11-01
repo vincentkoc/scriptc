@@ -1,0 +1,638 @@
+name: Diagnose native module evaluation
+
+on:
+  push:
+    branches: [qualify/region-darwin-20261030]
+    paths: [.github/workflows/diagnose-native-module-evaluation.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-native-module-evaluation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 8b9f7981e9198831474bbbe2eb47c48407daa380
+
+jobs:
+  diagnose:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+    env:
+      PROOF_CAPACITY_NAME: native-module-evaluation-capacity
+      DIAGNOSTIC_SOURCE: 8b9f7981e9198831474bbbe2eb47c48407daa380
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: vincentkoc/scriptc
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify immutable source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
+      - uses: ./.github/actions/llvm-linux
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(sha256sum "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/zig
+      - uses: ./.github/actions/native-packages
+        with:
+          target: linux-x64-gnu
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Prepare owned diagnostic runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/native-module-evaluation.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { basename, join, relative } from "node:path";
+          import { fileURLToPath, pathToFileURL } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self = fileURLToPath(import.meta.url), root = process.cwd();
+          const out = join(process.env.RUNNER_TEMP, "native-module-evaluation-proof");
+          const work = join(process.env.RUNNER_TEMP, "native-module-evaluation-work");
+          const head = process.env.SOURCE_SHA;
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: head, platform: process.platform };
+          const CAP = 16 * 1024 * 1024;
+          const sourcePins = {".github/actions/llvm-linux/action.yml":"3e003bf185a932cf561ecc4c5e2c3f7c8275b803c1b25bd29aeea667fe0dc57f",".github/actions/native-packages/action.yml":"66ccdecfc85530af8cee2c61f33c4429abcedc615ccae38b5654ef7c309d2631",".github/actions/zig/action.yml":"3e3776ffc554e501040464545e7a283ad7f7e7d364c6950a9201353d89da7aed",".github/actions/libnode/action.yml":"ff4bc6ff8bdc6e28a7a73630f4f213bac3d09bf50c4efa91b2110c35692a36b9",".node-version":"a1c56e968c358e10872d64220b3ae759ffe7feaffc4da95fae425dbcca43fe44","package.json":"154f121f394b6c9d94120814de67c281d0f7505ffc340f88a8fdb0e9078d83fa","pnpm-lock.yaml":"f4bfbdc670252a428c20be1b9e104a573858ed596322294f80bed876b53d6353","pnpm-workspace.yaml":"57732c3fec5d4f4b879a11a073f9d85d26bf09fe361d4e2794d4cb2d00652632","packages/compiler/package.json":"6ab1024e6b8ec404121a9bd99d75d99f8882ef060dc04f79bbc9ba936a74b62f","packages/compiler/src/index.ts":"98bd62a6d96c384be7551c5c5d3b8dd9e4cd5af481055188d75be60a18d1efa4","packages/compiler/src/cli/command.ts":"1aedc02304a6fc5044d98c2102f53b77a41b5b92b1fd19df6edd2e48af6a60b4","packages/compiler/src/cli/output-options.ts":"f67105fb66f3d95a679c7fe8be81939e6349a128731fe5563b5b9891c3b6a316","packages/compiler/src/executable/prepare.ts":"b582606e772f19558dcaa0e785c8714abc2740f49b0a1097571241c9d4c524c7","packages/compiler/src/backend/runtime-abi.ts":"410942a8aec11d7ca9a7e2c9c2eb5f2881978b2bce77c867a48bdc8859e2691f","packages/compiler/src/frontend/lowering/builtins/process.ts":"c6a0ce9b6a0160cc3fca75f1be0db85f9d46ad492c63631dcebdc4cfc56bb793","packages/compiler/src/frontend/lowering/lower-node-island.ts":"e24b6e158ccd48a54ca959fea8caaf6f5acf8694d6a58f9c2218190790a8651f","packages/compiler/src/frontend/node-api-import.ts":"0b75b3b1c2b74c56b2ea250ee3fba175c62cceb240dd81fa69e1ab709b211a98","packages/compiler/src/ir/ir.ts":"4083cf2a5b697c98938d50fb2434b95dba8ad3135bf1aed1e9a782717817382b","packages/compiler/src/node-islands/libnode-pack.ts":"4c08376cd8d4869a5fdc633e7f143b3b86746e80955cc0b9ce8afe7a63d370fd","packages/compiler/src/node-islands/modules.ts":"18d6288bfe7b274126cad65fb898b8d80e6c3f4082105f5867dd122b3a4beb54","packages/compiler/src/node-islands/scan.ts":"705fb767501a6b05bddbbf8addaa2f5e615932cdfed99e0b1f21177786027317","packages/node/package.json":"fbf093ff9f865a4e9d7cf854c6877ed9e4c07f734624a1f851a73a16bf123947","packages/node/index.js":"3f4ada7e53d93fc7b57c27540f8e4f5f19f3dbbf190de8f33a8c35604876b665","packages/node/index.d.ts":"00f09914126b6f3e72d4cb10c2d04820f9dcf5d164b5431f12a721fb2e85f803","packages/runtime/src/scr_node_island.c":"19a5e19b376649bf1168e50b9a96f50b7cdcc24aa5b28c35e63d8b09cff7748e","packages/libnode-common/bridge/scr_node_bridge.cc":"a299f3ffa15e8a3ca229d253f1027a2e04a1a141921cb8a229eea3402a3360cc","packages/libnode-common/dev-pack.json":"5e3480eb55bdc799ced4bc963265728d037847b93f45691bf5eaeaf7efe66c7b","packages/libnode-common/build-pack.mjs":"3315dc1e0a0dcf9239f93bb2674a2b3ee77abd5420a70c651c982407f8b4453f","packages/libnode-common/fetch-dev-pack.mjs":"d99c18e0d407f3aebc5470449a7fb10958e172f731c13c45a1ebf472f07eff71","packages/libnode-common/scripts/cache-key.mjs":"a949852965733eff702f2abc164e2466684e68d4b8726f6c98d0c6883cf875c3","packages/libnode-common/scripts/verify.mjs":"051fd399d29bddc8f757213ee00d5f6c1d200755266b0ebe86b7603462de503a","packages/runtime-pack-common/scripts/verify.mjs":"a708bddecf7af5d2446cf5cd575299041522bc4f5d7fd99113876e26dee44c13","packages/runtime/src/scr_lib.c":"3b59b6e99e950f251260a7417fbf814a1bb4960d9657ecb9578a9ebe20ffa2ef","packages/runtime/src/scr_lib.h":"83a688df501afd1115baaeff931c61bcb8973cd505acd8f59bca5a18cadafdbc","packages/compiler/src/frontend/lowering/builtins/environment.ts":"096afd3dd58d041ebea6c565b5245acb9b93a7bd8afecabca8c9a2916b241c7a","packages/runtime/src/scr_events.c":"0f27965c4237b688841d14df5c71e8c87c34f0c0311569f40d35208ae5cd294e","packages/runtime/src/scr_async.c":"6a990cc466361828bd82bd688fc3811da23b876df223fb5d0214c496ca855198","packages/runtime/src/scr_node_island_host.cjs":"e853e03ceaa0ef422c7554da29d15d7f8c6bfab1c9668a837b2f8e4f68ca6913","packages/compiler/src/ir/jsval.ts":"d9fc8a262e6e0d18380df446af7c3bbf16c117ee3e5cde7fad82f7491107cd9d","packages/compiler/src/frontend/lowering/lower-functions.ts":"96d8855867decc59426dba062221d7526527478120cf3b784442c38bf18367ae","packages/compiler/src/frontend/pipeline.ts":"44d15a631828fe5483a3489b31bbe9063da5f188fde6dc0d5721f390a141f1eb","packages/compiler/src/frontend/lowering/lower-modules.ts":"e0c52ed22a75d9e686521035fd034ab4e651abe12d2a0208b77893f4c8133ffe","packages/compiler/src/frontend/lowering/lowerer.ts":"0f1ba8ae4ef99d443dd73a08b84f86db293543b3ed5ec3b58789ddb52ac78f68","packages/compiler/src/frontend/lowering/lower-shared-modules.ts":"17a1144990227554d0018284bfc9cd443bf64c167ed983722a53a32ce857bbba","packages/compiler/src/diagnostics/diagnostic.ts":"f6151c4b9c3ef455225d3c431b0105c26b550c466175ac7b0a8152dfa50fb9a3","packages/runtime/src/scr_node_island_export.c":"13135ce8f10ba1a60f7f6c64c52210700bf166612b85d4662c5238934610161a","packages/runtime/src/scr_regex.c":"a6790257bf0e56e575e18d1119fc276ff355135ceb693d2d9b3d268b5e47a1c7","packages/runtime/src/scr_regex.h":"3deb5f58aab84c525e6f6016d680d08eaac3f3f77483fa26894427ba9dd46746"};
+          const sourceFiles = Object.keys(sourcePins);
+          const nativeExpected = {"count":1053,"sha256":"35ebd589a5df0336f1219abfd535c91fe9c15bfd3a62af36e74303e7c63e436b"};
+          const specs = [{"id":"scalar-only","files":{"helper.mjs":"let count = 40;\nlet initialized = 0;\ninitialized += 1;\nconsole.log(\"helper:init\", initialized);\nexport function readScalar() { count += 1; return count; }\nexport function initializationCount() { return initialized; }\n","island.mjs":"import { readScalar, initializationCount } from \"./helper.mjs\";\nconsole.log(\"island:init\");\nexport function read() { return readScalar(); }\nexport function count() { return initializationCount(); }\n","main.mjs":"import { read, count } from \"./island.mjs\";\nconsole.log(\"main:read\", read(), count());\nconsole.log(\"main:read\", read(), count());\n"},"expected":"helper:init 1\nisland:init\nmain:read 41 1\nmain:read 42 1\n"},{"id":"native-helper-before-island","files":{"helper.mjs":"let count = 40;\nlet initialized = 0;\ninitialized += 1;\nconsole.log(\"helper:init\", initialized);\nexport function readScalar() { count += 1; return count; }\nexport function initializationCount() { return initialized; }\nconst expression = /^seed:[0-9]+$/;\nconst values = [7, 11];\nconst record = { value: 13 };\nconst lookup = new Map([[\"seed\", 17]]);\nexport function readState() {\n  const value = readScalar();\n  console.log(\"helper:read\", value, initializationCount());\n  return value + \":\" + initializationCount() + \":\" + (expression.test(\"seed:7\") ? 1 : 0) + \":\" + values[1] + \":\" + record.value + \":\" + lookup.get(\"seed\");\n}\n","island.mjs":"import { readState } from \"./helper.mjs\";\nconsole.log(\"island:top\", readState());\nexport function read() { return readState(); }\n","main.mjs":"import { initializationCount } from \"./helper.mjs\";\nimport { read } from \"./island.mjs\";\nconsole.log(\"main:direct-count\", initializationCount());\nconsole.log(\"main:read\", read());\nconsole.log(\"main:read\", read());\n"},"expected":"helper:init 1\nhelper:read 41 1\nisland:top 41:1:1:11:13:17\nmain:direct-count 1\nhelper:read 42 1\nmain:read 42:1:1:11:13:17\nhelper:read 43 1\nmain:read 43:1:1:11:13:17\n"},{"id":"native-helper-after-island","files":{"helper.mjs":"let count = 40;\nlet initialized = 0;\ninitialized += 1;\nconsole.log(\"helper:init\", initialized);\nexport function readScalar() { count += 1; return count; }\nexport function initializationCount() { return initialized; }\nconst expression = /^seed:[0-9]+$/;\nconst values = [7, 11];\nconst record = { value: 13 };\nconst lookup = new Map([[\"seed\", 17]]);\nexport function readState() {\n  const value = readScalar();\n  console.log(\"helper:read\", value, initializationCount());\n  return value + \":\" + initializationCount() + \":\" + (expression.test(\"seed:7\") ? 1 : 0) + \":\" + values[1] + \":\" + record.value + \":\" + lookup.get(\"seed\");\n}\n","island.mjs":"import { readState } from \"./helper.mjs\";\nconsole.log(\"island:top\", readState());\nexport function read() { return readState(); }\n","main.mjs":"import { read } from \"./island.mjs\";\nimport { initializationCount } from \"./helper.mjs\";\nconsole.log(\"main:direct-count\", initializationCount());\nconsole.log(\"main:read\", read());\nconsole.log(\"main:read\", read());\n"},"expected":"helper:init 1\nhelper:read 41 1\nisland:top 41:1:1:11:13:17\nmain:direct-count 1\nhelper:read 42 1\nmain:read 42:1:1:11:13:17\nhelper:read 43 1\nmain:read 43:1:1:11:13:17\n"}];
+          const fixtureExpected = [{"path":"native-helper-after-island/expected.stdout.log","bytes":164,"sha256":"70a438a0778038cc6c37c74193379c243a04b52fc53edd14020b04032b26d0db"},{"path":"native-helper-after-island/helper.mjs","bytes":625,"sha256":"baa5ae55d75858874bdea84d650d635dd70156dc4dcfbebc83f6705e60f4d6a7"},{"path":"native-helper-after-island/island.mjs","bytes":129,"sha256":"6aafb419fa90e5da26a434ef91a13d1738ff71b5760bc5bc429357ec4443b235"},{"path":"native-helper-after-island/main.mjs","bytes":214,"sha256":"1f4fc899be15e750059285df8a7fb0a56cd74c165884b50969ca77010e0bfa18"},{"path":"native-helper-before-island/expected.stdout.log","bytes":164,"sha256":"70a438a0778038cc6c37c74193379c243a04b52fc53edd14020b04032b26d0db"},{"path":"native-helper-before-island/helper.mjs","bytes":625,"sha256":"baa5ae55d75858874bdea84d650d635dd70156dc4dcfbebc83f6705e60f4d6a7"},{"path":"native-helper-before-island/island.mjs","bytes":129,"sha256":"6aafb419fa90e5da26a434ef91a13d1738ff71b5760bc5bc429357ec4443b235"},{"path":"native-helper-before-island/main.mjs","bytes":214,"sha256":"81d76c55e8a94d60d3f43ec5c56f4bd9efc084e8a0b696e47135a6097cc7a3ad"},{"path":"scalar-only/expected.stdout.log","bytes":56,"sha256":"650e832bb1ecc8de8ba92f7c304ee07feb784c6800e665a52d54b319a5a099c9"},{"path":"scalar-only/helper.mjs","bytes":217,"sha256":"3a9272c96e1e9194bd306275091306e8b3e3c510ae76293d62c660536e13e3f4"},{"path":"scalar-only/island.mjs","bytes":198,"sha256":"9b86e342f712f747d71ca6f17ee8a12d7e5c90630b048005df4b4ab9e75145a9"},{"path":"scalar-only/main.mjs","bytes":130,"sha256":"f6ecc341cbdf828dc62c183f880ee905966ee549b27994d606fadf49b7a81c35"}];
+          const fixtureDigest = "e5c9280f2ee3e79368eacc1d6a89c074c06fd5cc739c70c248e028603066c8c8";
+          const fixtureOrigin = {"workflowCommit":"25b6ada8b94856f532024ae681754f44df94f57c","workflowPath":".github/workflows/diagnose-shared-module-initialization.yml","workflowSha256":"9821e7381616914042a664c63d9591cb87ef3c2897e4a625b3ad4d5d7fbb1eac","definitionBlockSha256":"e9be8db69fd5a24dedb0179214c7cd4825c0b43e964f32fe3f36745d6b2299b9","definitionBlockBytes":3608,"definitionBlockScope":"raw YAML from indented const scalarHelper through the byte before indented const fixtures","evidenceReused":false};
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const hash = path => digest(readFileSync(path));
+          const json = path => JSON.parse(readFileSync(path, "utf8"));
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          const capture = (command, args = []) => {
+            const value = spawnSync(command, args, { cwd: root, encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(value.error, undefined, command + " launcher failed"); assert.equal(value.status, 0, command + ": " + value.stderr);
+            return value.stdout.trim();
+          };
+          const escape = text => text.replace(/[.*+?^$()|[\]{}\\]/g, char => "\\" + char);
+          const normalize = text => text.replace(/^==\d+==WARNING: ASan doesn't fully support makecontext\/swapcontext functions and may produce false positives in some cases!\n/gm, "");
+          function verifyWorkOwner() {
+            const info = lstatSync(work); assert.ok(info.isDirectory() && !info.isSymbolicLink()); assert.equal(info.mode & 0o777, 0o700);
+            assert.deepEqual(json(join(work, "owner.json")), owner);
+          }
+          function source() {
+            assert.equal(head, "8b9f7981e9198831474bbbe2eb47c48407daa380"); assert.equal(capture("git", ["rev-parse", "HEAD"]), head);
+            assert.equal(capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+            const tree = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]);
+            assert.equal(digest(tree), "7f5f79ac0950296feabf3b1e315cf7570467d9fa921aba5c908ca7fd4861f7e1");
+            const pins = Object.fromEntries(sourceFiles.map(path => [path, hash(join(root, path))]));
+            assert.deepEqual(pins, sourcePins);
+            return { head, clean: true, treeSha256: digest(tree), files: pins };
+          }
+          function nativeInputs() {
+            const rows = capture("git", ["ls-tree", "-r", "--full-tree", "HEAD"]).split("\n").filter(row => {
+              const path = row.slice(row.indexOf("\t") + 1);
+              return path.startsWith("native/llvm-codegen/") || /^packages\/(runtime(?:-[^/]+)?|llvm-[^/]+|libnode-[^/]+)\//.test(path) ||
+                /^\.github\/actions\/(native-packages|llvm-linux|zig|libnode)\//.test(path) ||
+                [".node-version", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/compiler/package.json", "packages/compiler/src/backend/runtime-abi.ts"].includes(path);
+            });
+            assert.equal(rows.length, nativeExpected.count); assert.equal(digest(rows.join("\n")), nativeExpected.sha256);
+            return { rows, sha256: digest(rows.join("\n")), disk: rows.map(row => { const path = row.split("\t")[1]; return { path, sha256: hash(join(root, path)) }; }) };
+          }
+          function files(base, prefix = "") {
+            return readdirSync(base, { withFileTypes: true }).sort((a,b) => a.name.localeCompare(b.name)).flatMap(item => {
+              const path = join(base, item.name), name = prefix + item.name, info = lstatSync(path);
+              assert.ok(!info.isSymbolicLink()); if (info.isDirectory()) return files(path, name + "/");
+              assert.ok(info.isFile()); return [{ path: name, bytes: info.size, sha256: hash(path) }];
+            });
+          }
+          function nativeFiles(target) {
+            return ["packages/llvm-" + target + "/bin", "packages/runtime-" + target + "/artifacts"].flatMap(path => files(join(root, path)).map(row => ({ ...row, path: path + "/" + row.path })))
+              .concat([{ path: "packages/runtime-" + target + "/runtime-pack.json", sha256: hash(join(root, "packages/runtime-" + target + "/runtime-pack.json")) }]);
+          }
+          function tool(command, args = ["--version"]) {
+            const path = realpathSync(capture("/bin/sh", ["-c", 'command -v "$1"', "identity", command]));
+            const result = spawnSync(command, args, { encoding: "utf8", timeout: 30000, maxBuffer: CAP });
+            assert.equal(result.error, undefined); assert.equal(result.status, 0);
+            return { path, sha256: hash(path), version: (result.stdout + result.stderr).trim() };
+          }
+          function tools() {
+            const common = { node: tool(process.execPath), pnpm: tool("pnpm"), clang: tool("clang"), ld: tool("ld", process.platform === "darwin" ? ["-v"] : ["--version"]), nm: tool("nm") };
+            if (process.platform === "darwin") {
+              const sdk = capture("xcrun", ["--sdk", "macosx", "--show-sdk-path"]);
+              return { ...common, dsymutil: tool("dsymutil"), dwarfdump: tool("dwarfdump"), lldb: tool("lldb"),
+                sdk: { path: sdk, version: capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]), settingsSha256: hash(join(sdk, "SDKSettings.json")) },
+                xcode: capture("xcodebuild", ["-version"]), developer: capture("xcode-select", ["-p"]), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+            }
+            return { ...common, llvm: tool("llvm-config", ["--version"]), zig: tool("zig", ["version"]), cxx: tool("g++"), strip: tool("strip"), imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion };
+          }
+          function makeEnvironment(id, sanitize) {
+            const dir = join(work, id); mkdirSync(dir, { mode: 0o700 });
+            for (const name of ["cache", "tmp", "xdg"]) mkdirSync(join(dir, name), { mode: 0o700 });
+            return { SCRIPTC_SAN: sanitize ? "1" : "", SCRIPTC_TEST_WORKERS: "1", SCRIPTC_TEST_STABLE_TOOLCHAIN: "1",
+              SCRIPTC_CACHE_DIR: join(dir, "cache"), TMPDIR: join(dir, "tmp"), XDG_CACHE_HOME: join(dir, "xdg") };
+          }
+
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function retain(path, name) { const to = join(out, name); copyFileSync(path, to); return record(to); }
+          function readOutput(step, stream) { return readFileSync(join(out, step[stream].path), "utf8"); }
+          let providedModulePlaceholder;
+          function validateCompile(step, entry, artifact, island) {
+            requireSuccess(step);
+            const data=JSON.parse(readOutput(step,"stdout"));
+            assert.equal(data.schema,"scriptc-diagnostics");assert.equal(data.schemaVersion,1);
+            assert.equal(data.command,"build");assert.equal(data.entry,entry);assert.equal(data.artifact,artifact);
+            assert.equal(data.phase,"complete");assert.equal(data.success,true);assert.ok(Array.isArray(data.diagnostics));
+            assert.equal(data.diagnostics.filter(row=>row.severity==="error").length,0);
+            const notes=data.diagnostics.filter(row=>row.code==="SC8001");
+            assert.equal(notes.length,1);assert.equal(notes[0].file,island);
+            assert.equal(notes[0].severity,"warning");
+            assert.ok(notes[0].message.startsWith("module '"+island+"' runs in a Node island:"));
+            return data;
+          }
+          function collect(value,predicate,result=[]){
+            if(value && typeof value==="object"){
+              if(predicate(value))result.push(value);
+              for(const child of Object.values(value))collect(child,predicate,result);
+            }
+            return result;
+          }
+          function moduleRows(spec,rows){
+            const placeholder=Buffer.from(providedModulePlaceholder("helper.mjs"));
+            const expected=[
+              {path:"helper.mjs",bytes:placeholder.length,sha256:digest(placeholder)},
+              {path:"island.mjs",bytes:Buffer.byteLength(spec.files["island.mjs"]),sha256:digest(spec.files["island.mjs"])},
+            ];
+            assert.equal(rows.length,expected.length);
+            for(const item of expected){
+              const row=rows.find(row=>row.path===item.path);assert.ok(row);
+              assert.equal(row.bytes,item.bytes);assert.equal(row.sha256,item.sha256);
+            }
+            return expected;
+          }
+          function irEvidence(program,spec,entry,helper,island){
+            assert.notEqual(program.commonJsEntry,true);
+            const functions=program.functions, globals=new Set(program.globals.map(row=>row.id));
+            const owned=functions.filter(fn=>fn.loc?.file===helper && fn.body?.length);
+            const expected=["readScalar","initializationCount",...(spec.id==="scalar-only"?[]:["readState"])];
+            const nativeBodies=expected.map(name=>{
+              const matches=owned.filter(fn=>(fn.sourceName??fn.name)===name);
+              assert.ok(matches.length>0,"missing native helper function "+name);
+              for(const fn of matches)assert.equal(collect(fn.body,node=>node.kind==="libCall" && node.fn.startsWith("nodeIsland.")).length,0);
+              return {name,functions:matches.map(fn=>({name:fn.name,loc:fn.loc}))};
+            });
+            const entryBodies=functions.filter(fn=>fn.loc?.file===entry && fn.body?.length);
+            assert.ok(entryBodies.length>0,"entry has no native body");
+            assert.equal(functions.filter(fn=>fn.loc?.file===island && fn.body?.length).length,0,"island body was compiled natively");
+            const inventory=program.nodeIsland?.modules?.files;assert.ok(Array.isArray(inventory));
+            moduleRows(spec,inventory.map(row=>({path:row.path,bytes:row.size,sha256:row.sha256})));
+            assert.equal(inventory.find(row=>row.path==="helper.mjs").placeholder,true);
+            assert.notEqual(inventory.find(row=>row.path==="island.mjs").placeholder,true);
+            const calls=collect(program,node=>node.kind==="libCall" && node.fn==="nodeIsland.require");
+            assert.ok(calls.length>0 && calls.some(call=>call.loc?.file===entry),"native entry does not enter the selected island");
+            // These are observations of concrete functions and writes, not an initialization verdict inferred from names.
+            const owners=functions.filter(fn=>[entry,helper].includes(fn.loc?.file) && fn.body?.length);
+            return {nativeBodies,entryBodies:entryBodies.map(fn=>({name:fn.name,loc:fn.loc})),moduleInventory:inventory,
+              callEdges:owners.flatMap(fn=>collect(fn.body,node=>node.kind==="call" || node.kind==="libCall")
+                .map(node=>({owner:fn.name,kind:node.kind,target:node.callee??node.fn,loc:node.loc}))),
+              globalStores:owners.flatMap(fn=>collect(fn.body,node=>node.kind==="assign" && globals.has(node.localId))
+                .map(node=>({owner:fn.name,global:node.localId,initializes:node.initializes??false,valueKind:node.value.kind,loc:node.loc})))};
+          }
+          function makeFixtures(){
+            const base=join(work,"fixtures");mkdirSync(base,{mode:0o700});
+            for(const spec of specs){
+              const dir=join(base,spec.id);mkdirSync(dir,{mode:0o700});
+              const data={...spec.files,"expected.stdout.log":spec.expected};
+              for(const [name,text] of Object.entries(data)){
+                writeFileSync(join(dir,name),text,{flag:"wx",mode:0o600});
+                mkdirSync(join(out,"fixtures",spec.id),{recursive:true});
+                copyFileSync(join(dir,name),join(out,"fixtures",spec.id,name));
+              }
+            }
+            const manifest=files(base);assert.deepEqual(manifest,fixtureExpected);
+            assert.equal(digest(JSON.stringify(manifest)),fixtureDigest);
+            return {base,manifest};
+          }
+          function terminalOutcome(step,sanitize){
+            for(const name of ["stdout","stderr"]){
+              const item=step[name];assert.equal(item.complete,true);assert.equal(item.bytes,item.observedBytes);
+              assert.equal(item.sha256,item.observedSha256);assert.equal(hash(join(out,item.path)),item.sha256);
+            }
+            assert.equal(step.status,"exited");assert.equal(step.drained,true);assert.equal(step.storageComplete,true);
+            assert.equal(step.streamsClosed,true);assert.equal(step.forcedCleanup,false);
+            assert.ok(!["SIGKILL","SIGTERM","SIGHUP","SIGINT"].includes(step.signal),"termination is incomplete diagnostic evidence");
+            assert.ok(![124,125,126,127,129,130,137,143].includes(step.code),"launcher, timeout or termination is incomplete evidence");
+            assert.ok((Number.isInteger(step.code) && step.code>=0 && step.signal===null) || (step.code===null && typeof step.signal==="string"));
+            const stdout=readOutput(step,"stdout"),rawStderr=readOutput(step,"stderr");
+            const stderr=sanitize?normalize(rawStderr):rawStderr;
+            return {code:step.code,signal:step.signal,stdoutSha256:digest(stdout),stderrSha256:digest(stderr),
+              normalization:sanitize?"anchored canonical ASan swapcontext warning only":"none",
+              normalizedStderrBytes:Buffer.byteLength(stderr),rawStderrSha256:digest(rawStderr)};
+          }
+
+          function scrub(value) {
+            let text = String(value);
+            for (const [path, label] of [[work, "<work>"], [root, "<source>"], [process.env.RUNNER_TEMP, "<runner-temp>"]]) text = text.split(path).join(label);
+            return text;
+          }
+          async function main() {
+            const report = json(join(out, "summary.json")); verifyWorkOwner();
+            let verifyInputs;
+            try {
+              assert.deepEqual(source(), report.sourceBefore); report.nativeInputs = nativeInputs();
+              report.nativeBefore = nativeFiles("linux-x64-gnu"); report.toolsBefore = tools();
+              assert.equal(process.version, "v24.22.1"); assert.equal(report.toolsBefore.pnpm.version, "11.1.3");
+              assert.equal(report.toolsBefore.llvm.version, "22.1.8"); assert.equal(report.toolsBefore.zig.version, "0.16.0");
+              report.helper = JSON.parse(capture("packages/llvm-linux-x64-gnu/bin/scriptc-llvm-codegen", ["version", "--format=json"]));
+              assert.equal(report.helper.ok, true); assert.equal(report.helper.protocol_version, "1"); assert.equal(report.helper.llvm_version, "22.1.8");
+              assert.equal(report.helper.scriptc_package_version, json("packages/llvm-linux-x64-gnu/package.json").version);
+              report.runtimeManifest = retain("packages/runtime-linux-x64-gnu/runtime-pack.json", "runtime-pack.json");
+              save("summary.json", report);
+              const buildEnv = makeEnvironment("build", false);
+              report.build = await run("workspace-build", "pnpm", ["build"], 600, buildEnv); requireSuccess(report.build);
+              assert.deepEqual(nativeFiles("linux-x64-gnu"), report.nativeBefore);
+              const { readLibnodePack } = await import(pathToFileURL(join(root, "packages/compiler/dist/node-islands/libnode-pack.js")));
+              const packRoot = join(work, "libnode");
+              assert.equal(existsSync(packRoot), false);
+              report.libnodeFetch = await run("libnode-fetch", process.execPath,
+                ["packages/libnode-common/fetch-dev-pack.mjs", "--out", packRoot], 600, makeEnvironment("libnode-fetch", false));
+              requireSuccess(report.libnodeFetch);
+              const pack = readLibnodePack(packRoot, { verifyHashes: true });
+              assert.equal(pack.manifest.nodeVersion, "24.22.1"); assert.equal(pack.manifest.bridgeAbi, 10);
+              assert.equal(pack.manifest.platform, "linux"); assert.equal(pack.manifest.arch, "x64");
+              report.libnode = { manifest: pack.manifest, manifestFile: retain(join(packRoot, "manifest.json"), "libnode-manifest.json"),
+                files: files(packRoot), route: "explicit checksum-pinned Linux Node 24.22.1 development pack; bridge built from this source",
+                developmentPin: sourcePins["packages/libnode-common/dev-pack.json"], historicalBinaryReuseClaim: false };
+              process.env.SCRIPTC_LIBNODE = packRoot;
+
+              ({providedModulePlaceholder}=await import(pathToFileURL(join(root,"packages/compiler/dist/node-islands/modules.js"))));
+              const placeholder=Buffer.from(providedModulePlaceholder("helper.mjs"));
+              assert.equal(placeholder.length,67);
+              assert.equal(digest(placeholder),"5f8c1374c2e8c2d568005c62525ba2c77056cb845db4b465afada3deb5077830");
+              report.placeholder={bytes:placeholder.length,sha256:digest(placeholder),source:sourcePins["packages/compiler/src/node-islands/modules.ts"]};
+              const fixture=makeFixtures();report.fixture={manifest:fixture.manifest,digest:fixtureDigest,origin:fixtureOrigin};
+              const verifyFixtures=()=>assert.deepEqual(files(fixture.base),fixture.manifest);
+              verifyInputs=async()=>{
+                requireSuccess(await run("verify-runtime-after",process.execPath,["packages/runtime-linux-x64-gnu/scripts/verify.mjs"],120));
+                assert.deepEqual(nativeFiles("linux-x64-gnu"),report.nativeBefore);
+                assert.deepEqual(readLibnodePack(packRoot,{verifyHashes:true}).manifest,pack.manifest);
+                assert.deepEqual(files(packRoot),report.libnode.files);assert.deepEqual(nativeInputs(),report.nativeInputs);
+                assert.deepEqual(tools(),report.toolsBefore);assert.deepEqual(source(),report.sourceBefore);verifyFixtures();
+                report.inputsVerifiedAfter=true;
+              };
+              const capacity=join(process.env.RUNNER_TEMP,process.env.PROOF_CAPACITY_NAME,"capacity.py");
+              assert.equal(hash(capacity),"13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");
+              requireSuccess(await run("pre-proof-capacity","python3",[capacity,"pre-proof"],60));
+              for(const spec of specs){
+                const row={id:spec.id,oracle:{status:"not-executed"},ir:{status:"not-compiled"},flavors:[]};
+                report.cases.push(row);save("summary.json",report);
+                const dir=join(fixture.base,spec.id),entry=join(dir,"main.mjs"),island=join(dir,"island.mjs"),helper=join(dir,"helper.mjs");
+                const common=["packages/cli/dist/main.js","build",entry,"--print=diagnostics","--node-islands=explicit","--node-island="+island];
+                try{
+                  verifyFixtures();
+                  row.oracle.execution=await run(spec.id+"-node",process.execPath,[entry],30);
+                  requireSuccess(row.oracle.execution);
+                  assert.equal(readOutput(row.oracle.execution,"stdout"),spec.expected);
+                  assert.equal(readOutput(row.oracle.execution,"stderr"),"");
+                  row.oracle.status="passed";
+                }catch(error){row.oracle.status="failed";row.oracle.error=scrub(error.stack??error);}
+                save("summary.json",report);assert.ok(allDrained(),"Node process custody unresolved");
+                try{
+                  const ir=join(out,spec.id+".ir.json");
+                  row.ir.compile=await run(spec.id+"-ir",process.execPath,[...common,"--emit=ir","-o",ir],180,makeEnvironment(spec.id+"-ir",false));
+                  row.ir.diagnostics=validateCompile(row.ir.compile,entry,ir,island);
+                  row.ir.artifact=record(ir);row.ir.ownership=irEvidence(json(ir),spec,entry,helper,island);row.ir.status="passed";
+                }catch(error){row.ir.status="failed";row.ir.error=scrub(error.stack??error);}
+                save("summary.json",report);assert.ok(allDrained(),"IR process custody unresolved");
+                for(const flavor of ["plain","san"]){
+                  const item={flavor,compileAdmitted:false,execution:{attempted:false,status:"not-executed"},complete:false,parity:"not-compared"};row.flavors.push(item);
+                  try{
+                    assert.equal(row.oracle.status,"passed","fresh Node oracle admission failed");
+                    assert.equal(row.ir.status,"passed","native helper/island IR admission failed");
+                    const build=join(work,spec.id+"-"+flavor);mkdirSync(build,{mode:0o700});
+                    const binary=join(build,"program"),env={...makeEnvironment(spec.id+"-"+flavor+"-cache",flavor==="san"),SCRIPTC_LIBNODE:packRoot,ASAN_OPTIONS:"detect_leaks=0"};
+                    item.compile=await run(spec.id+"-"+flavor+"-compile",process.execPath,[...common,"-o",binary,"--keep-llvm","--libnode=beside",...(flavor==="san"?["--sanitize"]:[])],600,env);
+                    if(existsSync(join(build,"main.ll")))item.llvm=retain(join(build,"main.ll"),spec.id+"-"+flavor+".ll");
+                    item.diagnostics=validateCompile(item.compile,entry,binary,island);
+                    assert.ok(item.llvm,"successful compilation did not retain LLVM");
+                    assert.deepEqual(readFileSync(binary).subarray(0,4),Buffer.from([127,69,76,70]));
+                    item.binary={bytes:statSync(binary).size,sha256:hash(binary)};
+                    const deployment=()=>{
+                      assert.equal(hash(binary),item.binary.sha256);
+                      assert.deepEqual(readLibnodePack(binary+".libnode",{verifyHashes:true}).manifest,pack.manifest);
+                      const moduleDir=binary+".libnode/modules",rows=files(moduleDir);
+                      moduleRows(spec,rows);
+                      assert.deepEqual(readFileSync(join(moduleDir,"helper.mjs")),placeholder);
+                      assert.equal(hash(join(moduleDir,"island.mjs")),digest(spec.files["island.mjs"]));
+                      return files(binary+".libnode");
+                    };
+                    item.deployment=deployment();verifyFixtures();item.compileAdmitted=true;
+                    item.execution=await run(spec.id+"-"+flavor+"-run",binary,[],30,{...env,SCRIPTC_LIBNODE:""});
+                    item.execution.attempted=true;
+                    item.outcome=terminalOutcome(item.execution,flavor==="san");
+                    item.parity=item.outcome.code===0 && item.outcome.signal===null &&
+                      item.outcome.stdoutSha256===digest(spec.expected) && item.outcome.stderrSha256===digest("")?"matched":"mismatch";
+                    assert.deepEqual(deployment(),item.deployment);verifyFixtures();item.inputsVerifiedAfter=true;item.complete=true;
+                  }catch(error){item.error=scrub(error.stack??error);}
+                  save("summary.json",report);assert.ok(allDrained(),"native process custody unresolved");
+                }
+              }
+              report.executionAttempts=report.cases.flatMap(row=>row.flavors).filter(row=>row.execution.attempted).length;
+              report.preCleanupComplete=report.cases.length===3 && report.executionAttempts===6 && report.cases.every(row=>
+                row.oracle.status==="passed" && row.ir.status==="passed" && row.flavors.length===2 &&
+                row.flavors.every(item=>item.compileAdmitted && item.complete && item.inputsVerifiedAfter));
+              report.nativeParity=report.preCleanupComplete && report.cases.every(row=>row.flavors.every(item=>item.parity==="matched"));
+            } catch (error) { report.error = scrub(error.stack ?? error); }
+            finally {
+              try { assert.ok(verifyInputs, "preparation did not complete"); await verifyInputs(); }
+              catch (error) { report.readbackError = scrub(error.stack ?? error); }
+              report.sourceAfter = source(); save("summary.json", report);
+            }
+            assert.equal(report.preCleanupComplete, true, "diagnostic incomplete");
+            assert.equal(report.inputsVerifiedAfter, true);
+            assert.equal(report.nativeParity, true, "native scalar/order parity differs; see raw diagnostic evidence");
+          }
+          function initialize() {
+            assert.equal(head, "8b9f7981e9198831474bbbe2eb47c48407daa380");
+            assert.equal(process.platform, "linux"); assert.equal(process.arch, "x64"); assert.equal(process.version, "v24.22.1");
+            mkdirSync(work, { mode: 0o700 }); writeFileSync(join(work, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+            mkdirSync(out, { mode: 0o700 }); copyFileSync(self, join(out, "runner.mjs"));
+            save("summary.json", { schemaVersion: 1, ...owner, runnerSha256: hash(self), sourceBefore: source(),
+              fixtureOrigin,scope:{caseCount:3,nodeOracles:3,irCompiles:3,nativeCompiles:6,nativeExecutions:6},
+              limitations:["Historical fixture source bytes are reused; all Node/IR/native observations are fresh at this one Scriptc source.",
+                "The selected island runs in embedded Node; main and helper remain native, with exact helper placeholder and function-body admission.",
+                "Call edges and global writes are neutral evidence. Names alone do not establish initialization order or ownership.",
+                "This scalar/order replay does not qualify cyclic module evaluation, lifecycle protocols, runtime timing, or production adoption.",
+                "Only the canonical ASan swapcontext warning is normalized; raw streams and generated LLVM remain intact.",
+                "ASan leak detection is disabled as in the established embedded-Node diagnostic."],
+              cases: [], diagnosticComplete: false, qualificationComplete: false, runtimeAcceptance: false });
+          }
+          function finalize() {
+            const report = json(join(out, "summary.json")), cleanup = { passed: false, retained: true };
+            try {
+              verifyWorkOwner(); assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k => [k, report[k]])), owner);
+              assert.ok(allDrained(), "owned process custody unresolved");
+              assert.equal(hash(self), report.runnerSha256); cleanup.source = source(); assert.deepEqual(cleanup.source, report.sourceBefore);
+              rmSync(work, { recursive: true }); cleanup.passed = true; cleanup.retained = false;
+              rmSync(self); cleanup.payloadRemoved = true;
+            } catch (error) { cleanup.error = scrub(error.stack ?? error); }
+            report.cleanup = cleanup;
+            report.diagnosticComplete = report.preCleanupComplete === true && report.inputsVerifiedAfter === true && cleanup.passed;
+            report.qualificationComplete = false; report.runtimeAcceptance = false;
+            save("summary.json", report); save("artifact-manifest.json", files(out).filter(row => row.path !== "artifact-manifest.json"));
+            assert.equal(report.diagnosticComplete, true, "diagnostic incomplete");
+            assert.equal(report.nativeParity, true, "diagnostic retained native mismatches");
+          }
+          if (process.argv[2] !== "--probe") {
+            try {
+              if (process.argv[2] === "--init") initialize();
+              else if (process.argv[2] === "--finalize") finalize();
+              else if (process.argv[2] === "--child") await childMain();
+              else await main();
+            } catch (error) { process.stderr.write(scrub(error.stack ?? error) + "\n[native-module-evaluation] FAILED (exit 1)\n"); process.exitCode = 1; }
+          }
+          RUNNER
+          node "$RUNNER_TEMP/native-module-evaluation.mjs" --init
+      - name: Replay scalar and module evaluation order
+        run: |
+          ulimit -c 0
+          node "$RUNNER_TEMP/native-module-evaluation.mjs"
+      - name: Verify custody and remove owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/native-module-evaluation.mjs"
+          node "$RUNNER_TEMP/native-module-evaluation.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-module-evaluation
+          path: ${{ runner.temp }}/native-module-evaluation-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-module-evaluation-capacity
+          path: ${{ runner.temp }}/native-module-evaluation-capacity
+          if-no-files-found: error
+          retention-days: 1
