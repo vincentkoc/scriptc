@@ -259,6 +259,7 @@ try {
         "failed recapture preserves descriptor",
       );
       check(
+        // oxlint-disable-next-line oxc/const-comparisons -- Each accessor read is observable and verifies caching.
         target.stack === old && target.stack === old && calls === 1,
         "old hidden state preserved",
       );
@@ -434,6 +435,7 @@ try {
       rangeError = error instanceof RangeError;
     }
     check(rangeError && calls === 1, "formatter overflow propagated");
+    // oxlint-disable-next-line oxc/const-comparisons -- Each accessor read is observable and verifies caching.
     check(target.stack === marker && target.stack === marker && calls === 2, "overflow not cached");
   });
   test("termination-without-cache", () =>
