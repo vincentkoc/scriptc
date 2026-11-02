@@ -171,7 +171,7 @@ jobs:
               for path in (patch, common / "patches/README.md", addon_source, api_test, oracle, root / ".github/workflows/qualify-node-lazy-stack-patch.yml"):
                   before[str(path.relative_to(root))] = entry(path)
                   shutil.copyfile(path, proof / path.name)
-              assert digest(patch) == "5f80ffdbf45b060b65ed535ff25f5364ab31070fa3c40b690ea518ad0264a13d", "reviewed patch"
+              assert digest(patch) == "effe834608eec404efc93f15733bcb6f2e562758ab43b1314356648d60978c3e", "reviewed patch"
               summary["inputsBefore"] = before
               capacity("before-download")
               tools = {name: Path(shutil.which(name)).resolve(strict=True) for name in ("gcc", "g++", "ninja", "python3", "git", "ldd", "readelf")}
@@ -203,7 +203,7 @@ jobs:
               patch_inputs = {
                   "deps/v8/include/v8-exception.h": ["a56b9a825bd5a95e3a091f16e1f49c9e56b0aa7392fd584d34e3bf3452b4f6f3", "25e3b91500ce876bef7568226585d7bc5fe56a3a2320ab457ef90707afb6a96d"],
                   "deps/v8/src/api/api.cc": ["a93ee520e961142b36a538f3ca44d5705eae1660d8cecfd0e0bbf61ecfb71174", "e9802a130cccda9f7b2177b5b02873e9703afc4be1997ba9b572329823e7d6dc"],
-                  "deps/v8/src/execution/messages.cc": ["a00739d8a0d7dc796bb10d50b495df9b417b9125c6b86b8333f37224a2bce59e", "d093f2833c6fcee5c19115e163491f2a7660ac23be26e0dc0b342089985f4a86"],
+                  "deps/v8/src/execution/messages.cc": ["a00739d8a0d7dc796bb10d50b495df9b417b9125c6b86b8333f37224a2bce59e", "338b1a230459eecd52c5a976254ab6eadbc409128eec2bcb94c9ffaf3b7c46b1"],
                   "deps/v8/src/execution/messages.h": ["35256d237e040edf0426b0f694765c07e325ba7ff97e4b5b1f1e9b4a9aaecd81", "7577cc013925834af0857301e9c0299bc9372c6523831a0ea6ccb9dd60f98e6a"],
                   "deps/v8/src/heap/factory.cc": ["2fe58f81d0a161f64345ce1e3ca3e1a449dc7205ec2705cfe39a4dfd87fd7804", "9d93da27fb1dedfe0bd218a3c38a800e1b4014be86d8031b9f4e02094e6180a7"],
                   "deps/v8/src/heap/factory.h": ["541e52af5ef550b7eec1aeabc29dc0facf73241cdc50842217996a30827f286b", "760c1dccb7e9ba16ca8976fbb19503e511e872968cd18f127a8ce4c22afa40c5"],

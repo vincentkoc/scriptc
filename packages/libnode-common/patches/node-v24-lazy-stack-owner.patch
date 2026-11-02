@@ -74,7 +74,7 @@ diff --git a/deps/v8/src/api/api.cc b/deps/v8/src/api/api.cc
 diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.cc
 --- a/deps/v8/src/execution/messages.cc
 +++ b/deps/v8/src/execution/messages.cc
-@@ -281,6 +281,32 @@
+@@ -281,6 +281,31 @@
    Isolate* isolate_;
  };
  
@@ -91,8 +91,7 @@ diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.
 +          ? direct_handle(Cast<JSGlobalObject>(*holder)->global_proxy(), isolate)
 +          : DirectHandle<Object>(holder),
 +      direct_handle(lazy_stack->value2(), isolate),
-+      may_invoke_custom_formatter ? isolate->factory()->true_value()
-+                                  : isolate->factory()->false_value()};
++      isolate->factory()->ToBoolean(may_invoke_custom_formatter)};
 +  if (may_invoke_custom_formatter) {
 +    PrepareStackTraceScope scope(isolate);
 +    return Execution::Call(isolate, formatter,
@@ -107,7 +106,7 @@ diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.
  }  // namespace
  
  // static
-@@ -289,6 +315,9 @@
+@@ -289,6 +314,9 @@
      DirectHandle<Object> raw_stack) {
    if (v8_flags.correctness_fuzzer_suppressions) {
      return isolate->factory()->empty_string();
@@ -117,7 +116,7 @@ diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.
    }
    DCHECK(IsFixedArray(*raw_stack));
    auto elems = Cast<FixedArray>(raw_stack);
-@@ -1164,19 +1193,19 @@
+@@ -1164,19 +1192,19 @@
          isolate, formatted_stack,
          FormatStackTrace(
              isolate, error_object,
@@ -141,7 +140,7 @@ diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.
      RETURN_ON_EXCEPTION(
          isolate, Object::SetProperty(isolate, error_object,
                                       isolate->factory()->error_stack_symbol(),
-@@ -1212,19 +1241,18 @@
+@@ -1212,19 +1240,18 @@
    }
  }
  
@@ -167,7 +166,7 @@ diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.
    }
  
    // Add the stack accessors.
-@@ -1233,10 +1261,42 @@
+@@ -1233,10 +1260,42 @@
    desc.set_configurable(true);
    desc.set_get(factory->error_stack_getter_fun_template());
    desc.set_set(factory->error_stack_setter_fun_template());
