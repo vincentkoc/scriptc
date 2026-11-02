@@ -1,0 +1,312 @@
+diff --git a/deps/v8/include/v8-exception.h b/deps/v8/include/v8-exception.h
+--- a/deps/v8/include/v8-exception.h
++++ b/deps/v8/include/v8-exception.h
+@@ -14,6 +14,7 @@
+ namespace v8 {
+ 
+ class Context;
++class Function;
+ class Isolate;
+ class Message;
+ class StackTrace;
+@@ -68,6 +69,33 @@
+    */
+   static Maybe<bool> CaptureStackTrace(Local<Context> context,
+                                        Local<Object> object);
++
++  /**
++   * Installs a lazy stack formatter without capturing frames or formatting.
++   * All handles must be nonempty and belong to this isolate. Non-JSObject
++   * targets (including proxies) return Just(false). Accessor installation
++   * follows CaptureStackTrace: a nonextensible target or incompatible own
++   * stack property throws, returns Nothing, and preserves the old hidden state.
++   *
++   * The formatter and data are retained until the lazy state is replaced or
++   * collected. The formatter receives (holder, data, mayInvokeCustomFormatter)
++   * with undefined as its receiver, using normal function realm semantics.
++   * holder is the hidden stack property's owner, with global objects exposed
++   * as their global proxy. Only target's own existing detailed trace is kept;
++   * inherited trace metadata is not copied.
++   *
++   * mayInvokeCustomFormatter is false during stack-formatting reentry or
++   * stack overflow. The formatter must then use its native fallback without
++   * invoking user formatting. False is permission, not a guarantee that a
++   * callback can execute on an exhausted stack. Invocation failures propagate
++   * without committing a formatter result; callback side effects remain.
++   * Successful results use the ordinary stack cache's writeback rules,
++   * including setter and recapture during formatting.
++   */
++  static Maybe<bool> SetLazyStackTrace(Local<Context> context,
++                                      Local<Object> target,
++                                      Local<Function> formatter,
++                                      Local<Value> data);
+ };
+ 
+ /**
+diff --git a/deps/v8/src/api/api.cc b/deps/v8/src/api/api.cc
+--- a/deps/v8/src/api/api.cc
++++ b/deps/v8/src/api/api.cc
+@@ -11243,6 +11243,24 @@
+   return Just(true);
+ }
+ 
++Maybe<bool> Exception::SetLazyStackTrace(Local<Context> context,
++                                        Local<Object> target,
++                                        Local<Function> formatter,
++                                        Local<Value> data) {
++  auto i_isolate = reinterpret_cast<i::Isolate*>(context->GetIsolate());
++  ENTER_V8_NO_SCRIPT(i_isolate, context, Exception, SetLazyStackTrace,
++                    i::HandleScope);
++  auto object = Utils::OpenHandle(*target);
++  if (!IsJSObject(*object)) return Just(false);
++  auto result = i::ErrorUtils::SetLazyStackTrace(
++      i_isolate, i::Cast<i::JSObject>(object),
++      Utils::OpenDirectHandle(*formatter), Utils::OpenDirectHandle(*data));
++  i::DirectHandle<i::Object> handle;
++  has_exception = !result.ToHandle(&handle);
++  RETURN_ON_FAILED_EXECUTION_PRIMITIVE(bool);
++  return Just(true);
++}
++
+ v8::MaybeLocal<v8::Array> v8::Object::PreviewEntries(bool* is_key_value) {
+   auto object = Utils::OpenDirectHandle(this);
+   i::Isolate* i_isolate = object->GetIsolate();
+diff --git a/deps/v8/src/execution/messages.cc b/deps/v8/src/execution/messages.cc
+--- a/deps/v8/src/execution/messages.cc
++++ b/deps/v8/src/execution/messages.cc
+@@ -281,6 +281,32 @@
+   Isolate* isolate_;
+ };
+ 
++MaybeDirectHandle<Object> FormatLazyStackTrace(
++    Isolate* isolate, DirectHandle<JSObject> holder,
++    DirectHandle<Tuple2> lazy_stack) {
++  DirectHandle<Object> formatter(lazy_stack->value1(), isolate);
++  DCHECK(IsCallable(*formatter));
++  const bool may_invoke_custom_formatter =
++      !isolate->formatting_stack_trace() &&
++      !StackLimitCheck{isolate}.HasOverflowed();
++  std::array<DirectHandle<Object>, 3> args{
++      IsJSGlobalObject(*holder)
++          ? direct_handle(Cast<JSGlobalObject>(*holder)->global_proxy(), isolate)
++          : DirectHandle<Object>(holder),
++      direct_handle(lazy_stack->value2(), isolate),
++      may_invoke_custom_formatter ? isolate->factory()->true_value()
++                                  : isolate->factory()->false_value()};
++  if (may_invoke_custom_formatter) {
++    PrepareStackTraceScope scope(isolate);
++    return Execution::Call(isolate, formatter,
++                           isolate->factory()->undefined_value(),
++                           base::VectorOf(args));
++  }
++  return Execution::Call(isolate, formatter,
++                         isolate->factory()->undefined_value(),
++                         base::VectorOf(args));
++}
++
+ }  // namespace
+ 
+ // static
+@@ -289,6 +315,9 @@
+     DirectHandle<Object> raw_stack) {
+   if (v8_flags.correctness_fuzzer_suppressions) {
+     return isolate->factory()->empty_string();
++  }
++  if (IsTuple2(*raw_stack)) {
++    return FormatLazyStackTrace(isolate, error, Cast<Tuple2>(raw_stack));
+   }
+   DCHECK(IsFixedArray(*raw_stack));
+   auto elems = Cast<FixedArray>(raw_stack);
+@@ -1164,19 +1193,19 @@
+         isolate, formatted_stack,
+         FormatStackTrace(
+             isolate, error_object,
+-            direct_handle(error_stack_data->call_site_infos(), isolate)));
++            direct_handle(error_stack_data->call_site_infos_or_formatted_stack(),
++                          isolate)));
+     error_stack_data->set_formatted_stack(*formatted_stack);
+     return formatted_stack;
+   }
+ 
+-  if (IsFixedArray(*lookup.error_stack)) {
++  if (IsFixedArray(*lookup.error_stack) || IsTuple2(*lookup.error_stack)) {
+     DirectHandle<JSObject> error_object =
+         lookup.error_stack_symbol_holder.ToHandleChecked();
+     DirectHandle<Object> formatted_stack;
+     ASSIGN_RETURN_ON_EXCEPTION(
+         isolate, formatted_stack,
+-        FormatStackTrace(isolate, error_object,
+-                         Cast<FixedArray>(lookup.error_stack)));
++        FormatStackTrace(isolate, error_object, lookup.error_stack));
+     RETURN_ON_EXCEPTION(
+         isolate, Object::SetProperty(isolate, error_object,
+                                      isolate->factory()->error_stack_symbol(),
+@@ -1212,19 +1241,18 @@
+   }
+ }
+ 
+-// static
+-MaybeHandle<Object> ErrorUtils::CaptureStackTrace(Isolate* isolate,
+-                                                  DirectHandle<JSObject> object,
+-                                                  FrameSkipMode mode,
+-                                                  Handle<Object> caller) {
++namespace {
++Maybe<bool> InstallStackAccessors(Isolate* isolate,
++                                 DirectHandle<JSObject> object) {
+   Factory* factory = isolate->factory();
+   Handle<Name> name = factory->stack_string();
+ 
+   // Explicitly check for frozen objects to simplify things since we need to
+   // add both "stack" and "error_stack_symbol" properties in one go.
+   if (!JSObject::IsExtensible(isolate, object)) {
+-    THROW_NEW_ERROR(isolate,
+-                    NewTypeError(MessageTemplate::kDefineDisallowed, name));
++    THROW_NEW_ERROR_RETURN_VALUE(
++        isolate, NewTypeError(MessageTemplate::kDefineDisallowed, name),
++        Nothing<bool>());
+   }
+ 
+   // Add the stack accessors.
+@@ -1233,10 +1261,42 @@
+   desc.set_configurable(true);
+   desc.set_get(factory->error_stack_getter_fun_template());
+   desc.set_set(factory->error_stack_setter_fun_template());
+-  Maybe<bool> success = JSReceiver::DefineOwnProperty(
+-      isolate, object, name, &desc, Just(kThrowOnError));
+-
+-  MAYBE_RETURN(success, {});
++  return JSReceiver::DefineOwnProperty(isolate, object, name, &desc,
++                                       Just(kThrowOnError));
++}
++}  // namespace
++
++// static
++MaybeHandle<Object> ErrorUtils::SetLazyStackTrace(
++    Isolate* isolate, DirectHandle<JSObject> object,
++    DirectHandle<JSReceiver> formatter, DirectHandle<Object> data) {
++  DCHECK(IsCallable(*formatter));
++  MAYBE_RETURN(InstallStackAccessors(isolate, object), {});
++  auto lazy_stack = isolate->factory()->NewTuple2(
++      formatter, data, AllocationType::kYoung);
++  DirectHandle<Object> value = lazy_stack;
++  StackPropertyLookupResult old = GetErrorStackProperty(isolate, object);
++  DirectHandle<JSObject> holder;
++  if (old.error_stack_symbol_holder.ToHandle(&holder) &&
++      *holder == *object && IsErrorStackData(*old.error_stack)) {
++    auto trace = direct_handle(
++        Cast<ErrorStackData>(*old.error_stack)->stack_trace(), isolate);
++    value = isolate->factory()->NewErrorStackData(lazy_stack, trace);
++  }
++  RETURN_ON_EXCEPTION(
++      isolate, Object::SetProperty(isolate, object,
++                                   isolate->factory()->error_stack_symbol(),
++                                   value, StoreOrigin::kMaybeKeyed,
++                                   Just(ShouldThrow::kThrowOnError)));
++  return isolate->factory()->undefined_value();
++}
++
++// static
++MaybeHandle<Object> ErrorUtils::CaptureStackTrace(Isolate* isolate,
++                                                  DirectHandle<JSObject> object,
++                                                  FrameSkipMode mode,
++                                                  Handle<Object> caller) {
++  MAYBE_RETURN(InstallStackAccessors(isolate, object), {});
+ 
+   // Collect the stack trace and store it in |object|'s private
+   // "error_stack_symbol" property.
+diff --git a/deps/v8/src/execution/messages.h b/deps/v8/src/execution/messages.h
+--- a/deps/v8/src/execution/messages.h
++++ b/deps/v8/src/execution/messages.h
+@@ -146,6 +146,10 @@
+                                 DirectHandle<JSObject> maybe_error_object,
+                                 DirectHandle<Object> formatted_stack);
+ 
++  static MaybeHandle<Object> SetLazyStackTrace(
++      Isolate* isolate, DirectHandle<JSObject> object,
++      DirectHandle<JSReceiver> formatter, DirectHandle<Object> data);
++
+   // Collects the stack trace and installs the stack property accessors.
+   static MaybeHandle<Object> CaptureStackTrace(Isolate* isolate,
+                                                DirectHandle<JSObject> object,
+diff --git a/deps/v8/src/heap/factory.cc b/deps/v8/src/heap/factory.cc
+--- a/deps/v8/src/heap/factory.cc
++++ b/deps/v8/src/heap/factory.cc
+@@ -1527,7 +1527,8 @@
+ }
+ 
+ DirectHandle<ErrorStackData> Factory::NewErrorStackData(
+-    DirectHandle<UnionOf<JSAny, FixedArray>> call_site_infos_or_formatted_stack,
++    DirectHandle<UnionOf<JSAny, FixedArray, Tuple2>>
++        call_site_infos_or_formatted_stack,
+     DirectHandle<StackTraceInfo> stack_trace) {
+   Tagged<ErrorStackData> error_stack_data = NewStructInternal<ErrorStackData>(
+       ERROR_STACK_DATA_TYPE, AllocationType::kYoung);
+diff --git a/deps/v8/src/heap/factory.h b/deps/v8/src/heap/factory.h
+--- a/deps/v8/src/heap/factory.h
++++ b/deps/v8/src/heap/factory.h
+@@ -451,7 +451,7 @@
+   DirectHandle<AccessorInfo> NewAccessorInfo();
+ 
+   DirectHandle<ErrorStackData> NewErrorStackData(
+-      DirectHandle<UnionOf<JSAny, FixedArray>>
++      DirectHandle<UnionOf<JSAny, FixedArray, Tuple2>>
+           call_site_infos_or_formatted_stack,
+       DirectHandle<StackTraceInfo> stack_trace);
+ 
+diff --git a/deps/v8/src/logging/runtime-call-stats.h b/deps/v8/src/logging/runtime-call-stats.h
+--- a/deps/v8/src/logging/runtime-call-stats.h
++++ b/deps/v8/src/logging/runtime-call-stats.h
+@@ -160,6 +160,7 @@
+   V(DictionaryTemplate_NewInstance)                        \
+   V(Error_New)                                             \
+   V(Exception_CaptureStackTrace)                           \
++  V(Exception_SetLazyStackTrace)                           \
+   V(External_New)                                          \
+   V(Float16Array_New)                                      \
+   V(Float32Array_New)                                      \
+diff --git a/deps/v8/src/objects/debug-objects-inl.h b/deps/v8/src/objects/debug-objects-inl.h
+--- a/deps/v8/src/objects/debug-objects-inl.h
++++ b/deps/v8/src/objects/debug-objects-inl.h
+@@ -88,14 +88,17 @@
+ TQ_OBJECT_CONSTRUCTORS_IMPL(ErrorStackData)
+ 
+ bool ErrorStackData::HasFormattedStack() const {
+-  return !IsFixedArray(call_site_infos_or_formatted_stack());
++  auto value = call_site_infos_or_formatted_stack();
++  return !IsFixedArray(value) && !IsTuple2(value);
+ }
+ 
+ ACCESSORS_RELAXED_CHECKED2(ErrorStackData, formatted_stack, Tagged<Object>,
+                            kCallSiteInfosOrFormattedStackOffset,
+                            HasFormattedStack(), true)
+ 
+-bool ErrorStackData::HasCallSiteInfos() const { return !HasFormattedStack(); }
++bool ErrorStackData::HasCallSiteInfos() const {
++  return IsFixedArray(call_site_infos_or_formatted_stack());
++}
+ 
+ DEF_GETTER(ErrorStackData, call_site_infos, Tagged<FixedArray>) {
+   DCHECK(HasCallSiteInfos());
+diff --git a/deps/v8/src/objects/debug-objects.tq b/deps/v8/src/objects/debug-objects.tq
+--- a/deps/v8/src/objects/debug-objects.tq
++++ b/deps/v8/src/objects/debug-objects.tq
+@@ -99,13 +99,14 @@
+ //     indicates that the inspector already asked for the
+ //     detailed stack information, but the error.stack
+ //     property was not yet formatted.
+-// (2) A valid JavaScript object and StackTraceInfo once
++// (2) A valid JavaScript value and StackTraceInfo once
+ //     error.stack was accessed.
++// (3) A Tuple2(formatter, data) and StackTraceInfo for an embedder's
++//     unformatted lazy stack, retaining only the owner's detailed trace.
+ extern class ErrorStackData extends Struct {
+-  // This holds either the FixedArray of CallSiteInfo instances or
+-  // the formatted stack value (usually a string) that's returned
+-  // from the error.stack property.
+-  call_site_infos_or_formatted_stack: FixedArray|JSAny;
++  // Unformatted call sites or lazy formatter state, otherwise the cached
++  // JavaScript value returned by the error.stack property.
++  call_site_infos_or_formatted_stack: FixedArray|Tuple2|JSAny;
+   // This holds the StackTraceInfo for inspector stack trace.
+   stack_trace: StackTraceInfo;
+ }

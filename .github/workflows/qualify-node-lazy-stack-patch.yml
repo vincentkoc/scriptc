@@ -1,0 +1,317 @@
+name: Qualify standalone Node lazy stack patch
+
+on:
+  push:
+    branches: [feat/libnode-lazy-stack-owner-20261102]
+    paths:
+      - packages/libnode-common/patches/node-v24-lazy-stack-owner.patch
+      - packages/libnode-common/test/lazy-stack-api.cc
+      - packages/libnode-common/test/lazy-stack-api.mjs
+      - .github/workflows/qualify-node-lazy-stack-patch.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-lazy-stack-patch
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: "24.22.0"
+            archive: 41f97cff2c666f1f8293dc5f85c65e8dd605c16b43fd9febd49ede32ee1e0329
+          - node: "24.22.1"
+            archive: 4f5379796280cdaeb0c2f358fd04b6a16cc4fb7dfa83b5a8c91a9d963b435231
+    env:
+      NODE_PIN: ${{ matrix.node }}
+      ARCHIVE_SHA: ${{ matrix.archive }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Build and test fresh patched Node
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import signal
+          import stat
+          import subprocess
+          import tarfile
+          import tempfile
+          import time
+          import urllib.request
+
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          proof = Path(os.environ["RUNNER_TEMP"]) / "node-lazy-stack-patch-evidence"
+          proof.mkdir(mode=0o700)
+          work = Path(tempfile.mkdtemp(prefix="node-lazy-stack-build-", dir=os.environ["RUNNER_TEMP"]))
+          version = os.environ["NODE_PIN"]
+          common = root / "packages/libnode-common"
+          patch = common / "patches/node-v24-lazy-stack-owner.patch"
+          addon_source = common / "test/lazy-stack-api.cc"
+          api_test = common / "test/lazy-stack-api.mjs"
+          oracle = common / "test/lazy-stack-oracle.mjs"
+          env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR") if k in os.environ}
+          env.update({"TZ": "UTC", "NO_COLOR": "1", "CC": "gcc", "CXX": "g++", "PYTHONDONTWRITEBYTECODE": "1"})
+          summary = {"schema": "scriptc.lazy-stack-patch-proof.v1", "source": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "node": version, "commands": [], "cells": [], "capacities": [], "complete": False,
+              "productionAdoption": False, "binaryArchiveRetained": False, "cleanup": False,
+              "preexistingOverflowPermission": "source-reviewed-only"}
+          source_inputs = configured_inputs = config_inputs = None
+          tree = work / ("node-v" + version)
+          def digest(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+          def entry(path):
+              return {"bytes": path.stat().st_size, "sha256": digest(path)}
+          def source_entry(path):
+              mode = path.lstat().st_mode
+              if stat.S_ISLNK(mode): return {"type": "symlink", "target": os.readlink(path)}
+              if stat.S_ISDIR(mode): return {"type": "directory"}
+              assert stat.S_ISREG(mode), "unexpected source file type"
+              return {"type": "file", "mode": stat.S_IMODE(mode), **entry(path)}
+          def source_inventory():
+              return {str(p.relative_to(tree)): source_entry(p) for p in sorted(tree.rglob("*"))
+                      if p.relative_to(tree).parts[0] != "out"}
+          def capacity(phase):
+              st = os.statvfs(work)
+              row = {"phase": phase, "availableBytes": st.f_bavail * st.f_frsize,
+                     "availableInodes": st.f_favail, "memory": Path("/proc/meminfo").read_text()}
+              summary["capacities"].append(row)
+          def group_alive(pid):
+              try: os.killpg(pid, 0); return True
+              except ProcessLookupError: return False
+          def run(label, argv, cwd, seconds):
+              out, err = proof / (label + ".stdout.log"), proof / (label + ".stderr.log")
+              row = {"name": label, "argv": [str(a).replace(str(work), "<work>").replace(str(root), "<source>") for a in argv],
+                     "deadlineSeconds": seconds, "forcedCleanup": False, "groupDrained": False, "streamsComplete": False}
+              summary["commands"].append(row)
+              child = None
+              with out.open("wb") as stdout, err.open("wb") as stderr:
+                  try:
+                      child = subprocess.Popen([str(a) for a in argv], cwd=cwd, env=env, start_new_session=True,
+                                               stdout=stdout, stderr=stderr)
+                      row["pid"] = child.pid
+                      assert child.pid > 1 and child.pid != os.getpgrp(), "owned group identity"
+                      row["pgid"] = os.getpgid(child.pid)
+                      assert row["pgid"] == child.pid, "new session process group"
+                      deadline = time.monotonic() + seconds
+                      while child.poll() is None:
+                          if time.monotonic() >= deadline or max(out.stat().st_size, err.stat().st_size) > 32*1024**2:
+                              raise AssertionError("command deadline or stream bound")
+                          time.sleep(0.25)
+                      row["exitCode"] = child.wait()
+                  finally:
+                      saved_handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGTERM, signal.SIGINT)}
+                      if child is not None:
+                          settle = time.monotonic() + 2
+                          while group_alive(child.pid) and time.monotonic() < settle:
+                              time.sleep(0.05)
+                          if group_alive(child.pid):
+                              row["forcedCleanup"] = True
+                              os.killpg(child.pid, signal.SIGKILL)
+                              child.wait(timeout=5)
+                              settle = time.monotonic() + 5
+                              while group_alive(child.pid) and time.monotonic() < settle:
+                                  time.sleep(0.05)
+                          row["groupDrained"] = not group_alive(child.pid)
+                      stdout.flush(); stderr.flush()
+                      os.fsync(stdout.fileno()); os.fsync(stderr.fileno())
+                      row["stdout"] = entry(out); row["stderr"] = entry(err)
+                      row["streamsComplete"] = row["groupDrained"] and max(out.stat().st_size, err.stat().st_size) <= 32*1024**2
+                      for sig, handler in saved_handlers.items(): signal.signal(sig, handler)
+              assert row.get("exitCode") == 0 and row["groupDrained"] and row["streamsComplete"] and not row["forcedCleanup"], label
+              return out
+          def interrupted(signum, frame):
+              raise InterruptedError("workflow interrupted")
+          signal.signal(signal.SIGTERM, interrupted)
+          signal.signal(signal.SIGINT, interrupted)
+          def validate_probe(row, kind, mode):
+              assert isinstance(row["v8"], str) and row["v8"], "V8 readback"
+              values = ["undefined", "null", "false", "zero", "negative-zero", "nan", "bigint",
+                        "symbol", "object", "array", "function"]
+              if kind == "stock":
+                  assert row["schema"] == "scriptc.lazy-stack-oracle.v1", "stock schema"
+                  assert row["assertions"] == (148 if mode == "inspector" else 147), "stock assertion inventory"
+                  names = ["recursive", "setter-read", "recapture", "throw", "setter-throw", "recapture-throw",
+                           "borrowed-get", "borrowed-set", "get-empty"]
+                  for value in [*values, "error-self"]: names.extend(["assigned-" + value, "returned-" + value])
+                  names.extend(["nonextensible", "nonconfigurable"])
+                  assert row["stackTraceLimit"] == 2 and row["inspector"] == {
+                      "enabled": mode != "plain", "size": None if mode == "plain" else (32 if mode == "inspector" else 0),
+                      "disabled": mode != "plain", "disconnected": mode != "plain"}, "stock inspector lifecycle"
+              else:
+                  assert kind == "api" and row["schema"] == "scriptc.lazy-stack-api.v1", "API schema"
+                  assert row["assertions"] == 184 and row["preexistingOverflowPermission"] == "source-reviewed-only", "API assertion inventory/limit"
+                  names = ["recursive", "setter-read", "recapture", "reinstall", "throw", "setter-throw", "recapture-throw"]
+                  for value in [*values, "self"]: names.extend(["returned-" + value, "assigned-" + value])
+                  names.extend(["borrowed-holder", "nonextensible", "nonconfigurable", "unsupported-proxy-target",
+                      "revoked-formatter-retries", "strict-sloppy-bound-proxy-realms", "global-holder",
+                      "ordinary-formatter-recursion-guard", "overflow-throws-without-cache", "termination-without-cache",
+                      "own-detailed-trace", "gc-format", "gc-setter", "gc-recapture", "gc-reinstall", "gc-owner-drop"])
+              assert [case["name"] for case in row["cases"]] == names, "exact ordered case inventory"
+          before = {}
+          try:
+              assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, timeout=15).decode().strip() == summary["source"]
+              assert subprocess.check_output(["git", "status", "--porcelain"], cwd=root, timeout=15) == b""
+              for path in (patch, common / "patches/README.md", addon_source, api_test, oracle, root / ".github/workflows/qualify-node-lazy-stack-patch.yml"):
+                  before[str(path.relative_to(root))] = entry(path)
+                  shutil.copyfile(path, proof / path.name)
+              assert digest(patch) == "5f80ffdbf45b060b65ed535ff25f5364ab31070fa3c40b690ea518ad0264a13d", "reviewed patch"
+              summary["inputsBefore"] = before
+              capacity("before-download")
+              tools = {name: Path(shutil.which(name)).resolve(strict=True) for name in ("gcc", "g++", "ninja", "python3", "git", "ldd", "readelf")}
+              for name in ("cc1plus", "as", "ld"):
+                  located = subprocess.check_output([tools["g++"], "-print-prog-name=" + name], env=env, timeout=15).decode().strip()
+                  tools[name] = Path(located if "/" in located else shutil.which(located)).resolve(strict=True)
+              env.update({"CC": str(tools["gcc"]), "CXX": str(tools["g++"])})
+              summary["toolsBefore"] = {name: entry(path) for name, path in tools.items()}
+              for name in ("gcc", "g++", "ninja", "python3", "git"):
+                  run("tool-" + name.replace("+", "p"), [tools[name], "--version"], work, 15)
+              archive = work / ("node-v" + version + ".tar.xz")
+              download_deadline = time.monotonic() + 180
+              with urllib.request.urlopen("https://nodejs.org/dist/v" + version + "/" + archive.name, timeout=30) as response, archive.open("xb") as target:
+                  total = 0
+                  while chunk := response.read(1024**2):
+                      total += len(chunk)
+                      assert total <= 256*1024**2 and time.monotonic() < download_deadline, "archive bound"
+                      target.write(chunk)
+              assert digest(archive) == os.environ["ARCHIVE_SHA"], "official source archive"
+              summary["archive"] = entry(archive)
+              with tarfile.open(archive, "r:xz") as tar:
+                  members = tar.getmembers()
+                  assert len(members) <= 200000 and sum(m.size for m in members) <= 4*1024**3, "source bounds"
+                  for member in members:
+                      path = PurePosixPath(member.name)
+                      assert not path.is_absolute() and ".." not in path.parts and path.parts[0] == tree.name, "source path"
+                  tar.extractall(work, filter="data")
+              source_inputs = source_inventory()
+              patch_inputs = {
+                  "deps/v8/include/v8-exception.h": ["a56b9a825bd5a95e3a091f16e1f49c9e56b0aa7392fd584d34e3bf3452b4f6f3", "25e3b91500ce876bef7568226585d7bc5fe56a3a2320ab457ef90707afb6a96d"],
+                  "deps/v8/src/api/api.cc": ["a93ee520e961142b36a538f3ca44d5705eae1660d8cecfd0e0bbf61ecfb71174", "e9802a130cccda9f7b2177b5b02873e9703afc4be1997ba9b572329823e7d6dc"],
+                  "deps/v8/src/execution/messages.cc": ["a00739d8a0d7dc796bb10d50b495df9b417b9125c6b86b8333f37224a2bce59e", "d093f2833c6fcee5c19115e163491f2a7660ac23be26e0dc0b342089985f4a86"],
+                  "deps/v8/src/execution/messages.h": ["35256d237e040edf0426b0f694765c07e325ba7ff97e4b5b1f1e9b4a9aaecd81", "7577cc013925834af0857301e9c0299bc9372c6523831a0ea6ccb9dd60f98e6a"],
+                  "deps/v8/src/heap/factory.cc": ["2fe58f81d0a161f64345ce1e3ca3e1a449dc7205ec2705cfe39a4dfd87fd7804", "9d93da27fb1dedfe0bd218a3c38a800e1b4014be86d8031b9f4e02094e6180a7"],
+                  "deps/v8/src/heap/factory.h": ["541e52af5ef550b7eec1aeabc29dc0facf73241cdc50842217996a30827f286b", "760c1dccb7e9ba16ca8976fbb19503e511e872968cd18f127a8ce4c22afa40c5"],
+                  "deps/v8/src/logging/runtime-call-stats.h": ["30222866a7361f3fc1bae688d4880864d697e92cb70e527fb3b3083ddf64e4a0", "aab31215ef9a2ee7dad04ba9e90340874f032a02b2647ce17269a2c126b74ea6"],
+                  "deps/v8/src/objects/debug-objects-inl.h": ["abff9d3bc89f268ba805035aaa883c85a4b1b5b9923293636d43a9ba8479f2aa", "ac3ebfcc68b60bc33fc0c4175dcd4900f3f007a30aca9b877f4b21231d88ddf8"],
+                  "deps/v8/src/objects/debug-objects.tq": ["36f080f6230692a720000d1f9752a2b33c8318774004baa89691f8f2912f1325", "a040e49df7e16583b059e370cd82869fe55e716d8009bdb7c5a32b9d9eac9692"],
+              }
+              for path, (old, new) in patch_inputs.items():
+                  assert digest(tree / path) == old, "exact patch preimage: " + path
+              run("patch-check", [tools["git"], "apply", "--check", patch], tree, 30)
+              run("patch-apply", [tools["git"], "apply", patch], tree, 30)
+              for path, (old, new) in patch_inputs.items():
+                  assert digest(tree / path) == new, "exact patch result: " + path
+                  source_inputs[path] = source_entry(tree / path)
+              summary["patchInputs"] = patch_inputs
+              (proof / "source-inputs.json").write_text(json.dumps(source_inputs, sort_keys=True) + "\n")
+              capacity("before-configure")
+              run("configure", ["./configure", "--shared", "--ninja"], tree, 300)
+              config = json.loads("\n".join(line for line in (tree / "config.gypi").read_text().splitlines() if not line.startswith("#")))
+              assert all(config["variables"][key] == expected for key, expected in
+                         (("node_shared", "true"), ("node_use_node_snapshot", "true"), ("icu_small", "false"))), "shared/snapshot/full-ICU configuration"
+              assert all(config["variables"][key] == 0 for key in ("v8_enable_pointer_compression", "v8_enable_sandbox",
+                         "v8_enable_pointer_compression_shared_cage", "v8_enable_external_code_space",
+                         "v8_enable_31bit_smis_on_64bit_arch")), "addon public-header ABI configuration"
+              assert all(source_entry(tree / path) == expected for path, expected in source_inputs.items()), "configure preserved source"
+              configured_inputs = source_inventory()
+              config_inputs = {name: entry(tree / name) for name in ("config.gypi", "config.status", "config.mk", "icu_config.gypi")}
+              summary["configurationBefore"] = config_inputs
+              for name in config_inputs:
+                  shutil.copyfile(tree / name, proof / name)
+              (proof / "configured-inputs.json").write_text(json.dumps(configured_inputs, sort_keys=True) + "\n")
+              capacity("before-build")
+              run("build", [tools["ninja"], "-C", "out/Release", "-j2", "node", "libnode"], tree, 180*60)
+              capacity("after-build")
+              binary = (tree / "out/Release/node").resolve(strict=True)
+              libraries = [p for p in (tree / "out/Release").rglob("libnode.so.137") if p.is_file()]
+              libraries = sorted(set(p.resolve() for p in libraries))
+              assert len(libraries) == 1 and binary.is_relative_to(tree) and libraries[0].is_relative_to(tree), "owned build outputs"
+              library = libraries[0]
+              env["LD_LIBRARY_PATH"] = str(library.parent)
+              addon = work / "lazy-stack-api.node"
+              run("addon-build", [tools["g++"], "-std=c++20", "-O2", "-shared", "-fPIC", "-fno-rtti",
+                  "-DNODE_GYP_MODULE_NAME=lazy_stack_api", "-DBUILDING_NODE_EXTENSION",
+                  "-I" + str(tree / "src"), "-I" + str(tree / "deps/v8/include"), "-I" + str(tree / "deps/uv/include"),
+                  "-I" + str(tree / "out/Release/obj/gen"), addon_source,
+                  "-L" + str(library.parent), "-l:libnode.so.137", "-Wl,-rpath," + str(library.parent), "-o", addon], tree, 120)
+              for name, path in (("node", binary), ("addon", addon)):
+                  linked = run("ldd-" + name, [tools["ldd"], path], tree, 15).read_text()
+                  assert str(library) in linked and "not found" not in linked, "actual libnode linkage"
+                  run("dynamic-" + name, [tools["readelf"], "-d", path], tree, 15)
+              outputs = {"node": binary, "libnode": library, "addon": addon}
+              summary["outputsBefore"] = {name: entry(path) for name, path in outputs.items()}
+              for mode in ("plain", "inspector", "inspector-zero"):
+                  for kind, script, extra in (("stock", oracle, []), ("api", api_test, [addon])):
+                      label = kind + "-" + mode
+                      flags = [] if kind == "stock" else ["--expose-gc"]
+                      out = run(label, [binary, *flags, script, *extra, mode, version], tree, 30)
+                      raw = out.read_bytes()
+                      assert len(raw) <= 32768 and raw.endswith(b"\n") and raw.count(b"\n") == 1, "one JSON record"
+                      assert (proof / (label + ".stderr.log")).read_bytes() == b"", "probe stderr"
+                      row = json.loads(raw)
+                      assert row["complete"] is True and row["failures"] == [] and row["node"] == "v" + version and row["mode"] == mode, "probe assertions"
+                      assert row["binarySha256"] == digest(binary) and row["fixtureSha256"] == digest(script), "executed input hashes"
+                      validate_probe(row, kind, mode)
+                      if kind == "api": assert row["addonSha256"] == digest(addon), "loaded addon hash"
+                      summary["cells"].append({"name": label, "node": row["node"], "v8": row["v8"], "cases": len(row["cases"]), "assertions": row["assertions"]})
+              summary["outputsAfter"] = {name: entry(path) for name, path in outputs.items()}
+              assert summary["outputsBefore"] == summary["outputsAfter"], "output readback"
+              summary["toolsAfter"] = {name: entry(path) for name, path in tools.items()}
+              assert summary["toolsBefore"] == summary["toolsAfter"], "tool readback"
+              assert source_inventory() == configured_inputs, "source type/path/content readback"
+              summary["sourceInputsUnchanged"] = True
+              summary["configurationAfter"] = {name: entry(tree / name) for name in config_inputs}
+              assert summary["configurationAfter"] == config_inputs, "configuration readback"
+              summary["complete"] = len(summary["cells"]) == 6
+          except Exception as error:
+              summary["error"] = (type(error).__name__ + ": " + str(error)).replace(str(work), "<work>").replace(str(root), "<source>")
+          finally:
+              signal.signal(signal.SIGTERM, signal.SIG_IGN)
+              signal.signal(signal.SIGINT, signal.SIG_IGN)
+              try:
+                  summary["inputsUnchanged"] = all(entry(root / path) == expected for path, expected in before.items()) and len(before) == 6
+                  if configured_inputs is not None:
+                      summary["sourceInputsUnchanged"] = source_inventory() == configured_inputs
+                      summary["configurationAfter"] = {name: entry(tree / name) for name in config_inputs}
+                      assert summary["configurationAfter"] == config_inputs and summary["sourceInputsUnchanged"], "source/configuration readback"
+              except Exception as error:
+                  summary["readbackError"] = type(error).__name__ + ": " + str(error)
+                  summary["inputsUnchanged"] = False
+              summary["groupsDrained"] = all(row["groupDrained"] for row in summary["commands"])
+              summary["noForcedCleanup"] = all(not row["forcedCleanup"] for row in summary["commands"])
+              if summary["groupsDrained"]:
+                  try:
+                      shutil.rmtree(work)
+                      summary["cleanup"] = not work.exists()
+                  except Exception as error:
+                      summary["cleanupError"] = type(error).__name__ + ": " + str(error)
+              summary["complete"] = summary["complete"] and summary["inputsUnchanged"] and summary["groupsDrained"] and summary["noForcedCleanup"] and summary["cleanup"]
+              (proof / "summary.json").write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n")
+              manifest = [{"path": p.name, **entry(p)} for p in sorted(proof.iterdir())]
+              (proof / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+              print(json.dumps({"complete": summary["complete"], "cells": summary["cells"], "error": summary.get("error"), "cleanup": summary["cleanup"]}))
+          if not summary["complete"]: raise SystemExit(1)
+      - name: Retain bounded proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-lazy-stack-patch-${{ matrix.node }}
+          path: ${{ runner.temp }}/node-lazy-stack-patch-evidence
+          if-no-files-found: error
+          retention-days: 7
