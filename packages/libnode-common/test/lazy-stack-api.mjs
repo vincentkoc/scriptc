@@ -22,15 +22,31 @@ const result = {
   preexistingOverflowPermission: "source-reviewed-only",
 };
 let phase = "arguments";
+let progressBytes = 0;
+function writeAll(fd, bytes) {
+  for (let offset = 0; offset < bytes.length;) {
+    const size = writeSync(fd, bytes, offset, bytes.length - offset);
+    if (size <= 0) throw new Error("probe write failed");
+    offset += size;
+  }
+}
+function progress(event, name) {
+  const bytes = Buffer.from(`lazy-stack-api ${event} ${name}\n`);
+  progressBytes += bytes.length;
+  if (progressBytes > 16384) throw new Error("probe progress exceeds 16 KiB");
+  writeAll(2, bytes);
+}
 function check(condition, label) {
   result.assertions++;
   if (!condition) throw new Error(`${phase}: ${label}`);
 }
 function test(name, body) {
   phase = name;
+  progress("begin", name);
   const before = result.assertions;
   body();
   result.cases.push({ name, assertions: result.assertions - before });
+  progress("end", name);
 }
 function withPrepare(hook, body) {
   const saved = Object.getOwnPropertyDescriptor(Error, "prepareStackTrace");
@@ -55,7 +71,10 @@ const limit = Object.getOwnPropertyDescriptor(Error, "stackTraceLimit");
 try {
   check(extra.length === 0 && ["plain", "inspector", "inspector-zero"].includes(mode), "mode");
   check(["24.22.0", "24.22.1"].includes(version) && process.version === `v${version}`, "version");
+  phase = "addon-load";
+  progress("begin", phase);
   const api = createRequire(import.meta.url)(addonPath);
+  progress("end", phase);
   if (mode !== "plain") {
     session = new Session();
     session.connect();
@@ -452,6 +471,14 @@ try {
       const before = api.trace(owner);
       check(before.length > 0, "detailed trace available");
       check(
+        before.some(([name]) => name === ""),
+        "unnamed frame preserved",
+      );
+      check(
+        before.some(([name]) => name === "capturedOwner"),
+        "named owner frame preserved",
+      );
+      check(
         api.installTrace(
           owner,
           () => {
@@ -521,9 +548,5 @@ try {
 }
 const bytes = Buffer.from(`${JSON.stringify(result)}\n`);
 if (bytes.length > 32768) throw new Error("probe record exceeds 32 KiB");
-for (let offset = 0; offset < bytes.length;) {
-  const size = writeSync(1, bytes, offset, bytes.length - offset);
-  if (size <= 0) throw new Error("stdout write failed");
-  offset += size;
-}
+writeAll(1, bytes);
 if (!result.complete || result.failures.length) process.exitCode = 1;

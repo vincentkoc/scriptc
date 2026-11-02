@@ -30,7 +30,10 @@ static Local<Array> Frames(Isolate* isolate, Local<StackTrace> trace) {
   Local<Array> result = Array::New(isolate, count);
   for (int i = 0; i < count; ++i) {
     Local<StackFrame> frame = trace->GetFrame(isolate, i);
-    Local<Value> fields[] = {frame->GetFunctionName(),
+    Local<String> name = frame->GetFunctionName();
+    // Unnamed frames return an empty handle, which Array::New cannot consume.
+    if (name.IsEmpty()) name = String::Empty(isolate);
+    Local<Value> fields[] = {name,
                             Integer::New(isolate, frame->GetLineNumber()),
                             Integer::New(isolate, frame->GetColumn())};
     result->Set(context, i, Array::New(isolate, fields, 3)).Check();

@@ -140,11 +140,12 @@ jobs:
               raise InterruptedError("workflow interrupted")
           signal.signal(signal.SIGTERM, interrupted)
           signal.signal(signal.SIGINT, interrupted)
-          def validate_probe(row, kind, mode):
+          def validate_probe(row, kind, mode, stderr):
               assert isinstance(row["v8"], str) and row["v8"], "V8 readback"
               values = ["undefined", "null", "false", "zero", "negative-zero", "nan", "bigint",
                         "symbol", "object", "array", "function"]
               if kind == "stock":
+                  assert stderr == b"", "stock stderr"
                   assert row["schema"] == "scriptc.lazy-stack-oracle.v1", "stock schema"
                   assert row["assertions"] == (148 if mode == "inspector" else 147), "stock assertion inventory"
                   names = ["recursive", "setter-read", "recapture", "throw", "setter-throw", "recapture-throw",
@@ -156,13 +157,16 @@ jobs:
                       "disabled": mode != "plain", "disconnected": mode != "plain"}, "stock inspector lifecycle"
               else:
                   assert kind == "api" and row["schema"] == "scriptc.lazy-stack-api.v1", "API schema"
-                  assert row["assertions"] == 184 and row["preexistingOverflowPermission"] == "source-reviewed-only", "API assertion inventory/limit"
+                  assert row["assertions"] == 186 and row["preexistingOverflowPermission"] == "source-reviewed-only", "API assertion inventory/limit"
                   names = ["recursive", "setter-read", "recapture", "reinstall", "throw", "setter-throw", "recapture-throw"]
                   for value in [*values, "self"]: names.extend(["returned-" + value, "assigned-" + value])
                   names.extend(["borrowed-holder", "nonextensible", "nonconfigurable", "unsupported-proxy-target",
                       "revoked-formatter-retries", "strict-sloppy-bound-proxy-realms", "global-holder",
                       "ordinary-formatter-recursion-guard", "overflow-throws-without-cache", "termination-without-cache",
                       "own-detailed-trace", "gc-format", "gc-setter", "gc-recapture", "gc-reinstall", "gc-owner-drop"])
+                  expected_progress = "".join("lazy-stack-api " + event + " " + name + "\n"
+                      for name in ["addon-load", *names] for event in ("begin", "end")).encode()
+                  assert len(stderr) <= 16384 and stderr == expected_progress, "exact bounded API progress"
               assert [case["name"] for case in row["cases"]] == names, "exact ordered case inventory"
           before = {}
           try:
@@ -263,11 +267,11 @@ jobs:
                       out = run(label, [binary, *flags, script, *extra, mode, version], tree, 30)
                       raw = out.read_bytes()
                       assert len(raw) <= 32768 and raw.endswith(b"\n") and raw.count(b"\n") == 1, "one JSON record"
-                      assert (proof / (label + ".stderr.log")).read_bytes() == b"", "probe stderr"
+                      stderr = (proof / (label + ".stderr.log")).read_bytes()
                       row = json.loads(raw)
                       assert row["complete"] is True and row["failures"] == [] and row["node"] == "v" + version and row["mode"] == mode, "probe assertions"
                       assert row["binarySha256"] == digest(binary) and row["fixtureSha256"] == digest(script), "executed input hashes"
-                      validate_probe(row, kind, mode)
+                      validate_probe(row, kind, mode, stderr)
                       if kind == "api": assert row["addonSha256"] == digest(addon), "loaded addon hash"
                       summary["cells"].append({"name": label, "node": row["node"], "v8": row["v8"], "cases": len(row["cases"]), "assertions": row["assertions"]})
               summary["outputsAfter"] = {name: entry(path) for name, path in outputs.items()}
