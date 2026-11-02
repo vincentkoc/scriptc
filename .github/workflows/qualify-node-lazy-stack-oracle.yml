@@ -1,0 +1,169 @@
+name: Qualify stock Node lazy stack oracle
+
+on:
+  push:
+    branches: [feat/libnode-lazy-stack-owner-20261102]
+    paths:
+      - packages/libnode-common/test/lazy-stack-oracle.mjs
+      - .github/workflows/qualify-node-lazy-stack-oracle.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-lazy-stack-oracle
+  cancel-in-progress: false
+
+jobs:
+  oracle:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        node: ["24.22.0", "24.22.1"]
+        mode: [plain, inspector, inspector-zero]
+    env:
+      ORACLE_VERSION: ${{ matrix.node }}
+      ORACLE_MODE: ${{ matrix.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run one fresh bounded oracle process
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import signal
+          import subprocess
+          import time
+
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          proof = Path(os.environ["RUNNER_TEMP"]) / "node-lazy-stack-oracle"
+          proof.mkdir(mode=0o700)
+          fixture = root / "packages/libnode-common/test/lazy-stack-oracle.mjs"
+          workflow = root / ".github/workflows/qualify-node-lazy-stack-oracle.yml"
+          binary = Path(shutil.which("node")).resolve(strict=True)
+          version, mode = os.environ["ORACLE_VERSION"], os.environ["ORACLE_MODE"]
+          def digest(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(source, "sha256").hexdigest()
+          def git(*args):
+              return subprocess.check_output(["git", *args], cwd=root, timeout=10)
+          summary = {
+              "schema": "scriptc.lazy-stack-oracle-receipt.v1",
+              "source": os.environ["GITHUB_SHA"], "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "version": version, "mode": mode,
+              "argv": ["<node>", str(fixture.relative_to(root)), mode, version],
+              "diagnosticComplete": False, "runtimeQualification": False,
+              "cleanupIntervention": False, "groupDrained": False, "streamsComplete": False,
+          }
+          child = None
+          stdout = stderr = b""
+          try:
+              assert git("rev-parse", "HEAD").decode().strip() == summary["source"], "source SHA"
+              assert git("status", "--porcelain") == b"", "clean checkout"
+              before = {"fixture": digest(fixture), "workflow": digest(workflow), "node": digest(binary)}
+              summary["inputsBefore"] = before
+              for path in (fixture, workflow):
+                  assert git("show", "HEAD:" + str(path.relative_to(root))) == path.read_bytes(), "committed input bytes"
+                  shutil.copyfile(path, proof / path.name)
+              env = {key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR", "LANG") if key in os.environ}
+              env.update({"TZ": "UTC", "NO_COLOR": "1"})
+              child = subprocess.Popen([str(binary), str(fixture), mode, version], cwd=root, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+              group = os.getpgid(child.pid)
+              assert group == child.pid and group > 1 and group != os.getpgrp(), "owned process group"
+              summary["pid"] = child.pid
+              summary["pgid"] = group
+              try:
+                  stdout, stderr = child.communicate(timeout=30)
+              except subprocess.TimeoutExpired:
+                  summary["cleanupIntervention"] = True
+                  os.killpg(group, signal.SIGKILL)
+                  stdout, stderr = child.communicate(timeout=5)
+                  raise AssertionError("oracle deadline exceeded")
+              summary["exitCode"] = child.returncode
+              summary["streamsComplete"] = True
+              assert len(stdout) <= 32768 and len(stderr) <= 32768, "bounded streams"
+              assert child.returncode == 0 and stderr == b"", "ordinary clean exit"
+              assert stdout.endswith(b"\n") and stdout.count(b"\n") == 1, "one complete JSON record"
+              result = json.loads(stdout)
+              assert result["schema"] == "scriptc.lazy-stack-oracle.v1", "oracle schema"
+              assert result["mode"] == mode and result["node"] == "v" + version, "mode/version"
+              assert isinstance(result["v8"], str) and result["v8"], "V8 readback"
+              assert result["fixtureSha256"] == before["fixture"] and result["binarySha256"] == before["node"], "executed bytes"
+              assert result["complete"] is True and result["failures"] == [], "oracle assertions"
+              assert result["assertions"] == (148 if mode == "inspector" else 147), "assertion inventory"
+              names = ["recursive", "setter-read", "recapture", "throw", "setter-throw", "recapture-throw",
+                       "borrowed-get", "borrowed-set", "get-empty"]
+              for value in ("undefined", "null", "false", "zero", "negative-zero", "nan", "bigint",
+                            "symbol", "object", "array", "function", "error-self"):
+                  names.extend(["assigned-" + value, "returned-" + value])
+              names.extend(["nonextensible", "nonconfigurable"])
+              assert [row["name"] for row in result["cases"]] == names, "exact ordered case inventory"
+              expected_inspector = {"enabled": mode != "plain", "size": None if mode == "plain" else (32 if mode == "inspector" else 0),
+                                    "disabled": mode != "plain", "disconnected": mode != "plain"}
+              assert result["inspector"] == expected_inspector, "acknowledged inspector lifecycle"
+              summary["oracle"] = {"cases": len(names), "assertions": result["assertions"], "node": result["node"], "v8": result["v8"]}
+          except Exception as error:
+              summary["error"] = type(error).__name__ + ": " + str(error).replace(str(root), "<source>").replace(str(binary), "<node>")
+          finally:
+              if child is not None:
+                  try:
+                      os.killpg(child.pid, 0)
+                  except ProcessLookupError:
+                      summary["groupDrained"] = True
+                  else:
+                      summary["cleanupIntervention"] = True
+                      os.killpg(child.pid, signal.SIGKILL)
+                      try:
+                          stdout, stderr = child.communicate(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          summary["error"] = "cleanup stream deadline exceeded"
+                      deadline = time.monotonic() + 2
+                      while time.monotonic() < deadline:
+                          try:
+                              os.killpg(child.pid, 0)
+                          except ProcessLookupError:
+                              summary["groupDrained"] = True
+                              break
+                          time.sleep(0.05)
+              try:
+                  after = {"fixture": digest(fixture), "workflow": digest(workflow), "node": digest(binary)}
+                  summary["inputsAfter"] = after
+                  summary["inputsUnchanged"] = after == summary.get("inputsBefore") and git("status", "--porcelain") == b""
+              except Exception:
+                  summary["inputsUnchanged"] = False
+              for name, data in (("stdout.json", stdout), ("stderr.log", stderr)):
+                  (proof / name).write_bytes(data)
+                  summary[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+              summary["diagnosticComplete"] = ("error" not in summary and "oracle" in summary
+                  and summary["inputsUnchanged"] and summary["groupDrained"] and summary["streamsComplete"]
+                  and not summary["cleanupIntervention"])
+              (proof / "summary.json").write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n")
+              manifest = [{"path": path.name, "bytes": path.stat().st_size, "sha256": digest(path)}
+                          for path in sorted(proof.iterdir())]
+              (proof / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+              print(json.dumps(summary, sort_keys=True))
+          if not summary["diagnosticComplete"]:
+              raise SystemExit(1)
+      - name: Retain oracle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-lazy-stack-oracle-${{ matrix.node }}-${{ matrix.mode }}
+          path: ${{ runner.temp }}/node-lazy-stack-oracle
+          if-no-files-found: error
+          retention-days: 7
