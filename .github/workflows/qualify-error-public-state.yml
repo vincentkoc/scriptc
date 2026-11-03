@@ -25,7 +25,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 15
+          fetch-depth: 16
           path: candidate
       - uses: actions/checkout@v4
         with:
@@ -382,7 +382,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 15
+          fetch-depth: 16
           path: candidate
       - uses: pnpm/action-setup@v4
         with:
@@ -757,7 +757,7 @@ jobs:
                   assert.ok(allDrained(),"test custody unresolved");
                 }
               }
-              assert.equal(report.observations.length,6);assert.ok(report.observations.every(r=>r.accepted));report.preCleanupComplete=true;
+              assert.equal(report.observations.length,2*caseSpecs.length);assert.ok(report.observations.every(r=>r.accepted));report.preCleanupComplete=true;
             }catch(error){report.error=scrub(error.stack??error);process.stderr.write(report.error+"\n");}
             finally{
               try{

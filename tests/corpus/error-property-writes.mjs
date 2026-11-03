@@ -156,7 +156,9 @@ restoreStack(deletedSubclass);
 /** @param {any} error */
 function throwingStackSetter(error) {
   error.stack = "original cache";
+  /** @type {any} */
   const nativeGetter = Object.getOwnPropertyDescriptor(error, "stack").get;
+  if (typeof nativeGetter !== "function") throw new Error("missing native stack getter");
   Object.defineProperty(error, "stack", {
     get() { return "custom stack"; },
     set(value) { console.log("stack setter receiver", this === error); throw sentinel; },

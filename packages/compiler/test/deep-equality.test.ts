@@ -13,6 +13,8 @@ test("native deep equality keeps opaque values and accessors explicitly refused"
       entry,
       `
 const { isDeepStrictEqual: equal } = require("node:util");
+/** @param {any} value */
+function dyn(value) { return value; }
 function attempt(a, b) {
   try { console.log(equal(a, b)); }
   catch (error) { console.log(error.name, error.code, error.message); }
@@ -28,7 +30,7 @@ attempt({ error: new Error("fail") }, { error: new Error("fail") });
 const sameError = new Failure("same");
 attempt(sameError, sameError);
 let getterCalls = 0;
-Object.defineProperty(sameError, "extra", {
+Object.defineProperty(dyn(sameError), "extra", {
   get() { getterCalls++; throw new Error("must not read"); },
   enumerable: true,
 });

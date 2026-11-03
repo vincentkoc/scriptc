@@ -29,10 +29,14 @@ try {
 
 /** @param {any} value */
 function inspectOverrides(value) {
-  value[NodeInspectSymbol] = function() { return `own: ${this.message}`; };
+  Object.defineProperty(value, NodeInspectSymbol, {
+    value: function() { return `own: ${this.message}`; },
+    writable: true,
+    configurable: true,
+  });
   console.log(util.inspect(value));
   const beforeShadow = inspections;
-  value[NodeInspectSymbol] = undefined;
+  Object.defineProperty(value, NodeInspectSymbol, { value: undefined });
   util.inspect(value);
   console.log("own undefined shadows", inspections === beforeShadow);
   delete value[NodeInspectSymbol];
