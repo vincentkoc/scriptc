@@ -114,9 +114,11 @@ test("runtime Error roots refuse publication before walking private state", () =
     ],
   };
   const llvm = emitLlvmModule(errors, { pointerBits: 64 });
-  const body = walker(llvm);
+  const body = llvm.split(/^define /m).find((fn) => fn.includes("; publish class Node")) ?? "";
   expect(body).not.toBe("");
   expect(body).not.toContain("@scr_pub_dyn_fn");
   expect(body).not.toContain("getelementptr");
+  expect(body).toMatch(/call void @sc_pub_\d+\(ptr %o, ptr %ctx\)/);
+  expect(llvm).toContain("call void @scr_pub_refuse_at");
   expect(llvm).toContain("Cannot publish a Error object");
 });

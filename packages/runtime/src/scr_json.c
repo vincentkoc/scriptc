@@ -28,7 +28,6 @@
 static SCR_TL ScrDyn *scr_builtin_object_prototype;
 static ScrErrorState *scr_error_state_of_value(const ScrDyn *value);
 static bool scr_error_state_adopted(const ScrErrorState *state);
-static bool scr_error_builtin_capsule(const ScrDyn *value);
 static ScrDyn *scr_error_capsule_view(const ScrDyn *capsule);
 static void scr_error_capsule_bind_view(const ScrDyn *capsule, ScrDyn *view);
 
@@ -2775,7 +2774,10 @@ ScrDyn *scr_dyn_get_prototype(ScrDyn *object) {
   if (object == scr_builtin_object_prototype) return scr_dyn_new_null();
   if (object->kind == SCR_DYN_OBJ && scr_dyn_error_view_on_error_prototype(object)) return scr_dyn_error_prototype();
   if (scr_dyn_class_reflection_fence(object)) return NULL;
-  if (object->kind == SCR_DYN_TYPED_REF && strncmp(object->v.typed_ref.type_key, "object:", 7)) {
+  /* Builtin Errors now use object capsules; their owned property view keeps
+   * prototype changes, unlike the fixed compiled-class prototype surface. */
+  if (object->kind == SCR_DYN_TYPED_REF &&
+      (strncmp(object->v.typed_ref.type_key, "object:", 7) || scr_dyn_builtin_error_capsule(object))) {
     ScrDyn *view = scr_dyn_typed_ref_materialize(object);
     if (!view) return NULL;
     ScrDyn *result = scr_dyn_get_prototype(view);
@@ -3043,7 +3045,7 @@ static bool scr_dyn_class_integrity(ScrDyn *object, ScrDyn *(*operation)(ScrDyn 
       object->v.typed_ref.type_key_len < 7 || memcmp(object->v.typed_ref.type_key, "object:", 7) != 0)
     return false;
   ScrDyn *view = scr_dyn_typed_ref_materialize(object);
-  bool word = scr_error_builtin_capsule(object);
+  bool word = scr_dyn_builtin_error_capsule(object);
   if (!word && !scr_exc_pending()) {
     scr_class_integrity_committed = false;
     scr_dyn_typed_ref_commit(object);
@@ -5952,7 +5954,8 @@ static bool scr_dyn_instanceof_object(const ScrDyn *value) {
       }
     } else if (current->kind == SCR_DYN_OBJ || current->kind == SCR_DYN_ARR ||
                (current->kind == SCR_DYN_TYPED_REF &&
-                strncmp(current->v.typed_ref.type_key, "object:", 7) != 0)) {
+                (strncmp(current->v.typed_ref.type_key, "object:", 7) != 0 ||
+                 scr_dyn_builtin_error_capsule(current)))) {
       next = scr_dyn_get_prototype(current);
       if (!next) {
         scr_dyn_release(current);
@@ -5985,7 +5988,8 @@ static bool scr_dyn_instanceof_function(const ScrDyn *value) {
     bool unset = !table->prototype && !table->null_proto;
     scr_dyn_release(table);
     if (unset) return true;
-  } else if (value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR) {
+  } else if (value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR ||
+             scr_dyn_builtin_error_capsule(value)) {
     current = scr_dyn_get_prototype((ScrDyn *)value);
     if (!current) return false; /* the read threw: pending */
   }
@@ -6004,7 +6008,8 @@ static bool scr_dyn_instanceof_function(const ScrDyn *value) {
         scr_dyn_release(current);
         return true;
       }
-    } else if (current->kind == SCR_DYN_OBJ || current->kind == SCR_DYN_ARR) {
+    } else if (current->kind == SCR_DYN_OBJ || current->kind == SCR_DYN_ARR ||
+               scr_dyn_builtin_error_capsule(current)) {
       next = scr_dyn_get_prototype(current);
       if (!next) {
         scr_dyn_release(current);
@@ -6062,14 +6067,15 @@ bool scr_bytes_instanceof_at(const ScrDyn *value, const ScrDyn *callee, const Sc
     ScrDyn *prototype = scr_dyn_reflect_get((ScrDyn *)callee, key, (ScrDyn *)callee);
     scr_dyn_release(key);
     if (!prototype) return false; /* the read threw: pending */
-    if (prototype->kind == SCR_DYN_OBJ) {
+    if (prototype->kind == SCR_DYN_OBJ || scr_dyn_builtin_error_capsule(prototype)) {
       bool found = false;
       /* A handle of a class (scr_dyn_handle_class.c) has the class's
        * prototype. */
       ScrDyn *handle_prototype = value->kind == SCR_DYN_HANDLE && scr_dyn_handle_class_ops
                                      ? scr_dyn_handle_class_ops->prototype_of(value)
                                      : NULL;
-      if (handle_prototype || value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR || value->kind == SCR_DYN_FUNC) {
+      if (handle_prototype || value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR ||
+          value->kind == SCR_DYN_FUNC || scr_dyn_builtin_error_capsule(value)) {
         ScrDyn *current = handle_prototype ? handle_prototype : scr_dyn_get_prototype((ScrDyn *)value);
         while (current && current->kind != SCR_DYN_NULL) {
           if (current == prototype) {
@@ -8350,7 +8356,8 @@ ScrDyn *scr_dyn_class_base_prototype(ScrDyn *constructor) {
   }
   ScrDyn *prototype = scr_dyn_fn_get(constructor, "prototype", 9);
   if (!prototype) return NULL;
-  if (prototype->kind == SCR_DYN_OBJ || prototype->kind == SCR_DYN_NULL) return prototype;
+  if (prototype->kind == SCR_DYN_OBJ || prototype->kind == SCR_DYN_NULL ||
+      scr_dyn_builtin_error_capsule(prototype)) return prototype;
   scr_dyn_release(prototype);
   static const char message[] = "This constructor prototype has no native class lowering";
   scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
@@ -11652,7 +11659,7 @@ static void scr_error_public_commit(void *ptr, const ScrDyn *view) {
   }
 }
 
-static bool scr_error_builtin_capsule(const ScrDyn *value) {
+bool scr_dyn_builtin_error_capsule(const ScrDyn *value) {
   return value->kind == SCR_DYN_TYPED_REF &&
          value->v.typed_ref.materialize == scr_error_public_view;
 }

@@ -53,3 +53,18 @@ const named = { kind: "named" };
 const movedNamed = new Error();
 Object.setPrototypeOf(movedNamed, named);
 console.log(Object.getPrototypeOf(movedNamed) === named, Object.getPrototypeOf(movedNamed).kind);
+
+const detached = Object.setPrototypeOf(new Error("detached"), null);
+console.log("null", Object.getPrototypeOf(detached) === null, detached instanceof Object);
+const callable = Object.setPrototypeOf(new Error("callable"), function () {});
+console.log("function", callable instanceof Function, callable instanceof Object);
+function Parent() {}
+const parented = Object.setPrototypeOf(new Error("parented"), Parent.prototype);
+console.log("parent", parented instanceof Parent);
+const inherited = Object.create(callable);
+console.log("inherited", inherited instanceof Function);
+function ErrorPrototype() {}
+ErrorPrototype.prototype = new Error("constructor prototype");
+const child = Object.create(ErrorPrototype.prototype);
+const instanceOf = (value, Constructor) => value instanceof Constructor;
+console.log("error as prototype", child instanceof ErrorPrototype, instanceOf(child, ErrorPrototype));

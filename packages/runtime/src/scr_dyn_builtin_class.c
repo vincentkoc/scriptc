@@ -1555,7 +1555,7 @@ static bool bc_chain_has(ScrDyn *value, ScrDyn *prototype) {
 #endif
   {
     if (value->kind != SCR_DYN_OBJ && value->kind != SCR_DYN_ARR && value->kind != SCR_DYN_FUNC &&
-        value->kind != SCR_DYN_PROXY)
+        value->kind != SCR_DYN_PROXY && !scr_dyn_builtin_error_capsule(value))
       return false;
     current = scr_dyn_get_prototype(value);
   }
@@ -1601,9 +1601,10 @@ bool scr_dyn_function_instanceof(ScrDyn *value, ScrDyn *callee) {
   if (!prototype) return false;
   bool found = false;
   if (prototype->kind == SCR_DYN_OBJ || prototype->kind == SCR_DYN_ARR || prototype->kind == SCR_DYN_FUNC ||
-      prototype->kind == SCR_DYN_PROXY) {
+      prototype->kind == SCR_DYN_PROXY || scr_dyn_builtin_error_capsule(prototype)) {
     found = bc_chain_has(value, prototype);
-  } else if (value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR || value->kind == SCR_DYN_FUNC) {
+  } else if (value->kind == SCR_DYN_OBJ || value->kind == SCR_DYN_ARR || value->kind == SCR_DYN_FUNC ||
+             scr_dyn_builtin_error_capsule(value)) {
     static const char message[] = "Function has non-object prototype 'undefined' in instanceof check";
     scr_throw_error_msg(SCR_ERR_TYPE, message, sizeof message - 1);
   }

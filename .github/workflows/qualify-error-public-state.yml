@@ -364,3 +364,462 @@ jobs:
           path: ${{ runner.temp }}/error-public-state-proof
           if-no-files-found: error
           retention-days: 1
+
+  native:
+    needs: focused
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: macos-15
+    timeout-minutes: 80
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        working-directory: candidate
+    env:
+      PROOF_CAPACITY_NAME: error-public-native-capacity
+      DIAGNOSTIC_SOURCE: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 8
+          path: candidate
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+          cache-dependency-path: candidate/pnpm-lock.yaml
+      - name: Admit disk capacity before LLVM
+        shell: python
+        run: |
+          probe = r"""import json
+          import os
+          import pathlib
+          import sys
+
+          phase = sys.argv[1]
+          minimum_gib, minimum_inodes = {
+              "pre-llvm": (32, 1000000),
+              "post-llvm": (16, 500000),
+              "pre-proof": (16, 250000),
+          }[phase]
+          owner = {
+              "workflow": os.environ["GITHUB_SHA"],
+              "run": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "source": os.environ.get("CALLBACK_SOURCE") or os.environ["DIAGNOSTIC_SOURCE"],
+          }
+          devices = {}
+          errors = {}
+          for label, path in {
+              "root": "/",
+              "workspace": os.environ["GITHUB_WORKSPACE"],
+              "runnerTemp": os.environ["RUNNER_TEMP"],
+          }.items():
+              try:
+                  info = os.statvfs(path)
+                  device = str(os.stat(path).st_dev)
+                  row = devices.setdefault(device, {"device": device, "paths": [], "measurements": []})
+                  row["paths"].append(label)
+                  row["measurements"].append({
+                      "path": label,
+                      "availableBytes": info.f_bavail * info.f_frsize,
+                      "availableInodes": info.f_favail,
+                  })
+              except OSError as error:
+                  errors[label] = {"type": type(error).__name__, "errno": error.errno}
+          for row in devices.values():
+              row["availableBytes"] = min(item["availableBytes"] for item in row["measurements"])
+              row["availableInodes"] = min(item["availableInodes"] for item in row["measurements"])
+              row["admitted"] = row["availableBytes"] >= minimum_gib * 1024 ** 3 and row["availableInodes"] >= minimum_inodes
+          report = {
+              **owner, "phase": phase,
+              "imageOS": os.environ.get("ImageOS"),
+              "imageVersion": os.environ.get("ImageVersion"),
+              "runnerOS": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "budgetKind": "conservative execution budget, not a measured peak",
+              "minimumBytes": minimum_gib * 1024 ** 3,
+              "minimumInodes": minimum_inodes,
+              "devices": list(devices.values()), "measurementErrors": errors,
+              "admitted": not errors and bool(devices) and all(row["admitted"] for row in devices.values()),
+              "toolsRemoved": False,
+          }
+          text = json.dumps(report, indent=2) + "\n"
+          print(text, flush=True)
+          capacity_dir = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"])
+          os.umask(0o077)
+          if phase == "pre-llvm":
+              capacity_dir.mkdir(mode=0o700)
+          else:
+              previous = json.loads((capacity_dir / "pre-llvm.json").read_text())
+              assert {key: previous[key] for key in owner} == owner, "capacity receipt owner mismatch"
+          with (capacity_dir / (phase + ".json")).open("x") as receipt:
+              receipt.write(text)
+          if not report["admitted"]:
+              print("[proof-capacity] FAILED (exit 1): disk or inode admission refused", file=sys.stderr)
+              raise SystemExit(1)
+          """
+          import os, pathlib, sys
+          sys.argv = ["capacity.py", "pre-llvm"]
+          exec(compile(probe, "capacity.py", "exec"))
+          payload = pathlib.Path(os.environ["RUNNER_TEMP"], os.environ["PROOF_CAPACITY_NAME"], "capacity.py")
+          with payload.open("x") as script:
+              script.write(probe)
+      - name: Install canonical macOS LLVM
+        run: brew install llvm@22
+      - name: Recheck disk capacity after LLVM
+        run: |
+          test "$(shasum -a 256 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" | cut -d ' ' -f 1)" = "13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9"
+          python3 "$RUNNER_TEMP/$PROOF_CAPACITY_NAME/capacity.py" post-llvm
+      - name: Prepare owned native runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/error-public-native.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync, chmodSync, readlinkSync } from "node:fs";
+          import { join, relative, dirname, resolve } from "node:path";
+          import { pathToFileURL, fileURLToPath } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self=fileURLToPath(import.meta.url),root=process.cwd();
+          const out=join(process.env.RUNNER_TEMP,"error-public-native-proof"),work=join(process.env.RUNNER_TEMP,"error-public-native-work");
+          const trees={candidate:root};
+          const baselineRoot=resolve(root,"../baseline"),baselineHead="741731656c0615b33a237354d26dc05043ebae3f";
+          const owner={workflow:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,source:process.env.GITHUB_SHA,platform:process.platform};
+          const CAP=16*1024*1024;
+          const digest=bytes=>createHash("sha256").update(bytes).digest("hex"),hash=path=>digest(readFileSync(path));
+          const json=path=>JSON.parse(readFileSync(path,"utf8"));
+          const save=(name,value)=>writeFileSync(join(out,name),JSON.stringify(value,null,2)+"\n");
+          const record=path=>({path:relative(out,path),bytes:statSync(path).size,sha256:hash(path)});
+          const scrub=value=>String(value).split(root).join("<source>").split(process.env.RUNNER_TEMP).join("<runner-temp>");
+          const capture=(command,args=[],cwd=root)=>{const r=spawnSync(command,args,{cwd,encoding:"utf8",timeout:30000,maxBuffer:CAP});assert.equal(r.error,undefined);assert.equal(r.status,0,command+": "+r.stderr);return r.stdout.trim();};
+          function verifyWorkOwner(){const st=lstatSync(work);assert.ok(st.isDirectory()&&!st.isSymbolicLink());assert.equal(st.mode&0o777,0o700);assert.deepEqual(json(join(work,"owner.json")),owner);}
+          function sourceAt(dir,head){
+            assert.equal(capture("git",["rev-parse","HEAD"],dir),head);
+            assert.equal(capture("git",["status","--porcelain=v1","--untracked-files=all"],dir),"");
+            const tree=capture("git",["ls-tree","-rz","--full-tree","HEAD"],dir);
+            const disk=tree.split("\0").filter(Boolean).map(row=>{
+              const tab=row.indexOf("\t"),metadata=row.slice(0,tab),path=row.slice(tab+1),mode=metadata.split(" ")[0];
+              assert.ok(["100644","100755","120000"].includes(mode),"unsupported source entry");
+              const p=join(dir,path),st=lstatSync(p);
+              if(mode==="120000"){assert.ok(st.isSymbolicLink());return {path,mode,target:readlinkSync(p)};}
+              assert.ok(st.isFile()&&!st.isSymbolicLink());return {path,mode,bytes:st.size,sha256:hash(p)};
+            });
+            return {head,treeSha256:digest(tree),disk};
+          }
+          const source=()=>sourceAt(root,owner.source);
+          function files(base,prefix=""){return readdirSync(base,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name)).flatMap(item=>{const p=join(base,item.name),name=prefix+item.name,st=lstatSync(p);assert.ok(!st.isSymbolicLink());if(st.isDirectory())return files(p,name+"/");assert.ok(st.isFile());return [{path:name,bytes:st.size,sha256:hash(p)}];});}
+          function tool(command,args=["--version"]){const path=realpathSync(capture("/bin/sh",["-c",'command -v "$1"',"identity",command]));const result=spawnSync(command,args,{encoding:"utf8",timeout:30000,maxBuffer:CAP});assert.equal(result.error,undefined);assert.equal(result.status,0);return {path,sha256:hash(path),version:(result.stdout+result.stderr).trim()};}
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function readOutput(step,stream){return readFileSync(join(out,step[stream].path),"utf8");}
+          let deadline;
+          function commandBudget(seconds,now=Date.now()){assert.ok(Number.isInteger(seconds)&&seconds>0);const remaining=Math.floor((deadline-now-120000)/1000);assert.ok(remaining>0,"reserved drain/readback budget reached");return Math.min(seconds,remaining);}
+          async function checked(label,command,args,seconds,env={}){const row=await run(label,command,args,commandBudget(seconds),env);requireSuccess(row);return row;}
+          function headArgs(label,command,args){return ["-c",'cd "$1" && shift && exec "$@"',"owned-head",trees[label],command,...args];}
+          async function headRun(label,id,command,args,seconds,env={}){return checked(label+"-"+id,"/bin/sh",headArgs(label,command,args),seconds,env);}
+          function environment(id){const dir=join(work,id);mkdirSync(dir,{mode:0o700});for(const n of ["tmp","cache","xdg"])mkdirSync(join(dir,n),{mode:0o700});return {TMPDIR:join(dir,"tmp"),XDG_CACHE_HOME:join(dir,"xdg"),SCRIPTC_CACHE_DIR:join(dir,"cache"),SCRIPTC_TEST_STABLE_TOOLCHAIN:"1"};}
+          function clearBuildOverrides(env){const removed=[];for(const key of Object.keys(env)){if(/^SCRIPTC_(?:SAN|RUNTIME_PROFILE|NATIVE_PROFILE|NATIVE_LAYOUT|LLVM_CODEGEN|LLVM_PACKAGE|LLVM_PROFILE|LLVM_THINLTO|RUNTIME_BITCODE|RUNTIME_PACK|CPU_DISPATCH|TEST_RUNTIME_SRC_DIR|LINKER|DSYMUTIL|CHECKER)(?:_|$)/.test(key)){delete env[key];removed.push(key);}}return {removed:removed.sort(),runtimePack:"default per-source resolution only",helper:"same exact admitted input and binary only",profiles:"canonical committed profiles; no environment override",valuesRetained:false};}
+
+
+          function tools(){const llvm=join(capture("brew",["--prefix","llvm@22"]),"bin","llvm-config"),sdk=capture("xcrun",["--sdk","macosx","--show-sdk-path"]);return {node:tool(process.execPath),pnpm:tool("pnpm"),llvm:tool(llvm),clang:tool("clang"),ld:tool("ld",["-v"]),nm:tool("nm"),cmake:tool("cmake"),ninja:tool("ninja"),sdk:{path:sdk,version:capture("xcrun",["--sdk","macosx","--show-sdk-version"]),settingsSha256:hash(join(sdk,"SDKSettings.json"))},xcode:capture("xcodebuild",["-version"]),imageOS:process.env.ImageOS,imageVersion:process.env.ImageVersion};}
+
+          const target="darwin-arm64";
+          const corpusCases=["error-property-writes.mjs","6020-class-extends-function-constructor.js","8078-instanceof-object-function.cjs","6454-constructor-function-stream-bases.cjs","web-stream-fetch-interop.mjs","8115-error-prototype-identity.js","6530-error-subclass-header.ts","assert-throws-expected-values.cjs","2285-iferror-dyn.cjs","5546-fs-read-stream.cjs","7246-stream-construct.ts","5807-worker-error-values.ts","5808-worker-unhandled-rejections.ts","6415-error-code-dynamic-writes.ts","5916-dyn-error-stack-property.ts"];
+          const caseSpecs=[
+            {id:"ownership",file:"tests/harness/error-public-ownership.test.ts"},
+            {id:"consumers",file:"tests/harness/llvm-differential.test.ts",filter:" ("+corpusCases.map(x=>x.replace(/[\\^$.*+?()[\]{}|]/g,"\\$&")).join("|")+")$"},
+            {id:"foreign-errors",file:"tests/harness/node-island-handles.test.ts",filter:"^foreign Error identity "},
+          ];
+          function retain(path,name){const dest=join(out,name);mkdirSync(dirname(dest),{recursive:true});copyFileSync(path,dest);assert.equal(hash(dest),hash(path));return record(dest);}
+          function nativeFiles(){return ["packages/llvm-"+target+"/bin","packages/runtime-"+target+"/artifacts"].flatMap(p=>files(join(root,p)).map(row=>({...row,path:p+"/"+row.path}))).concat([{path:"packages/runtime-"+target+"/runtime-pack.json",sha256:hash(join(root,"packages/runtime-"+target+"/runtime-pack.json"))}]);}
+          function distFiles(){return ["packages/compiler/dist","packages/cli/dist"].flatMap(path=>files(join(root,path)).map(row=>({...row,path:path+"/"+row.path})));}
+          async function capacityAgain(id){return checked(id+"-capacity","python3",["-c","import json,os,sys; paths=['/',os.environ['GITHUB_WORKSPACE'],os.environ['RUNNER_TEMP']]; rows=[dict(path=p,availableBytes=os.statvfs(p).f_bavail*os.statvfs(p).f_frsize,availableInodes=os.statvfs(p).f_favail) for p in paths]; print(json.dumps(rows)); sys.exit(0 if all(r['availableBytes']>=16*1024**3 and r['availableInodes']>=250000 for r in rows) else 1)"],60);}
+          function verifyResults(spec,data,collection){
+            assert.ok(Array.isArray(collection)&&collection.length>0);
+            assert.equal(new Set(collection.map(r=>r.name)).size,collection.length);
+            assert.ok(collection.every(r=>relative(root,resolve(root,r.file))===spec.file));
+            if(spec.id==="consumers")assert.deepEqual(collection.map(r=>r.name.split(" > ").at(-1)).sort(),corpusCases.slice().sort());
+            if(spec.id==="ownership")assert.equal(collection.length,3);
+            if(spec.id==="foreign-errors")assert.ok(collection.length>=10,"foreign Error identity coverage missing");
+            assert.equal(data.success,true);assert.equal(data.testResults.length,1);
+            const suite=data.testResults[0];assert.equal(suite.status,"passed");assert.equal(suite.message,"");
+            const selected=new Set(collection.map(r=>r.name)),passed=[];
+            for(const row of suite.assertionResults){
+              const name=[...row.ancestorTitles,row.title].join(" > ");assert.deepEqual(row.failureMessages,[]);
+              if(selected.has(name)){assert.equal(row.status,"passed");passed.push(name);}
+              else assert.ok(["pending","skipped"].includes(row.status),"unexpected unselected execution");
+            }
+            assert.deepEqual(passed.sort(),[...selected].sort());
+            assert.equal(data.numFailedTests,0);assert.equal(data.numTodoTests,0);assert.equal(data.numPassedTests,selected.size);
+            assert.equal(data.numTotalTests,suite.assertionResults.length);
+            assert.equal(data.numPendingTests,suite.assertionResults.length-selected.size);
+            return {count:passed.length,names:passed,unselected:data.numPendingTests};
+          }
+          async function gate(spec,flavor,packRoot){
+            const id=flavor+"-"+spec.id,env={...environment(id),SCRIPTC_LIBNODE:packRoot,SCRIPTC_SAN:flavor==="san"?"1":"",SCRIPTC_TEST_WORKERS:"1",ASAN_OPTIONS:"detect_leaks=0:halt_on_error=1",UBSAN_OPTIONS:"halt_on_error=1"};
+            const args=[spec.file,...(spec.filter?["-t",spec.filter]:[])],collection=join(out,id+".collection.json"),result=join(out,id+".tests.json");
+            const row={id,flavor,case:spec.id,accepted:false};
+            try{
+              row.collect=await checked(id+"-collect","pnpm",["exec","vitest","list",...args,"--json="+collection],120,env);
+              row.execute=await checked(id+"-test","pnpm",["test",...args,"--reporter=verbose","--reporter=json","--outputFile="+result],900,env);
+              row.verdict=verifyResults(spec,json(result),json(collection));
+              row.collection=record(collection);row.result=record(result);row.accepted=true;
+            }catch(error){row.error=scrub(error.stack??error);}
+            return row;
+          }
+
+
+          async function main(){
+            delete process.env.FORCE_COLOR;
+            const report=json(join(out,"summary.json"));verifyWorkOwner();deadline=Date.now()+65*60*1000;
+            let prepared=false,packRoot,readLibnodePack;
+            try{
+              assert.deepEqual(source(),report.sourceBefore);report.toolsBefore=tools();
+              assert.equal(report.toolsBefore.node.version,"v24.22.1");assert.equal(report.toolsBefore.pnpm.version,"11.1.3");assert.equal(report.toolsBefore.llvm.version,"22.1.8");
+              report.environmentPolicy=clearBuildOverrides(process.env);report.commands=[];
+              const capacity=join(process.env.RUNNER_TEMP,process.env.PROOF_CAPACITY_NAME,"capacity.py");
+              assert.equal(hash(capacity),"13e2743a6dea3948dae2f0f8e25e03f0dd775a5968ca1471f4989684668764e9");
+              const buildEnv=environment("build");
+              report.commands.push(await checked("install","pnpm",["install","--frozen-lockfile"],300,buildEnv));
+              report.commands.push(await checked("build","pnpm",["build"],600,buildEnv));
+              report.commands.push(await checked("fixture-baselines","pnpm",["test:ts7","--baselines-only"],120,buildEnv));
+              save("summary.json",report);
+              const helperRelative="packages/llvm-"+target+"/bin/scriptc-llvm-codegen";
+              assert.equal(existsSync(join(root,helperRelative)),false);
+              assert.equal(existsSync(join(root,"packages/runtime-"+target+"/runtime-pack.json")),false);
+              report.commands.push(await checked("capacity-before-helper","python3",[capacity,"pre-proof"],60));
+              report.commands.push(await checked("helper-build","pnpm",["--filter","@scriptc/llvm-"+target,"build:native"],600,environment("helper-build")));
+              const version=await checked("helper-version",join(root,helperRelative),["version","--format=json"],30);
+              report.helper={sha256:hash(join(root,helperRelative)),bytes:statSync(join(root,helperRelative)).size,version:JSON.parse(readOutput(version,"stdout"))};
+              assert.equal(report.helper.version.ok,true);assert.equal(report.helper.version.llvm_version,"22.1.8");assert.equal(report.helper.version.protocol_version,"1");
+              assert.equal(report.helper.version.scriptc_package_version,json(join(root,"packages/llvm-"+target+"/package.json")).version);
+              report.commands.push(await capacityAgain("before-pack"));
+              report.commands.push(await checked("runtime-build","pnpm",["--filter","@scriptc/runtime-"+target,"build:native"],1200,environment("runtime-build")));
+              report.commands.push(await checked("verify-runtime",process.execPath,["packages/runtime-"+target+"/scripts/verify.mjs"],120));
+              report.nativeBefore=nativeFiles();report.runtimeManifest=retain(join(root,"packages/runtime-"+target+"/runtime-pack.json"),"runtime-pack.json");
+              const manifest=json(join(root,"packages/runtime-"+target+"/runtime-pack.json"));assert.equal(manifest.flavors.release.optimization,"-O2");
+              report.changedRuntimeUnits=manifest.flavors.release.runtime_units.filter(u=>["scr_error.c","scr_json.c","scr_assert.c","scr_message.c","scr_dyn_builtin_class.c","scr_webstreams.c"].includes(u.source));
+              assert.equal(report.changedRuntimeUnits.length,6);
+              for(const unit of report.changedRuntimeUnits)for(const variant of unit.variants){
+                const artifact=report.nativeBefore.find(r=>r.path==="packages/runtime-"+target+"/"+variant.path);
+                assert.ok(artifact);assert.equal(artifact.sha256,variant.sha256);assert.equal(artifact.bytes,variant.size);
+              }
+              ({readLibnodePack}=await import(pathToFileURL(join(root,"packages/compiler/dist/node-islands/libnode-pack.js"))));
+              assert.equal(capture("git",["diff","--name-only",baselineHead,"HEAD","--","packages/libnode-common","packages/runtime/src/scr_node_bridge.h"]),"","libnode inputs changed");
+              packRoot=join(work,"libnode");
+              report.commands.push(await checked("libnode-fetch",process.execPath,["packages/libnode-common/fetch-dev-pack.mjs","--out",packRoot],600,environment("libnode-fetch")));
+              const pack=readLibnodePack(packRoot,{verifyHashes:true});
+              assert.equal(pack.manifest.nodeVersion,"24.22.0");assert.equal(pack.manifest.bridgeAbi,10);assert.equal(pack.manifest.platform,"darwin");assert.equal(pack.manifest.arch,"arm64");
+              const pin=json(join(root,"packages/libnode-common/dev-pack.json"))[target];assert.equal(pin.headers.dir,"node-v24.22.0/include/node");
+              report.libnode={manifest:pack.manifest,files:files(packRoot),pin};retain(join(packRoot,"manifest.json"),"libnode-manifest.json");
+              process.env.SCRIPTC_LIBNODE=packRoot;
+              report.dist=distFiles();report.lock=hash(join(root,"node_modules/.pnpm/lock.yaml"));prepared=true;
+              for(const flavor of ["plain","san"]){
+                report.commands.push(await capacityAgain(flavor));
+                for(const spec of caseSpecs){
+                  const row=await gate(spec,flavor,packRoot);report.observations.push(row);save("summary.json",report);
+                  assert.ok(allDrained(),"test custody unresolved");if(row.error)throw new Error(row.id+": "+row.error);
+                }
+              }
+              assert.equal(report.observations.length,6);assert.ok(report.observations.every(r=>r.accepted));report.preCleanupComplete=true;
+            }catch(error){report.error=scrub(error.stack??error);process.stderr.write(report.error+"\n");}
+            finally{
+              try{
+                assert.ok(allDrained());assert.deepEqual(source(),report.sourceBefore);assert.ok(prepared,"native preparation incomplete");
+                await checked("verify-runtime-after",process.execPath,["packages/runtime-"+target+"/scripts/verify.mjs"],120);
+                assert.deepEqual(nativeFiles(),report.nativeBefore);assert.deepEqual(distFiles(),report.dist);
+                assert.equal(hash(join(root,"node_modules/.pnpm/lock.yaml")),report.lock);
+                assert.deepEqual(readLibnodePack(packRoot,{verifyHashes:true}).manifest,report.libnode.manifest);
+                assert.deepEqual(files(packRoot),report.libnode.files);assert.deepEqual(tools(),report.toolsBefore);
+                report.sourceAfter=source();report.inputsVerifiedAfter=true;
+              }catch(error){report.readbackError=scrub(error.stack??error);}
+              save("summary.json",report);
+            }
+            assert.equal(report.preCleanupComplete,true,"native proof incomplete");assert.equal(report.inputsVerifiedAfter,true);
+          }
+          function initialize(){
+            assert.equal(process.platform,"darwin");assert.equal(process.arch,"arm64");assert.equal(process.version,"v24.22.1");
+            mkdirSync(work,{mode:0o700});writeFileSync(join(work,"owner.json"),JSON.stringify(owner),{flag:"wx",mode:0o600});
+            mkdirSync(out,{mode:0o700});copyFileSync(self,join(out,"runner.mjs"));
+            const report={schema:"scriptc.error-public-native.v1",...owner,runnerSha256:hash(self),observations:[],preCleanupComplete:false,inputsVerifiedAfter:false,complete:false,runtimeQualification:false,productionAdoption:false,
+              scope:"Focused Darwin arm64 native Error ownership, consumer parity and foreign Error identity; V8 promotion disabled",
+              limitations:["Not the full plain/SAN release gate or a performance claim.","The C prerequisite owns baseline negative proof.","Compiled ownership checks distinguish emitted path admission from observed audited cleanup."]};
+            save("summary.json",report);
+            try{report.sourceBefore=source();save("summary.json",report);}catch(error){report.error=scrub(error.stack??error);save("summary.json",report);throw error;}
+          }
+          function finalize(){
+            const report=json(join(out,"summary.json"));report.cleanup={passed:false,retained:true};
+            try{
+              verifyWorkOwner();assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k=>[k,report[k]])),owner);
+              assert.ok(allDrained(),"owned process closure unresolved");assert.equal(hash(self),report.runnerSha256);assert.deepEqual(source(),report.sourceBefore);
+              rmSync(work,{recursive:true});report.cleanup={passed:true,retained:false};rmSync(self);
+            }catch(error){report.cleanup.error=scrub(error.stack??error);}
+            report.complete=report.preCleanupComplete===true&&report.inputsVerifiedAfter===true&&report.cleanup.passed;
+            save("summary.json",report);save("artifact-manifest.json",files(out).filter(r=>r.path!=="artifact-manifest.json"));
+            assert.equal(report.complete,true,"native ownership proof incomplete");
+          }
+          try{
+            if(process.argv[2]==="--init")initialize();
+            else if(process.argv[2]==="--finalize")finalize();
+            else if(process.argv[2]==="--child")await childMain();
+            else await main();
+          }catch(error){process.stderr.write(scrub(error.stack??error)+"\n[error-public-native] FAILED (exit 1)\n");process.exitCode=1;}
+
+          RUNNER
+          node "$RUNNER_TEMP/error-public-native.mjs" --init
+      - name: Check compiled ownership and consumer parity
+        run: |
+          ulimit -c 0
+          node "$RUNNER_TEMP/error-public-native.mjs"
+      - name: Verify custody and remove owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/error-public-native.mjs"
+          node "$RUNNER_TEMP/error-public-native.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: error-public-native
+          path: ${{ runner.temp }}/error-public-native-proof
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: error-public-native-capacity
+          path: ${{ runner.temp }}/error-public-native-capacity
+          if-no-files-found: error
+          retention-days: 1

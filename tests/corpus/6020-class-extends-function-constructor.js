@@ -25,3 +25,10 @@ console.log(square.describe(), square.perimeter());
 console.log(square instanceof Polygon);
 const shape = new Unnamed("triangle", 3);
 console.log(shape.describe(), Object.keys(shape).join(","));
+
+function ErrorBase() {}
+ErrorBase.prototype = new Error("base prototype");
+class WithErrorPrototype extends ErrorBase {}
+const inherited = new WithErrorPrototype();
+console.log(Object.getPrototypeOf(WithErrorPrototype.prototype) === ErrorBase.prototype,
+  inherited.message, inherited instanceof ErrorBase);

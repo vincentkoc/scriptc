@@ -63,3 +63,17 @@ console.log(reader instanceof Readable, reader instanceof Writable);
 console.log(through instanceof Transform, through instanceof Duplex, through instanceof Readable);
 console.log(out instanceof Writable, out instanceof Readable, both instanceof Readable);
 console.log(typeof Shift.prototype.constructor, Shift.prototype instanceof Duplex);
+
+const error = new Error("stream prototype");
+Object.setPrototypeOf(error, Through.prototype);
+console.log("error chain", error instanceof Through, error instanceof PassThrough,
+  error instanceof Transform, error instanceof Duplex, error instanceof Readable, error instanceof Stream);
+Object.setPrototypeOf(error, null);
+console.log("error null", error instanceof Through, error instanceof Readable, error instanceof Stream);
+function MissingPrototype() {}
+MissingPrototype.prototype = undefined;
+try {
+  console.log("invalid prototype", error instanceof MissingPrototype);
+} catch (caught) {
+  console.log("invalid prototype", caught instanceof TypeError);
+}

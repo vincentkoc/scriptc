@@ -5294,11 +5294,12 @@ bool scr_webstream_instanceof(ScrDyn *value, double kind) {
   ws_install();
   ScrDynHandleTag tag = ws_class_tag(kind);
   if (value->kind == SCR_DYN_HANDLE) return scr_dyn_handle_class_tag_of(value) == tag;
-  if (value->kind != SCR_DYN_OBJ && value->kind != SCR_DYN_ARR && value->kind != SCR_DYN_FUNC) return false;
+  if (value->kind != SCR_DYN_OBJ && value->kind != SCR_DYN_ARR && value->kind != SCR_DYN_FUNC &&
+      !scr_dyn_builtin_error_capsule(value)) return false;
   ScrDyn *prototype = scr_dyn_handle_class_prototype(tag);
   bool found = false;
   ScrDyn *current = scr_dyn_get_prototype(value);
-  while (current && current->kind != SCR_DYN_NULL && current->kind == SCR_DYN_OBJ) {
+  while (current && (current->kind == SCR_DYN_OBJ || scr_dyn_builtin_error_capsule(current))) {
     if (current == prototype) {
       found = true;
       break;

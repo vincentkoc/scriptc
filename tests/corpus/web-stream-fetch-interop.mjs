@@ -25,6 +25,15 @@ console.log("variables", own instanceof RS, ownReader instanceof Reader, ownRead
 const isInstance = (value, C) => value instanceof C;
 console.log("parameters", isInstance(own, ReadableStream), isInstance(fetched.body, RS), isInstance(ownReader, RS), isInstance(new Uint8Array(1), Uint8Array));
 
+const error = new Error("web stream prototype");
+Object.setPrototypeOf(error, ReadableStream.prototype);
+console.log("error prototype", error instanceof ReadableStream, isInstance(error, RS));
+const errorChild = Object.create(error);
+console.log("error child", errorChild instanceof ReadableStream, isInstance(errorChild, RS));
+Object.setPrototypeOf(error, null);
+console.log("error null", error instanceof ReadableStream, isInstance(error, RS));
+console.log("error child null", errorChild instanceof ReadableStream, isInstance(errorChild, RS));
+
 const locked = new ReadableStream();
 locked.getReader();
 try {

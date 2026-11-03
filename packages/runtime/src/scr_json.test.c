@@ -1129,6 +1129,11 @@ static ScrDyn *error_receiver(ScrClosure *closure, ScrDyn *const *args, size_t a
 static void error_public_properties(void) {
   ScrError *error = scr_error_new(SCR_ERR_ERROR, NULL);
   ScrDyn *boxed = scr_dyn_from_error(error);
+  ScrDyn *default_prototype = scr_dyn_error_prototype();
+  ScrDyn *initial_prototype = scr_dyn_get_prototype(boxed);
+  assert(!scr_exc_pending() && initial_prototype == default_prototype);
+  scr_dyn_release(initial_prototype);
+  scr_dyn_release(default_prototype);
   ScrDyn *payload = scr_dyn_new_obj();
   const char *names[] = {"extra", "stack", "code", "name", "message"};
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
@@ -1166,7 +1171,7 @@ static void error_public_properties(void) {
   scr_collect_cycles();
   boxed = scr_dyn_from_error(error);
   ScrDyn *actual_prototype = scr_dyn_get_prototype(boxed);
-  assert(actual_prototype == prototype);
+  assert(!scr_exc_pending() && actual_prototype == prototype);
   scr_dyn_release(actual_prototype);
   scr_dyn_release(prototype);
   definition = scr_dyn_own_descriptor(boxed, hidden_key);
@@ -1176,6 +1181,14 @@ static void error_public_properties(void) {
   assert(scr_dyn_obj_get(definition, "configurable", 12)->v.b);
   scr_dyn_release(definition);
   scr_str_release(hidden_key);
+  ScrDyn *null_prototype = scr_dyn_new_null();
+  scr_dyn_release(scr_dyn_set_prototype(boxed, null_prototype));
+  scr_dyn_release(null_prototype);
+  scr_dyn_release(boxed);
+  boxed = scr_dyn_from_error(error);
+  actual_prototype = scr_dyn_get_prototype(boxed);
+  assert(!scr_exc_pending() && actual_prototype->kind == SCR_DYN_NULL);
+  scr_dyn_release(actual_prototype);
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
     ScrDyn *value = scr_dyn_iterator_result_get(boxed, names[i], strlen(names[i]));
     assert(value == payload);

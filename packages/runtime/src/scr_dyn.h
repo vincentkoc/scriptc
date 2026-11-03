@@ -2383,6 +2383,9 @@ void scr_dyn_promise_resolve_with(ScrPromise *target, ScrDyn *value);
 bool scr_dyn_ref_typeof_is(const ScrDyn *d, const char *name);
 bool scr_dyn_ref_is_array(const ScrDyn *d);
 bool scr_dyn_ref_is_error(const ScrDyn *d);
+/* Builtin Error representation only; compiled subclasses have their own
+ * adapters and prototype-dispatch policy. Does not materialize a view. */
+bool scr_dyn_builtin_error_capsule(const ScrDyn *value);
 bool scr_dyn_is_nullish(const ScrDyn *d);
 
 /* ── the ambient receiver (JS `this` inside listener/callback bodies) ──
