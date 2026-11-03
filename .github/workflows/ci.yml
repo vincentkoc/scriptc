@@ -1,1336 +1,348 @@
-name: CI
+name: Qualify release library cross-targets
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  # Nightly full macOS sweep. Pushes to main run no macOS jobs, and pull requests run them only when they change
-  # darwin code (scripts/ci-lanes.mjs).
-  schedule:
-    - cron: "17 7 * * *"
-  # A manual run, for example on a release candidate commit. It runs every lane; macos_suite selects the complete
-  # suite on macOS, as the nightly sweep runs it, or the darwin suite that pull requests run.
   workflow_dispatch:
     inputs:
-      macos_suite:
-        description: The test suite to run on macOS
-        type: choice
-        options: [full, darwin]
-        default: full
-      scope:
-        description: Every lane, or only the shape overlay validation (shape_overlay)
-        type: choice
-        options: [all, shape_overlay]
-        default: all
+      source_sha:
+        description: Exact integration source commit
+        type: string
+        required: true
+        default: 2c4a6299f3bacf38677d96b645398f770ea41306
+
+permissions:
+  contents: read
 
 concurrency:
-  # A new push to a pull request cancels its previous run. Every push to main runs to completion in a group of
-  # its own commit, so each merged commit gets a result (releases require a green run on their commit). The
-  # nightly sweep and manual runs neither cancel nor are cancelled by main pushes.
-  group: ci-${{ github.event_name == 'schedule' && 'schedule' || github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: library-cross-${{ inputs.source_sha }}
+  cancel-in-progress: false
 
 jobs:
-  # GitHub recommends stack.base.ref == base.ref for the lowest unmerged PR:
-  # https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/optimizing-ci-for-stacked-pull-requests
-  # Only trusted, same-repository upper layers defer full CI. Forks, ordinary
-  # PRs, pushes and incomplete metadata always retain full validation.
-  validation_scope:
-    name: Select CI scope
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions: {}
-    outputs:
-      full: ${{ steps.scope.outputs.full }}
-    steps:
-      - id: scope
-        # Read GitHub's event directly; do not run scripts from a PR checkout.
-        run: |
-          node <<'NODE'
-          const { appendFileSync, readFileSync } = require('node:fs');
-          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-          const pr = event.pull_request;
-          const repository = event.repository?.full_name;
-          const sameRepository = typeof repository === 'string' && repository.length > 0 &&
-            pr?.head?.repo?.full_name === repository && pr?.base?.repo?.full_name === repository;
-          const trustedAuthor = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(pr?.author_association);
-          const stackBase = pr?.stack?.base?.ref;
-          const prBase = pr?.base?.ref;
-          // Position 1 can already be merged; compare the current base branches.
-          // A PR into the default branch is the lowest unmerged layer of any
-          // stack, whatever the stack metadata names as its base.
-          const defaultBranch = event.repository?.default_branch;
-          const upperLayer = process.env.GITHUB_EVENT_NAME === 'pull_request' &&
-            sameRepository && trustedAuthor && typeof stackBase === 'string' && stackBase.length > 0 &&
-            typeof prBase === 'string' && prBase.length > 0 && stackBase !== prBase &&
-            prBase !== defaultBranch;
-          // A manual run of the shape overlay validation alone skips the other lanes.
-          const shapeOnly = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' &&
-            event.inputs?.scope === 'shape_overlay';
-          const full = !upperLayer && !shapeOnly;
-          appendFileSync(process.env.GITHUB_OUTPUT, `full=${full}\n`);
-          console.log(full ? 'Run full CI' : 'Defer full CI until this PR becomes the lowest unmerged layer');
-          NODE
-
-  # Which expensive lanes a pull request needs (scripts/ci-lanes.mjs, run from the base commit against the pull
-  # request's diff, so a pull request cannot change its own selection). Pushes to main run every lane except macos,
-  # whose jobs the nightly sweep runs on main. The nightly sweep and manual runs run every lane.
-  lanes:
-    needs: validation_scope
-    if: ${{ needs.validation_scope.outputs.full == 'true' }}
-    name: Select CI lanes
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      # A pull request runs the base revision's lane selector, and one that
-      # predates a lane emits nothing for it; that lane is off then, so its job
-      # is skipped and the required check accepts the skip.
-      linux: ${{ steps.lanes.outputs.linux || 'false' }}
-      macos: ${{ steps.lanes.outputs.macos || 'false' }}
-      effects: ${{ steps.lanes.outputs.effects || 'false' }}
-      bootstrap: ${{ steps.lanes.outputs.bootstrap || 'false' }}
-      profile: ${{ steps.lanes.outputs.profile || 'false' }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request'
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-      - id: lanes
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          every() { printf 'linux=true\nmacos=true\neffects=true\nbootstrap=true\nprofile=true\n' | tee -a "$GITHUB_OUTPUT"; }
-          if [ "$EVENT" = push ]; then
-            printf 'linux=true\nmacos=false\neffects=true\nbootstrap=true\nprofile=true\n' | tee -a "$GITHUB_OUTPUT"
-          elif [ "$EVENT" != pull_request ]; then
-            every
-          elif git show "$BASE:scripts/ci-lanes.mjs" > "$RUNNER_TEMP/ci-lanes.mjs" 2> /dev/null; then
-            node "$RUNNER_TEMP/ci-lanes.mjs" --base "$BASE" --head "$HEAD" --github-output
-          else
-            echo "The base commit has no scripts/ci-lanes.mjs: every lane"
-            every
-          fi
-
-  code_quality:
-    name: lint and format
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
-      - run: pnpm format:check
-      - name: Code quality and CI policy contracts
-        run: pnpm test tests/harness/code-quality.test.ts tests/harness/ci-stack-scope.test.ts
-        env:
-          SCRIPTC_TEST_WORKERS: "1"
-      - name: Verify mixed-source generated AST getters
-        run: pnpm generate:ts7-ast --check
-      - name: Verify the generated IR field readers
-        run: pnpm generate:ir-fields --check
-      - name: Verify the generated IR codec
-        run: pnpm generate:ir-codec --check
-
-  native_macos:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.macos == 'true' }}
-    name: build (macOS arm64 native packages)
+  cross_library:
+    if: github.repository == 'vincentkoc/scriptc'
     runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/native-packages
-        with:
-          target: darwin-arm64
-      - name: Preserve executable permissions in shared packages
-        run: >-
-          tar -czf "$RUNNER_TEMP/native-darwin-arm64.tar.gz"
-          packages/llvm-darwin-arm64/bin
-          packages/runtime-darwin-arm64/artifacts
-          packages/runtime-darwin-arm64/runtime-pack.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-darwin-arm64
-          path: ${{ runner.temp }}/native-darwin-arm64.tar.gz
-          retention-days: 1
-
-  tests:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Linux, ${{ matrix.flavor }}, ${{ matrix.shard }}/20)
-    # The full suite runs on Linux x64, whose hosted runners start without the
-    # macOS queue. tests_macos keeps the darwin clang/libc oracles.
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        flavor: [plain, san]
-        # Twenty shards keep each job near six minutes of tests (the corpus
-        # programs are balanced by measured cost, tests/harness/shard.ts).
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    timeout-minutes: 75
     env:
-      # Capped workers: the shared runner's cores oversubscribe under the
-      # corpus compile fan-out, and vitest's worker RPC times out ("Timeout
-      # calling onTaskUpdate") with every test green — the same contention
-      # artifact the harness README documents for local parallel suites.
-      SCRIPTC_TEST_WORKERS: "4"
-      # san = ASan + RC audit over the same suite; anything but "1" is plain.
-      SCRIPTC_SAN: ${{ matrix.flavor == 'san' && '1' || '' }}
-      # Match macOS, where Apple ASan has no LeakSanitizer: the RC audit owns
-      # leak detection, including intentional abandonment. Plain shards also
-      # build some sanitized probes, so this applies to both flavors. The
-      # san shards' case-sharded corpus turns LeakSanitizer on
-      # (scripts/ci-test-plan.mjs, tests/harness/lsan.supp).
-      ASAN_OPTIONS: detect_leaks=0
-      # Within-file partition for the large case-driven harnesses
-      # (differential, llvm-differential, npm, server, Test262, coverage, and
-      # Vercel E2E): partition stable case names into slice i of 20
-      # (tests/harness/shard.ts). The twenty shards' unions run every case
-      # exactly once. vitest's own --shard is FILE-granular and cannot split
-      # these monster files (differential.test.ts alone is ~9 min
-      # sequential), hence the case-sharded steps below.
-      SCRIPTC_TEST_SHARD: ${{ matrix.shard }}/20
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    defaults:
+      run:
+        working-directory: candidate
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: candidate
+          persist-credentials: false
+          fetch-depth: 1
       - uses: pnpm/action-setup@v4
         with:
           version: 11.1.3
       - uses: actions/setup-node@v4
         with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - run: pnpm build
-      # Node island tests (`// @requires-libnode` corpus programs and
-      # node-island.test.ts) load Node from a libnode pack, and fail rather
-      # than skip in this lane when none is configured.
-      - uses: ./.github/actions/libnode
-      # Ubuntu pipes core dumps to apport, and RLIMIT_CORE does not limit a
-      # piped dump. The kernel then streams every page of the runtime's
-      # reserved allocator address space through the pipe, so each expected
-      # abort outlives its test timeout. Write cores to files instead, where
-      # the limit below applies.
-      - name: Disable piped core dumps
-        run: sudo sysctl -w kernel.core_pattern=core
-      # Start the corpus immediately beside a serial side queue. One shared
-      # worker budget covers both processes; file and case shard axes stay
-      # separate so every fixture still runs exactly once in each lane.
-      # The tests run in a transient scope capped below the runner's 16 GB, so
-      # the runner itself keeps memory: past 15 GB of RAM the scope swaps, as
-      # the whole runner did before, and when RAM and swap run out the kernel
-      # kills the scope's largest process. A sanitized shard peaks near 16 GB,
-      # and the sanitized self-hosting native-frontend build alone needs 15 GB
-      # (its clang compile of the frontend takes 10.5 GB).
-      # OOMPolicy=continue leaves the rest of the scope running, so vitest
-      # reports the killed worker and the job log names the test. Node sizes
-      # its default heap from the memory it may use, which the scope lowers
-      # below 4 GB; the workers keep the 4 GB heap they had on the bare
-      # runner.
-      - name: Tests (corpus and integration suites)
+          node-version-file: candidate/.node-version
+      - name: Prepare exact-source proof and admit capacity
         run: |
-          ulimit -c 0
-          if [ -d /run/systemd/system ]; then
-            exec sudo --preserve-env systemd-run --scope --quiet -p MemoryMax=15G -p OOMPolicy=continue \
-              --uid="$(id -u)" --gid="$(id -g)" -- env PATH="$PATH" HOME="$HOME" NODE_OPTIONS="--max-old-space-size=4096" node scripts/ci-test.mjs
-          fi
-          node scripts/ci-test.mjs
+          mkdir "$RUNNER_TEMP/library-cross-proof"
+          cat > "$RUNNER_TEMP/library-cross-proof/runner.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { execFileSync, spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+          import { join, relative } from "node:path";
+          import { fileURLToPath } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const out = join(process.env.RUNNER_TEMP, "library-cross-proof");
+          const packs = ["linux-arm64-gnu", "linux-x64-gnu", "linux-arm64-musl", "linux-x64-musl", "win32-x64-msvc", "darwin-x64"];
+          const targets = ["aarch64-linux-gnu.2.36", "x86_64-linux-gnu.2.36", "aarch64-linux-musl", "x86_64-linux-musl", "x86_64-windows-gnu", "x86_64-macos"];
+          const digest = bytes => createHash("sha256").update(bytes).digest("hex");
+          const save = (name, value) => writeFileSync(join(out, name), JSON.stringify(value, null, 2) + "\n");
+          const json = name => JSON.parse(readFileSync(name.startsWith("/") ? name : join(out, name), "utf8"));
+          const capture = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30000 }).trim();
+          function source() {
+            const hash = createHash("sha256");
+            const paths = capture("git", ["ls-files", "-z"]).split("\0").filter(Boolean).sort();
+            for (const path of paths) {
+              const symlink = lstatSync(path).isSymbolicLink();
+              const bytes = symlink ? Buffer.from(readlinkSync(path)) : readFileSync(path);
+              hash.update(path + "\0" + (symlink ? "link" : "file") + "\0" + digest(bytes) + "\0");
+            }
+            assert.equal(capture("git", ["status", "--porcelain", "--untracked-files=no"]), "");
+            return { head: capture("git", ["rev-parse", "HEAD"]), tree: capture("git", ["rev-parse", "HEAD^{tree}"]), filesSha256: hash.digest("hex"), files: paths.length };
+          }
+          const self = fileURLToPath(import.meta.url), root = process.cwd();
+          const work = join(process.env.RUNNER_TEMP, "library-cross-work");
+          const owner = { workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, source: process.env.SOURCE_SHA, platform: process.platform };
+          const CAP = 16 * 1024 * 1024;
+          const hash = path => digest(readFileSync(path));
+          const record = path => ({ path: relative(out, path), bytes: statSync(path).size, sha256: hash(path) });
+          function verifyWorkOwner() {
+            const st = lstatSync(work);
+            assert.ok(st.isDirectory() && !st.isSymbolicLink());
+            assert.equal(st.mode & 0o777, 0o700);
+            assert.deepEqual(json(join(work, "owner.json")), owner);
+          }
+          function files(base,prefix=""){return readdirSync(base,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name)).flatMap(item=>{const p=join(base,item.name),name=prefix+item.name,st=lstatSync(p);assert.ok(!st.isSymbolicLink());if(st.isDirectory())return files(p,name+"/");assert.ok(st.isFile());return [{path:name,bytes:st.size,sha256:hash(p)}];});}
+          function tool(command,args=["--version"]){const path=realpathSync(capture("/bin/sh",["-c",'command -v "$1"',"identity",command]));const result=spawnSync(command,args,{encoding:"utf8",timeout:30000,maxBuffer:CAP});assert.equal(result.error,undefined);assert.equal(result.status,0);return {path,sha256:hash(path),version:(result.stdout+result.stderr).trim()};}
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function runOwned(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
 
-  tests_macos:
-    needs: [validation_scope, lanes, native_macos]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.macos == 'true' }}
-    name: test (macOS, ${{ matrix.flavor }}, ${{ (github.event_name != 'schedule' && inputs.macos_suite != 'full') && 'darwin ' || '' }}${{ matrix.shard }}/${{ (github.event_name != 'schedule' && inputs.macos_suite != 'full') && '3' || '10' }})
-    # arm64 macOS: same clang/libc the differential + number-formatting
-    # oracles were verified against. Pull requests that change darwin code and
-    # manual runs with macos_suite set to darwin run the darwin suite
-    # (scripts/ci-test-plan.mjs) in three slices; the nightly schedule and
-    # other manual runs run the complete suite in ten. The complete suite on
-    # every push needed more macOS runners than the repository has.
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        flavor: [plain, san]
-        shard: ${{ fromJSON((github.event_name != 'schedule' && inputs.macos_suite != 'full') && '[1, 2, 3]' || '[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]') }}
-    env:
-      # See the Linux tests job for the worker cap and case partitioning.
-      SCRIPTC_TEST_WORKERS: "4"
-      SCRIPTC_SAN: ${{ matrix.flavor == 'san' && '1' || '' }}
-      SCRIPTC_TEST_SHARD: ${{ matrix.shard }}/${{ (github.event_name != 'schedule' && inputs.macos_suite != 'full') && '3' || '10' }}
-      SCRIPTC_CI_SUITE: ${{ (github.event_name != 'schedule' && inputs.macos_suite != 'full') && 'darwin' || 'full' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-darwin-arm64
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-darwin-arm64.tar.gz"
-      - run: pnpm build
-      # Node island tests load Node from a libnode pack, and fail rather
-      # than skip on macOS CI when none is configured.
-      - uses: ./.github/actions/libnode
-      - name: Tests (${{ (github.event_name != 'schedule' && inputs.macos_suite != 'full') && 'darwin suite' || 'corpus and integration suites' }})
-        run: node scripts/ci-test.mjs
 
-  native_linux:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: build (Linux x64 native packages)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: ./.github/actions/native-packages
-        with:
-          target: linux-x64-gnu
-      - name: Preserve executable permissions in shared packages
-        run: >-
-          tar -czf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-          packages/llvm-linux-x64-gnu/bin
-          packages/runtime-linux-x64-gnu/artifacts
-          packages/runtime-linux-x64-gnu/runtime-pack.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}/native-linux-x64-gnu.tar.gz
-          retention-days: 1
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
 
-  effects:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.effects == 'true' }}
-    name: test (Linux, ${{ matrix.flavor }}, Effect ${{ matrix.shard }}/16)
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        flavor: [plain, san]
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-    env:
-      # One compiler at a time leaves room for its 8 GiB heap, checker and
-      # LLVM on a 16 GB runner. Parallelism comes from independent shards.
-      # Both package versions retain every Node/native comparison in both
-      # flavors; Effect 3 plain also retains its release optimizer coverage.
-      SCRIPTC_TEST_WORKERS: "1"
-      SCRIPTC_EFFECT_TEST_CONCURRENCY: "1"
-      SCRIPTC_TEST_SHARD: ${{ matrix.shard }}/16
-      SCRIPTC_SAN: ${{ matrix.flavor == 'san' && '1' || '' }}
-      ASAN_OPTIONS: detect_leaks=0
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - run: pnpm test tests/harness/effect.test.ts tests/harness/effect4.test.ts
-
-  # The sanitized three.js nodes build alone: beside the san corpus's other
-  # workers it took 860 to more than 1200 seconds of its shard
-  # (SCRIPTC_THREE_SANITIZED_NODES_JOB in scripts/ci-test-plan.mjs). It keeps
-  # the corpus's LeakSanitizer settings.
-  three_nodes_san:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Linux, san, three.js nodes)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    env:
-      SCRIPTC_SAN: "1"
-      ASAN_OPTIONS: detect_leaks=1
-      LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/harness/lsan.supp:print_suppressions=0
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - run: pnpm test tests/harness/three.test.ts -t "'nodes' runs statically through LLVM on 'native'"
-
-  # The sanitized self-hosting native-frontend builds alone. Each of these
-  # three files compiles the whole frontend under ASan in beforeAll, which
-  # takes 10.5 GB of clang beside a 3.8 GB compile in Node; beside a shard's
-  # corpus workers the kernel killed it intermittently at 670-740 s (SIGKILL,
-  # empty stderr, every test skipped). One file per job, one worker, no
-  # corpus. The plain suite and the macOS shards keep them in the shard side
-  # queue (scripts/ci-test-plan.mjs).
-  native_frontend_san:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Linux, san, native frontend ${{ matrix.suite }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: programs
-            file: tests/harness/self-hosting-native-frontend-programs.test.ts
-          - suite: checks
-            file: tests/harness/self-hosting-native-frontend-checks.test.ts
-          - suite: frontend
-            file: tests/harness/self-hosting-native-frontend.test.ts
-    env:
-      SCRIPTC_SAN: "1"
-      SCRIPTC_TEST_WORKERS: "1"
-      ASAN_OPTIONS: detect_leaks=0
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - name: Tests (${{ matrix.file }})
-        run: pnpm test ${{ matrix.file }}
-
-  # Shape inference's overlay (opt-in, SCRIPTC_SHAPE_OVERLAY=1) over the
-  # suites of real packages: nightly and on manual runs only (scope
-  # shape_overlay runs it alone), outside the `test` roll-up. Every case
-  # must build and run as in the default build. It builds its own native
-  # packages, so it does not depend on the other lanes.
-  shape_overlay_native:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: build (Linux x64 native packages, shape overlay)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: ./.github/actions/native-packages
-        with:
-          target: linux-x64-gnu
-      - name: Preserve executable permissions in shared packages
-        run: >-
-          tar -czf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-          packages/llvm-linux-x64-gnu/bin
-          packages/runtime-linux-x64-gnu/artifacts
-          packages/runtime-linux-x64-gnu/runtime-pack.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-linux-x64-gnu-shape-overlay
-          path: ${{ runner.temp }}/native-linux-x64-gnu.tar.gz
-          retention-days: 1
-
-  shape_overlay:
-    needs: [shape_overlay_native]
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    name: test (Linux, shape overlay, ${{ matrix.suite }} ${{ matrix.shard }}/8)
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [npm, npm-static, three, effect]
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    env:
-      SCRIPTC_SHAPE_OVERLAY: "1"
-      SCRIPTC_TEST_WORKERS: "1"
-      SCRIPTC_EFFECT_TEST_CONCURRENCY: "1"
-      SCRIPTC_TEST_SHARD: ${{ matrix.shard }}/8
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu-shape-overlay
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      # The npm suites' Node island cases load Node from a libnode pack, and
-      # fail rather than skip in this lane when none is configured.
-      - uses: ./.github/actions/libnode
-        if: matrix.suite == 'npm' || matrix.suite == 'npm-static'
-      - name: Run the suite with the overlay on
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          let report;
+          function capacity(phase, gib = 16, inodes = 250000) {
+            const rows = JSON.parse(capture("python3", ["-c", "import json,os; paths={'root':'/','workspace':os.getcwd(),'temp':os.environ['RUNNER_TEMP']}; print(json.dumps([dict(name=n,bytes=os.statvfs(p).f_bavail*os.statvfs(p).f_frsize,inodes=os.statvfs(p).f_favail) for n,p in paths.items()]))"]));
+            report.capacity.push({ phase, minimumBytes: gib * 1024 ** 3, minimumInodes: inodes, rows });
+            save("summary.json", report);
+            assert.ok(rows.every(r => r.bytes >= gib * 1024 ** 3 && r.inodes >= inodes), "capacity admission failed: " + phase);
+          }
+          function environment(extra = {}) {
+            const env = { ...process.env };
+            for (const key of Object.keys(env)) if (key.startsWith("SCRIPTC_") || ["CC", "AR"].includes(key)) delete env[key];
+            return { ...env, SCRIPTC_TEST_WORKERS: "1", ...extra };
+          }
+          async function run(label, cmd, args, seconds = 600, extra = {}) {
+            verifyWorkOwner(); assert.ok(allDrained(), "previous process group still active");
+            const remaining = Math.floor((report.deadline - Date.now() - 120000) / 1000);
+            assert.ok(remaining > 0, "reserved drain/readback budget reached");
+            const result = await runOwned(label, cmd, args, Math.min(seconds, remaining), environment(extra));
+            report.commands.push({ label, ...result }); save("summary.json", report);
+            requireSuccess(result);
+          }
+          function tools() {
+            const llvm = join(capture("brew", ["--prefix", "llvm@22"]), "bin/llvm-config");
+            const sdk = capture("xcrun", ["--show-sdk-path"]);
+            return {
+              node: tool(process.execPath), pnpm: tool("pnpm"), zig: tool("zig", ["version"]),
+              llvm: tool(llvm), clang: tool("clang"), cmake: tool("cmake"), ninja: tool("ninja"),
+              nm: tool("nm"), ld: tool("ld", ["-v"]),
+              sdk: { path: sdk, version: capture("xcrun", ["--show-sdk-version"]), settingsSha256: hash(join(sdk, "SDKSettings.json")) },
+              xcode: capture("xcodebuild", ["-version"]),
+            };
+          }
+          function helper() {
+            const path = "packages/llvm-darwin-arm64/bin/scriptc-llvm-codegen";
+            return { sha256: digest(readFileSync(path)), version: JSON.parse(capture(path, ["version", "--format=json"])) };
+          }
+          async function verifyPacks(phase) {
+            for (const pack of packs) await run("verify-" + phase + "-" + pack, process.execPath, ["packages/runtime-" + pack + "/scripts/verify.mjs"], 120);
+          }
+          function packHashes() {
+            return Object.fromEntries(packs.map(pack => [pack, digest(readFileSync("packages/runtime-" + pack + "/runtime-pack.json"))]));
+          }
+          if (process.argv[2] === "--child") await childMain();
+          else try {
+            const mode = process.argv[2];
+            if (mode === "init") {
+              assert.match(process.env.SOURCE_SHA, /^[a-f0-9]{40}$/);
+              assert.equal(process.platform, "darwin"); assert.equal(process.arch, "arm64");
+              report = { source: process.env.SOURCE_SHA, workflow: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, scope: "release cross-target library symbol, ambient and link contracts", commands: [], capacity: [], passed: false };
+              report.sourceBefore = source(); assert.equal(report.sourceBefore.head, report.source);
+              report.runnerSha256 = digest(readFileSync(join(out, "runner.mjs")));
+              report.deadline = Date.now() + 65 * 60 * 1000;
+              mkdirSync(work, { mode: 0o700 }); writeFileSync(join(work, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+              capacity("pre-llvm", 32, 1000000);
+            } else {
+              report = json("summary.json"); verifyWorkOwner(); assert.ok(allDrained(), "owned process closure unresolved");
+              assert.equal(digest(readFileSync(join(out, "runner.mjs"))), report.runnerSha256);
+              if (mode === "prepare") {
+                capacity("post-llvm", 16, 500000);
+                report.toolsBefore = tools();
+                assert.equal(report.toolsBefore.node.version, "v" + readFileSync(".node-version", "utf8").trim());
+                assert.equal(report.toolsBefore.pnpm.version, "11.1.3"); assert.equal(report.toolsBefore.zig.version, "0.16.0"); assert.equal(report.toolsBefore.llvm.version, "22.1.8");
+                await run("install", "pnpm", ["install", "--frozen-lockfile"], 300);
+                await run("workspace-build", "pnpm", ["build"], 600);
+                capacity("before-helper");
+                await run("helper-build", "pnpm", ["--filter", "@scriptc/llvm-darwin-arm64", "build:native"], 600);
+                report.helper = helper();
+                assert.equal(report.helper.version.llvm_version, "22.1.8"); assert.equal(report.helper.version.protocol_version, "1");
+                for (const pack of packs) {
+                  capacity("before-" + pack);
+                  await run("build-" + pack, "pnpm", ["--filter", "@scriptc/runtime-" + pack, "build:native"], 1200, { SCRIPTC_BUILD_CROSS: "1" });
+                  await run("verify-" + pack, process.execPath, ["packages/runtime-" + pack + "/scripts/verify.mjs"], 120);
+                  const manifestPath = "packages/runtime-" + pack + "/runtime-pack.json";
+                  assert.deepEqual(JSON.parse(readFileSync(manifestPath, "utf8")).runtime_abi, { version: 49, marker: "scr_runtime_abi_v49" });
+                  copyFileSync(manifestPath, join(out, "runtime-" + pack + ".json"));
+                }
+                report.packsBefore = packHashes();
+                report.prepared = true;
+              } else if (mode === "test") {
+                assert.equal(report.prepared, true); capacity("before-test");
+                const resultPath = join(out, "tests.json");
+                await run("library-cross", "pnpm", ["test", "tests/harness/library-cross.test.ts", "--reporter=verbose", "--reporter=json", "--outputFile=" + resultPath], 1200, { SCRIPTC_CROSS: "1" });
+                const data = json("tests.json");
+                assert.equal(data.success, true); assert.equal(data.numFailedTests, 0);
+                const rows = data.testResults.flatMap(s => s.assertionResults);
+                const fixtures = readdirSync("tests/library-mode").filter(name => existsSync(join("tests/library-mode", name, "profile.json"))).sort();
+                assert.equal(fixtures.length, 20);
+                for (const target of targets) {
+                  const selected = rows.filter(r => r.ancestorTitles.includes("target " + target));
+                  assert.equal(selected.length, fixtures.length);
+                  assert.deepEqual(selected.map(r => r.title.split(":")[0]).sort(), fixtures);
+                  assert.ok(selected.every(r => r.status === "passed" && r.failureMessages.length === 0));
+                }
+                assert.equal(rows.filter(r => r.title === "zig is on PATH" && r.status === "passed").length, 1);
+                assert.ok(rows.every(r => ["passed", "pending", "skipped"].includes(r.status) && r.failureMessages.length === 0));
+                report.tests = { required: 121, passed: data.numPassedTests, pending: data.numPendingTests, total: data.numTotalTests };
+                report.testsAccepted = true;
+              } else if (mode === "finalize") {
+                assert.equal(report.prepared, true); await verifyPacks("after");
+                assert.deepEqual(packHashes(), report.packsBefore); assert.deepEqual(helper(), report.helper);
+                assert.deepEqual(tools(), report.toolsBefore); report.sourceAfter = source();
+                assert.deepEqual(report.sourceAfter, report.sourceBefore);
+                report.inputsVerifiedAfter = true;
+                assert.equal(report.testsAccepted, true);
+                assert.ok(allDrained()); verifyWorkOwner(); rmSync(work, { recursive: true });
+                report.cleanup = { workRemoved: true }; report.passed = true;
+              } else throw new Error("unknown runner mode");
+              save("summary.json", report);
+            }
+          } catch (error) {
+            if (report) { report.error = String(error.stack ?? error).replaceAll(process.cwd(), "<source>").replaceAll(process.env.RUNNER_TEMP, "<runner-temp>"); save("summary.json", report); }
+            console.error(error); console.error("[library-cross] FAILED (exit 1)"); process.exitCode = 1;
+          } finally {
+            if (process.argv[2] === "finalize") save("artifact-manifest.json", files(out).filter(r => r.path !== "artifact-manifest.json"));
+          }
+          RUNNER
+          node "$RUNNER_TEMP/library-cross-proof/runner.mjs" init
+      - name: Install pinned LLVM
         run: |
-          case "${{ matrix.suite }}" in
-            npm) pnpm test tests/harness/npm-shape-overlay.test.ts ;;
-            npm-static) pnpm test tests/harness/npm-static.test.ts ;;
-            three) pnpm test tests/harness/three.test.ts ;;
-            effect) pnpm test tests/harness/effect.test.ts tests/harness/effect4.test.ts ;;
-          esac
-
-  # Build each instrumented seed once. Downstream contracts retain the same
-  # compiler and source artifacts without repeating seed construction.
-  bootstrap_seed:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.bootstrap == 'true' }}
-    name: build (Linux, ${{ matrix.flavor }}, bootstrap seed)
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        flavor: [plain, san]
-    env:
-      SCRIPTC_SAN: ${{ matrix.flavor == 'san' && '1' || '' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: ./.github/actions/native-packages
-        with:
-          target: linux-x64-gnu
-      - uses: ./.github/actions/native-packages
-        with:
-          target: wasm32-wasi
-          helper: "false"
-      - run: pnpm build
-      # The sanitized seed compiles the compiler's 700 MB module with one clang
-      # process under AddressSanitizer. It peaks near 14 GB while the Node
-      # process that emitted the module still holds about 6 GB. Together they
-      # exceed the runner's 16 GB of memory, so back them with swap.
-      - name: Enlarge swap for the sanitized seed
-        if: matrix.flavor == 'san'
-        run: |
-          sudo swapoff -a
-          sudo rm -f /mnt/swapfile
-          sudo fallocate -l 24G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          free -h
-      - name: Prepare bootstrap seed
-        run: node scripts/bootstrap-seed.mjs
-        env:
-          SCRIPTC_BOOTSTRAP_SEED_DIRECTORY: ${{ runner.temp }}/native-bootstrap
-      - name: Archive seed and compiler artifacts
-        run: tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/bootstrap-seed.tar" native-bootstrap
+          brew install llvm@22
+          test "$( "$(brew --prefix llvm@22)/bin/llvm-config" --version )" = 22.1.8
+          echo "LLVM_DIR=$(brew --prefix llvm@22)/lib/cmake/llvm" >> "$GITHUB_ENV"
+      - uses: ./candidate/.github/actions/zig
+      - name: Build exact-source helper and six runtime packs
+        run: node "$RUNNER_TEMP/library-cross-proof/runner.mjs" prepare
+      - name: Run the complete release library cross-target gate
+        run: node "$RUNNER_TEMP/library-cross-proof/runner.mjs" test
+      - name: Verify source, tools and all runtime packs after execution
+        if: always()
+        run: node "$RUNNER_TEMP/library-cross-proof/runner.mjs" finalize
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: bootstrap-seed-${{ matrix.flavor }}-${{ github.sha }}
-          path: ${{ runner.temp }}/bootstrap-seed.tar
+          name: release-library-cross-proof
+          path: ${{ runner.temp }}/library-cross-proof
           retention-days: 1
           if-no-files-found: error
-
-  # Optimized builds of the native compiler use the committed profile and
-  # layout. The share of the profile's functions a build matches falls as
-  # compiler code changes, and a stale profile leaves the compiler's cold code
-  # inline (11 MB more text at 85.4% than with a fresh one). The seed above
-  # builds without the layout, so this build keeps the committed one, as local
-  # builds do, and fails below the floor (scripts/build-native-cli-profile.mjs).
-  # It runs on the profile lane, which follows compiler code, code generation
-  # and the native CLI build, where the profile goes stale.
-  native_profile:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.profile == 'true' }}
-    name: check (native compiler profile)
-    runs-on: ubuntu-24.04
-    # The compiler build takes about as long as the seed's on a hosted runner.
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: ./.github/actions/native-packages
-        with:
-          target: linux-x64-gnu
-      - run: pnpm build
-      - name: Build the native compiler with the committed profile
-        run: pnpm build:native-compiler
-        env:
-          SCRIPTC_NATIVE_PROFILE_CHECK: "1"
-
-  bootstrap:
-    needs: [validation_scope, lanes, bootstrap_seed]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.bootstrap == 'true' }}
-    name: test (Linux, ${{ matrix.flavor }}, native bootstrap, ${{ matrix.phase }})
-    # These contracts are portable. Standard Linux runners have enough memory
-    # for LLVM optimization alongside the compiler that produces its input.
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        # The sanitized self-rebuild is split at the IR boundary: one job
-        # lowers the compiler and compares its IR with the seed's; the other
-        # emits, links and probes the next generation from the seed's IR.
-        include:
-          - { flavor: plain, phase: commands }
-          - { flavor: plain, phase: rebuild }
-          - { flavor: san, phase: commands }
-          - { flavor: san, phase: rebuild-frontend }
-          - { flavor: san, phase: rebuild-emit }
-    env:
-      SCRIPTC_TEST_WORKERS: "1"
-      SCRIPTC_SAN: ${{ matrix.flavor == 'san' && '1' || '' }}
-      SCRIPTC_BOOTSTRAP_PHASE: ${{ matrix.phase }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      # Rebuilds use the relocated seed's packaged helper and runtimes.
-      - uses: ./.github/actions/native-packages
-        if: matrix.phase == 'commands'
-        with:
-          target: linux-x64-gnu
-      - uses: ./.github/actions/native-packages
-        if: matrix.phase == 'commands'
-        with:
-          target: wasm32-wasi
-          helper: "false"
-      - run: pnpm build
-      - uses: actions/download-artifact@v4
-        with:
-          name: bootstrap-seed-${{ matrix.flavor }}-${{ github.sha }}
-          path: ${{ runner.temp }}
-      - name: Restore bootstrap seed
-        run: tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/bootstrap-seed.tar"
-      # The sanitized emitter peaks near 13 GB while it emits the compiler,
-      # then clang compiles the 348 MB module under AddressSanitizer. Together
-      # they exceed the runner's 16 GB of memory, so back them with swap.
-      - name: Enlarge swap for the sanitized emitter
-        if: matrix.phase == 'rebuild-emit'
-        run: |
-          sudo swapoff -a
-          sudo rm -f /mnt/swapfile
-          sudo fallocate -l 24G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          free -h
-      - name: Native bootstrap and package installation checks
-        # The instrumented emitter's recursion can exceed the default 8 MiB stack.
-        run: |
-          if [ "$SCRIPTC_BOOTSTRAP_PHASE" = rebuild-emit ]; then ulimit -s unlimited; fi
-          node scripts/ci-native-bootstrap.mjs
-        env:
-          SCRIPTC_BOOTSTRAP_SEED_DIRECTORY: ${{ runner.temp }}/native-bootstrap
-          SCRIPTC_BOOTSTRAP_PACKAGE_DIR: ${{ runner.temp }}/native-cli-package
-
-  # A real host-clang/glibc build, not the zig cross-target lane: catches
-  # Linux feature-test macro omissions at compile time and separate-libm
-  # omissions/order errors at link time.
-  linux_host_clang:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (linux host clang/glibc)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    env:
-      # The verdict must come from a live clang invocation, never a cached
-      # binary copied from a previous build.
-      SCRIPTC_NO_CACHE: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - name: Host clang and sanitizer build regressions
-        run: >-
-          pnpm test packages/compiler/test/cc-driver.test.ts
-          packages/compiler/src/native/sanitizer.test.ts
-          --testNamePattern "host-native clang static build|sanitized vendor archives"
-
-  # The TS7 parity sweep exercises the compiler frontend, so it can run
-  # alongside the Linux LLVM/runtime package build instead of following it.
-  ts7_parity:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (TypeScript 7 parity)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - name: TypeScript 7 full parity sweep
-        run: pnpm test:ts7
-
-  # tsc-ts, the default checker, and tsgo (SCRIPTC_CHECKER=tsgo) serve the same TypeScript 7 API. Every corpus
-  # program must compile to the same LLVM IR, with the same diagnostics, with either checker.
-  checker_identity:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (tsgo and tsc-ts give the same IR)
-    runs-on: ubuntu-24.04
-    # The two corpus compiles run back to back and take close to 30 minutes on a
-    # slow hosted runner, so a 30-minute limit cancels otherwise healthy runs.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - name: Corpus LLVM IR with tsgo and with tsc-ts (release)
-        run: pnpm test:checker-identity --optimization release
-      - name: Corpus LLVM IR with tsgo and with tsc-ts (dev)
-        run: pnpm test:checker-identity --optimization dev
-
-  llvm_artifacts_linux_x64:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Linux x64 LLVM artifacts, no clang)
-    runs-on: ubuntu-24.04
-    # The glibc helper and runtime pack come from native_linux, as the macOS
-    # artifact jobs take theirs from native_macos. The musl packages and the
-    # WASI smoke run in llvm_artifacts_linux_x64_musl and
-    # llvm_artifacts_linux_x64_wasi: together with a rebuild of the glibc
-    # packages, which a runtime change forces, the one job took 25 to 32
-    # minutes.
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - run: pnpm build
-      - name: Linux helper object format and no-clang output contract
-        run: |
-          PATH="$RUNNER_TEMP/traps:$PATH"
-          mkdir -p "$RUNNER_TEMP/traps"
-          for tool in clang cc gcc ar ld; do printf '#!/bin/sh\nexit 97\n' > "$RUNNER_TEMP/traps/$tool"; chmod +x "$RUNNER_TEMP/traps/$tool"; done
-          node packages/cli/dist/main.js build tests/corpus/001-hello.ts --emit=obj -o "$RUNNER_TEMP/hello.o"
-          file "$RUNNER_TEMP/hello.o" | grep 'ELF 64-bit LSB relocatable, x86-64'
-      - name: Linux helper/runtime-pack executable differential smoke
-        env:
-          SCRIPTC_NO_CACHE: "1"
-          SCRIPTC_LEGACY_C_PIPELINE: "0"
-        run: |
-          node packages/cli/dist/main.js build tests/corpus/001-hello.ts -o "$RUNNER_TEMP/hello"
-          test "$("$RUNNER_TEMP/hello")" = 'hello world'
-      - name: Linux release runtime reachability and debug payload
-        run: pnpm test tests/harness/runtime-tree-shaking.test.ts
-      - name: Debian 12 glibc 2.36 runtime-pack smoke
-        run: |
-          docker run --rm --volume "$GITHUB_WORKSPACE:/work:ro" --workdir /work node:24-bookworm-slim sh -ec '
-            apt-get update
-            apt-get install --yes --no-install-recommends clang
-            SCRIPTC_NO_CACHE=1 SCRIPTC_LEGACY_C_PIPELINE=0 node packages/cli/dist/main.js build tests/corpus/001-hello.ts -o /tmp/hello
-            test "$(/tmp/hello)" = "hello world"
-          '
-
-  llvm_artifacts_linux_x64_musl:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Linux x64 LLVM artifacts, no clang, musl)
-    runs-on: ubuntu-24.04
-    # The static musl helper and runtime pack, restored from the
-    # native-packages cache when their inputs are unchanged: about 9 minutes
-    # when both are built. The runtime build emits its units through the
-    # host's glibc helper (runtime-unit.mjs), which comes from native_linux.
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - uses: ./.github/actions/native-packages
-        with:
-          target: linux-x64-musl
-      - name: Verify the Linux x64 musl release helper
-        run: |
-          helper=packages/llvm-linux-x64-musl/bin/scriptc-llvm-codegen
-          readelf -l "$helper" > "$RUNNER_TEMP/musl-helper-program-headers"
-          if grep -q INTERP "$RUNNER_TEMP/musl-helper-program-headers"; then
-            echo "musl helper must be a static executable" >&2
-            exit 1
-          fi
-          docker run --rm --volume "$GITHUB_WORKSPACE:/work:ro" alpine:3.22 \
-            /work/$helper version --format=json | node -e '
-              const value = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
-              if (value.default_target !== "x86_64-unknown-linux-musl" || !value.supported_targets?.includes("wasm32-unknown-wasi")) process.exit(1);
-            '
-
-  llvm_artifacts_linux_x64_wasi:
-    needs: [validation_scope, lanes, native_linux]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Linux x64 LLVM artifacts, no clang, wasm32)
-    runs-on: ubuntu-24.04
-    # The wasm32-wasi runtime pack (restored from the native-packages cache
-    # when unchanged; its units go through native_linux's glibc helper) and
-    # the WASI smoke tests, which take 6 to 9 minutes.
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - uses: ./.github/actions/llvm-linux
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/zig
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-linux-x64-gnu
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-linux-x64-gnu.tar.gz"
-      - uses: ./.github/actions/native-packages
-        with:
-          target: wasm32-wasi
-          helper: "false"
-      - run: pnpm build
-      - name: WASI helper object/runtime-pack smoke
-        run: pnpm test packages/cli/test/wasi-runtime-pack.test.ts tests/harness/wasm-library.test.ts
-
-  llvm_artifacts_macos_arm64:
-    needs: [validation_scope, lanes, native_macos]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.macos == 'true' }}
-    name: test (macOS arm64 LLVM artifacts, no clang, ${{ matrix.shard }}/5)
-    runs-on: macos-15
-    # Each LLVM differential slice takes 30 to 35 minutes on a hosted runner.
-    # The package/install and link-parity contracts run in their own job
-    # (llvm_artifacts_macos_arm64_contracts), so no slice carries them.
-    timeout-minutes: 50
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5]
-    env:
-      # The helper differential uses the harness's stable per-case sharding,
-      # keeping each macOS job below its timeout while the matrix union still
-      # exercises every LLVM-tier program.
-      SCRIPTC_TEST_SHARD: ${{ matrix.shard }}/5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-darwin-arm64
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-darwin-arm64.tar.gz"
-      - run: pnpm build
-      # Node island tests load Node from a libnode pack, and fail rather
-      # than skip on macOS CI when none is configured.
-      - uses: ./.github/actions/libnode
-      - name: Node island harness
-        if: matrix.shard == 1
-        run: pnpm test tests/harness/node-island packages/libnode-common
-      - name: LLVM release/dev differential (${{ matrix.shard }}/5)
-        env:
-          SCRIPTC_TEST_WORKERS: "4"
-        run: pnpm test tests/harness/llvm-differential.test.ts
-
-  llvm_artifacts_macos_arm64_contracts:
-    needs: [validation_scope, lanes, native_macos]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.macos == 'true' }}
-    name: test (macOS arm64 LLVM artifacts, no clang, contracts)
-    runs-on: macos-15
-    # The no-clang object, helper parity, packaged helper and packed npm
-    # installation contracts: about 12 minutes, which used to run in front
-    # of shard 1's differential slice and took that job to 45-50 minutes.
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-darwin-arm64
-          path: ${{ runner.temp }}
-      - run: tar -xzf "$RUNNER_TEMP/native-darwin-arm64.tar.gz"
-      - run: pnpm build
-      - name: No-clang assembly/object contract
-        run: pnpm test packages/cli/test/native-output.test.ts
-      - name: Helper diagnostics and object/link parity
-        run: >-
-          pnpm test
-          packages/compiler/test/native-codegen-integration.test.ts
-          packages/compiler/src/backend/runtime-pack.test.ts
-          packages/cli/test/native-link-info.test.ts
-          packages/cli/test/runtime-pack.test.ts
-          tests/harness/native-object-example.test.ts
-      - name: Packaged helper contract
-        run: |
-          TARBALL=$(pnpm --dir packages/llvm-darwin-arm64 pack --pack-destination "$RUNNER_TEMP" --silent)
-          node scripts/verify-llvm-package.mjs "$RUNNER_TEMP/$(basename "$TARBALL")"
-      - name: Packed npm installation smoke
-        env:
-          # Release optimization is covered by the compiler bootstrap jobs.
-          # This lane verifies packaging and installation with a faster seed.
-          SCRIPTC_NATIVE_OPTIMIZATION: dev
-        run: |
-          pnpm --filter @scriptc/cli-darwin-arm64 build:native
-          pnpm --dir packages/runtime pack --pack-destination "$RUNNER_TEMP" --silent
-          pnpm --dir packages/runtime-darwin-arm64 pack --pack-destination "$RUNNER_TEMP" --silent
-          pnpm --dir packages/compiler pack --pack-destination "$RUNNER_TEMP" --silent
-          pnpm --dir packages/cli-darwin-arm64 pack --pack-destination "$RUNNER_TEMP" --silent
-          pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP" --silent
-          PREFIX="$RUNNER_TEMP/installed-scriptc"
-          npm install --prefix "$PREFIX" --no-audit --no-fund \
-            "$RUNNER_TEMP/scriptc-runtime-$(node -p "require('./packages/runtime/package.json').version").tgz" \
-            "$RUNNER_TEMP/scriptc-runtime-darwin-arm64-$(node -p "require('./packages/runtime-darwin-arm64/package.json').version").tgz" \
-            "$RUNNER_TEMP/scriptc-llvm-darwin-arm64-$(node -p "require('./packages/llvm-darwin-arm64/package.json').version").tgz" \
-            "$RUNNER_TEMP/scriptc-compiler-$(node -p "require('./packages/compiler/package.json').version").tgz" \
-            "$RUNNER_TEMP/scriptc-cli-darwin-arm64-$(node -p "require('./packages/cli-darwin-arm64/package.json').version").tgz" \
-            "$RUNNER_TEMP/scriptc-$(node -p "require('./packages/cli/package.json').version").tgz"
-          PATH="" "$PREFIX/node_modules/.bin/scriptc" build tests/corpus/001-hello.ts \
-            --emit=obj -o "$RUNNER_TEMP/installed.o"
-          file "$RUNNER_TEMP/installed.o" | grep 'Mach-O 64-bit object arm64'
-          PATH="" "$PREFIX/node_modules/.bin/scriptc" build tests/corpus/001-hello.ts \
-            --print=native-link-info -o "$RUNNER_TEMP/installed-link.o" \
-            > "$RUNNER_TEMP/installed-link.json"
-          node examples/native-object/link.mjs cc \
-            "$RUNNER_TEMP/installed-link.json" "$RUNNER_TEMP/installed-program"
-          test "$("$RUNNER_TEMP/installed-program")" = 'hello world'
-
-  llvm_artifacts_macos_x64:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.macos == 'true' }}
-    name: test (macOS x64 LLVM artifacts, no clang)
-    runs-on: macos-15-intel
-    # The Node island tests take most of it.
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - uses: ./.github/actions/native-packages
-        with:
-          target: darwin-x64
-      - run: pnpm build
-      # Node island tests load Node from a libnode pack, and fail rather
-      # than skip on macOS CI when none is configured.
-      - uses: ./.github/actions/libnode
-      - name: Node islands (Intel)
-        run: >-
-          pnpm test tests/harness/node-island packages/libnode-common
-          && pnpm test tests/harness/differential.test.ts -t ' (68[0-9][0-9]|7661|7662)-'
-        env:
-          SCRIPTC_TEST_WORKERS: "3"
-      - name: Intel Mach-O no-clang object contract
-        run: |
-          mkdir -p "$RUNNER_TEMP/traps"
-          for tool in clang cc gcc ar ld; do printf '#!/bin/sh\nexit 97\n' > "$RUNNER_TEMP/traps/$tool"; chmod +x "$RUNNER_TEMP/traps/$tool"; done
-          PATH="$RUNNER_TEMP/traps:$PATH" node packages/cli/dist/main.js build tests/corpus/001-hello.ts --emit=obj -o "$RUNNER_TEMP/hello.o"
-          file "$RUNNER_TEMP/hello.o" | grep 'Mach-O 64-bit object x86_64'
-      - name: Intel helper/runtime-pack executable smoke
-        env:
-          SCRIPTC_NO_CACHE: "1"
-          SCRIPTC_LEGACY_C_PIPELINE: "0"
-        run: |
-          node packages/cli/dist/main.js build tests/corpus/001-hello.ts -o "$RUNNER_TEMP/hello"
-          test "$($RUNNER_TEMP/hello)" = 'hello world'
-
-  # Exercises the supported Windows GNU target and the built CLI end to end:
-  # TS7 must open its synthetic project, ambient files must resolve across
-  # slash styles, and the default executable must use the .exe suffix.
-  windows_cli:
-    name: test (windows CLI smoke)
-    needs: [validation_scope, lanes, llvm_artifacts_windows_x64]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    runs-on: windows-latest
-    timeout-minutes: 15
-    env:
-      SCRIPTC_NO_CACHE: "1"
-      SCRIPTC_CC: zigcc
-      SCRIPTC_TARGET: x86_64-windows-gnu
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/zig
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          pnpm install --frozen-lockfile
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "pnpm exited without a diagnostic; retrying once"
-            pnpm install --frozen-lockfile
-          }
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-native-packages
-          path: packages
-      - run: pnpm build
-      - name: Windows path regressions
-        run: pnpm exec vitest run packages/compiler/test/ts7/program-adapter.test.ts packages/compiler/test/ts7/resolver-parity.test.ts packages/compiler/src/native/toolchain.test.ts packages/cli/test/paths.test.ts
-      - name: Windows Sandbox path regression
-        run: >-
-          pnpm exec vitest run tests/harness/worktree-files.test.ts
-          --testNamePattern "workspace reset keeps Linux Sandbox paths POSIX"
-      # The Node host checks with tsc-ts, the default, over the named pipe it
-      # serves on Windows, and with tsgo.
-      - name: Windows scriptc run smoke
-        shell: pwsh
-        run: |
-          zig version
-          foreach ($checker in @("tsc-ts", "tsgo")) {
-            $env:SCRIPTC_CHECKER = $checker
-            $output = & node packages/cli/dist/main.js run tests/corpus/001-hello.ts --backend llvm
-            if ($LASTEXITCODE -ne 0) {
-              exit $LASTEXITCODE
-            }
-            $actual = ($output -join "`n").Trim()
-            if ($actual -ne "hello world") {
-              throw "unexpected scriptc output with ${checker}: $actual"
-            }
-          }
-      - name: Windows PE subsystem selection
-        env:
-          SCRIPTC_NO_CACHE: "0"
-        run: pnpm exec vitest run packages/cli/test/windows-subsystem.test.ts
-      - name: Windows utility runtime linking
-        run: pnpm exec vitest run packages/compiler/test/util-runtime-linking.test.ts
-      - name: Windows filesystem links differential
-        run: >-
-          pnpm exec vitest run tests/harness/differential.test.ts tests/harness/project-config.test.ts
-          --testNamePattern "node24-fs-links|filesystem links"
-      - name: Windows CA-store differential
-        shell: pwsh
-        run: |
-          $nodeOutput = & node tests/corpus/2557-tls-ca-store.ts
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          $nativeOutput = & node packages/cli/dist/main.js run tests/corpus/2557-tls-ca-store.ts --backend llvm
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          $expected = ($nodeOutput -join "`n").Trim()
-          $actual = ($nativeOutput -join "`n").Trim()
-          if ($actual -ne $expected) {
-            throw "Windows CA-store output differed:`nNODE:`n$expected`nNATIVE:`n$actual"
-          }
-      - name: Windows CA EKU policy
-        run: >-
-          pnpm exec vitest run packages/compiler/test/cc-driver.test.ts
-          --testNamePattern "Windows CA roots honor"
-
-  llvm_artifacts_windows_x64:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (Windows x64 MSVC LLVM artifacts)
-    # The official LLVM 22 Windows archives are MSVC-built and the helper
-    # selects CMake's VS 2022 generator. `windows-latest` can move to an
-    # image without that generator, so retain the hosted VS 2022 contract.
-    runs-on: windows-2022
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.1.3
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - name: Install pinned LLVM development distribution
-        shell: pwsh
-        run: |
-          # windows-2022 already provides CMake, Ninja, VS 2022, and 7-Zip.
-          # Use the complete archive because it supplies LLVM's exported CMake
-          # targets and static libraries. Windows tar.exe takes 25+ minutes to
-          # materialize it; two-stage 7-Zip extraction takes seconds.
-          $archive = "$env:RUNNER_TEMP\clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz"
-          $llvm = "$env:RUNNER_TEMP\llvm-22.1.8"
-          $expanded = "$env:RUNNER_TEMP\llvm-expanded"
-          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-          if (-not (Test-Path $sevenZip)) {
-            choco install 7zip --no-progress -y
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          if (-not (Test-Path $sevenZip)) { throw "7-Zip is unavailable" }
-          curl.exe -fL --retry 3 -o $archive https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz
-          & $sevenZip x -y "-o$expanded" $archive
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $sevenZip x -y "-o$expanded" "$expanded\clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Move-Item "$expanded\clang+llvm-22.1.8-x86_64-pc-windows-msvc" $llvm
-          echo "LLVM_DIR=$llvm\lib\cmake\llvm" >> $env:GITHUB_ENV
-          echo "$llvm\bin" >> $env:GITHUB_PATH
-      - run: pnpm install --frozen-lockfile
-      - name: Build Windows helper
-        run: pnpm --filter @scriptc/llvm-win32-x64-msvc build:native
-      - uses: ./.github/actions/zig
-      - name: Build Windows runtime pack
-        run: pnpm --filter @scriptc/runtime-win32-x64-msvc build:native
-      - run: pnpm build
-      - name: Windows COFF no-clang object contract
-        shell: pwsh
-        run: |
-          node packages/cli/dist/main.js build tests/corpus/001-hello.ts --emit=obj -o "$env:RUNNER_TEMP\hello.obj"
-          $bytes = [System.IO.File]::ReadAllBytes("$env:RUNNER_TEMP\hello.obj")
-          if ($bytes[0] -ne 0x64 -or $bytes[1] -ne 0x86) { throw "expected AMD64 COFF object" }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-native-packages
-          path: |
-            packages/llvm-win32-x64-msvc/bin
-            packages/runtime-win32-x64-msvc/artifacts
-            packages/runtime-win32-x64-msvc/runtime-pack.json
-          retention-days: 1
-
-  mobile_runtime_packs:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.linux == 'true' }}
-    name: test (${{ matrix.runtime }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [runtime-android-arm64]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/mobile-runtime-pack
-        with:
-          runtime: ${{ matrix.runtime }}
-
-  # The iOS runtime packs build on macOS runners, so they run in the macos lane.
-  mobile_runtime_packs_ios:
-    needs: [validation_scope, lanes]
-    if: ${{ needs.validation_scope.outputs.full == 'true' && needs.lanes.outputs.macos == 'true' }}
-    name: test (${{ matrix.runtime }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runtime: [runtime-ios-arm64, runtime-ios-simulator-arm64]
-    runs-on: macos-15
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/mobile-runtime-pack
-        with:
-          runtime: ${{ matrix.runtime }}
-
-  # Retain the pre-matrix "test" check for branch protection and badges.
-  # Require this check on the stack base. Upper layers must not pass before
-  # full validation, so untested groups cannot merge. Merge bottom-up.
-  test:
-    needs:
-      [
-        validation_scope,
-        lanes,
-        code_quality,
-        native_macos,
-        tests,
-        tests_macos,
-        native_linux,
-        effects,
-        three_nodes_san,
-        native_frontend_san,
-        bootstrap_seed,
-        native_profile,
-        bootstrap,
-        linux_host_clang,
-        ts7_parity,
-        checker_identity,
-        llvm_artifacts_linux_x64,
-        llvm_artifacts_linux_x64_musl,
-        llvm_artifacts_linux_x64_wasi,
-        llvm_artifacts_macos_arm64,
-        llvm_artifacts_macos_arm64_contracts,
-        llvm_artifacts_macos_x64,
-        windows_cli,
-        llvm_artifacts_windows_x64,
-        mobile_runtime_packs,
-        mobile_runtime_packs_ios,
-      ]
-    # Run even after failed or cancelled lanes: skipped required jobs allow merging.
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: All lanes green
-        run: |
-          test "${{ needs.validation_scope.result }}" = success
-          test "${{ needs.code_quality.result }}" = success
-          case "${{ needs.validation_scope.outputs.full }}" in
-            true)
-              test "${{ needs.lanes.result }}" = success
-              # A lane job passes when it succeeded, or when it was skipped because its lane is off.
-              lane() { [ "$2" = success ] || { [ "$3" = false ] && [ "$2" = skipped ]; } || { echo "$1: $2 (lane $3)"; exit 1; }; }
-              lane native_macos "${{ needs.native_macos.result }}" "${{ needs.lanes.outputs.macos }}"
-              lane tests "${{ needs.tests.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane tests_macos "${{ needs.tests_macos.result }}" "${{ needs.lanes.outputs.macos }}"
-              lane native_linux "${{ needs.native_linux.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane effects "${{ needs.effects.result }}" "${{ needs.lanes.outputs.effects }}"
-              lane three_nodes_san "${{ needs.three_nodes_san.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane native_frontend_san "${{ needs.native_frontend_san.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane bootstrap_seed "${{ needs.bootstrap_seed.result }}" "${{ needs.lanes.outputs.bootstrap }}"
-              lane native_profile "${{ needs.native_profile.result }}" "${{ needs.lanes.outputs.profile }}"
-              lane bootstrap "${{ needs.bootstrap.result }}" "${{ needs.lanes.outputs.bootstrap }}"
-              lane linux_host_clang "${{ needs.linux_host_clang.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane ts7_parity "${{ needs.ts7_parity.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane checker_identity "${{ needs.checker_identity.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane llvm_artifacts_linux_x64 "${{ needs.llvm_artifacts_linux_x64.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane llvm_artifacts_linux_x64_musl "${{ needs.llvm_artifacts_linux_x64_musl.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane llvm_artifacts_linux_x64_wasi "${{ needs.llvm_artifacts_linux_x64_wasi.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane llvm_artifacts_macos_arm64 "${{ needs.llvm_artifacts_macos_arm64.result }}" "${{ needs.lanes.outputs.macos }}"
-              lane llvm_artifacts_macos_arm64_contracts "${{ needs.llvm_artifacts_macos_arm64_contracts.result }}" "${{ needs.lanes.outputs.macos }}"
-              lane llvm_artifacts_macos_x64 "${{ needs.llvm_artifacts_macos_x64.result }}" "${{ needs.lanes.outputs.macos }}"
-              lane windows_cli "${{ needs.windows_cli.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane llvm_artifacts_windows_x64 "${{ needs.llvm_artifacts_windows_x64.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane mobile_runtime_packs "${{ needs.mobile_runtime_packs.result }}" "${{ needs.lanes.outputs.linux }}"
-              lane mobile_runtime_packs_ios "${{ needs.mobile_runtime_packs_ios.result }}" "${{ needs.lanes.outputs.macos }}"
-              ;;
-            false)
-              echo "::notice::Full CI is deferred until this PR becomes the lowest unmerged layer. Merge the stack from the bottom up."
-              exit 1
-              ;;
-            *)
-              echo "Invalid CI scope"
-              exit 1
-              ;;
-          esac
