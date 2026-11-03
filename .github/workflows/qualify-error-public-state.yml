@@ -25,7 +25,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 8
+          fetch-depth: 9
           path: candidate
       - uses: actions/checkout@v4
         with:
@@ -382,7 +382,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 8
+          fetch-depth: 9
           path: candidate
       - uses: pnpm/action-setup@v4
         with:
@@ -731,8 +731,8 @@ jobs:
               report.commands.push(await checked("verify-runtime",process.execPath,["packages/runtime-"+target+"/scripts/verify.mjs"],120));
               report.nativeBefore=nativeFiles();report.runtimeManifest=retain(join(root,"packages/runtime-"+target+"/runtime-pack.json"),"runtime-pack.json");
               const manifest=json(join(root,"packages/runtime-"+target+"/runtime-pack.json"));assert.equal(manifest.flavors.release.optimization,"-O2");
-              report.changedRuntimeUnits=manifest.flavors.release.runtime_units.filter(u=>["scr_error.c","scr_json.c","scr_assert.c","scr_message.c","scr_dyn_builtin_class.c","scr_webstreams.c"].includes(u.source));
-              assert.equal(report.changedRuntimeUnits.length,6);
+              report.changedRuntimeUnits=manifest.flavors.release.runtime_units.filter(u=>["scr_error.c","scr_json.c","scr_assert.c","scr_message.c","scr_dyn_builtin_class.c","scr_webstreams.c","scr_qs.c"].includes(u.source));
+              assert.equal(report.changedRuntimeUnits.length,7);
               for(const unit of report.changedRuntimeUnits)for(const variant of unit.variants){
                 const artifact=report.nativeBefore.find(r=>r.path==="packages/runtime-"+target+"/"+variant.path);
                 assert.ok(artifact);assert.equal(artifact.sha256,variant.sha256);assert.equal(artifact.bytes,variant.size);

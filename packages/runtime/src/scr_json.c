@@ -5277,13 +5277,24 @@ ScrDyn *scr_dyn_typed_ref_key_get(const ScrDyn *d, const ScrStr *key) {
   }
   ScrDyn *date_method = scr_dyn_date_class_member(d, key->data, key->len);
   if (date_method) return date_method;
-  if (!scr_dyn_typed_ref_array_ops(d)) return NULL;
-  if (scr_typed_ref_is_length(key)) return scr_dyn_new_num((double)((ScrArr *)d->v.typed_ref.ptr)->len);
-  double number;
-  if (scr_arr_numeric_key(key->data, key->len, &number)) return scr_typed_ref_numeric_property(d, number);
-  size_t index;
-  if (!scr_typed_ref_canonical_index(key->data, key->len, &index)) return NULL;
-  return scr_dyn_typed_ref_element(d, index);
+  if (scr_dyn_typed_ref_array_ops(d)) {
+    if (scr_typed_ref_is_length(key)) return scr_dyn_new_num((double)((ScrArr *)d->v.typed_ref.ptr)->len);
+    double number;
+    if (scr_arr_numeric_key(key->data, key->len, &number)) return scr_typed_ref_numeric_property(d, number);
+    size_t index;
+    if (!scr_typed_ref_canonical_index(key->data, key->len, &index)) return NULL;
+    return scr_dyn_typed_ref_element(d, index);
+  }
+  ScrErrorState *state = scr_error_state_of_value(d);
+  if (state && !scr_error_state_adopted(state)) {
+    /* The view owns properties; accessor receivers keep the Error's identity. */
+    ScrDyn *view = scr_dyn_typed_ref_materialize(d);
+    ScrDyn *result = scr_exc_pending() ? NULL
+        : scr_dyn_obj_read_receiver(view, key->data, key->len, d);
+    scr_dyn_release(view);
+    return result;
+  }
+  return NULL;
 }
 
 /* An own `length` or element answers `in`/hasOwn without the snapshot. */
@@ -9962,6 +9973,9 @@ ScrDyn *scr_dyn_symbol_key_get(const ScrDyn *value, const ScrDyn *key, bool opti
   if (scr_dyn_generator(value)) return scr_dyn_generator_symbol(value, key)
     ? scr_iterator_function(4, &scr_iterator_self_call, "[Symbol.iterator]") : scr_dyn_retain(scr_dyn_undefined());
   if (value->kind == SCR_DYN_TYPED_REF) {
+    ScrErrorState *state = scr_error_state_of_value(value);
+    if (state && !scr_error_state_adopted(state))
+      return scr_dyn_reflect_get((ScrDyn *)value, (ScrDyn *)key, (ScrDyn *)value);
     ScrDyn *view = scr_dyn_typed_ref_materialize(value);
     ScrDyn *result = scr_exc_pending() ? NULL : scr_dyn_symbol_key_get(view, key, optional);
     scr_dyn_release(view);
@@ -15295,7 +15309,7 @@ static ScrDyn *scr_json_member(const ScrDyn *holder, const ScrStr *key) {
   if (holder->kind == SCR_DYN_TYPED_REF) {
     /* Bound records and arrays answer present members from the native value. */
     ScrDyn *live = scr_dyn_typed_ref_key_get(holder, key);
-    if (live) return live;
+    if (live || scr_exc_pending()) return live;
     ScrDyn *view = scr_dyn_typed_ref_materialize(holder);
     ScrDyn *member = scr_exc_pending() ? NULL : scr_json_member(view, key);
     scr_dyn_release(view);
@@ -15638,7 +15652,10 @@ static ScrDyn *scr_json_to_json_at(ScrDyn *value, const ScrStr *key, size_t inde
     scr_dyn_release(value);
     value = converted;
   } else if (inspected->kind == SCR_DYN_OBJ) {
-    ScrDyn *method = scr_dyn_obj_read(inspected, "toJSON", 6);
+    ScrErrorState *state = view ? scr_error_state_of_value(value) : NULL;
+    const ScrDyn *receiver = state && !scr_error_state_adopted(state) ? value : inspected;
+    /* Looking up the method can itself invoke an accessor on the Error. */
+    ScrDyn *method = scr_dyn_obj_read_receiver(inspected, "toJSON", 6, receiver);
     if (!method) { scr_dyn_release(view); scr_dyn_release(value); return NULL; }
     if (method->kind == SCR_DYN_FUNC) {
       ScrDyn *name = scr_json_key_arg(key, index);

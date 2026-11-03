@@ -1514,9 +1514,9 @@ const ScrStr *scr_dyn_typed_ref_class_name(const ScrDyn *d);
 /* Whether a class instance capsule's class prototype chain defines a
  * method or accessor named key; false for other values. */
 bool scr_dyn_typed_ref_class_has(const ScrDyn *d, const ScrStr *key);
-/* Fast keyed read on a live array capsule: +1 value for `length` and for
- * present or explicitly-undefined elements; NULL when the answer needs the
- * snapshot (holes, out-of-range, non-index names, or no bound ops). */
+/* Live keyed read on a native capsule, preserving an Error accessor's receiver.
+ * +1 value, or NULL with an exception pending. Only NULL without an exception
+ * requests the snapshot path (holes, unmodeled names, or no bound ops). */
 ScrDyn *scr_dyn_typed_ref_key_get(const ScrDyn *d, const ScrStr *key);
 /* +1 view of an own element of a bound live array capsule; NULL for a hole
  * or an index at or past its length. */

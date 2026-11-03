@@ -38,3 +38,16 @@ test("checked Error extraction keeps the native cache fast path and admits brand
   expect(body).toContain("@scr_dyn_check_fail");
   expect(body).toContain("@scr_dyn_obj_get");
 });
+
+test("a throwing live property read returns before snapshot fallback", () => {
+  const host = emitter();
+  host.dyn.dynKeyGetHelper();
+  const body = host.dyn.defs.join("\n");
+  expect(body).toMatch(/br i1 %\w+, label %kg\.tr\.fast\d+, label %kg\.tr\.miss\d+/);
+  expect(body).toMatch(
+    /kg\.tr\.miss\d+:\n  (%\w+) = call zeroext i1 @scr_exc_pending\(\)\n  br i1 \1, label %kg\.tr\.fast\d+, label %kg\.tr\.view\d+/,
+  );
+  expect(body.indexOf("@scr_exc_pending")).toBeLessThan(
+    body.indexOf("@scr_dyn_typed_ref_materialize"),
+  );
+});

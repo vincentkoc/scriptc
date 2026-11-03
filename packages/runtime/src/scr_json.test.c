@@ -1150,10 +1150,13 @@ static void error_public_properties(void) {
   scr_dyn_release(scr_dyn_define_property(boxed, receiver_name, receiver_descriptor));
   scr_dyn_release(receiver_name);
   scr_dyn_release(receiver_descriptor);
-  scr_str_release(receiver_key);
   ScrDyn *receiver = scr_dyn_iterator_result_get(boxed, "receiver", 8);
   assert(receiver == boxed);
   scr_dyn_release(receiver);
+  receiver = scr_dyn_typed_ref_key_get(boxed, receiver_key);
+  assert(receiver == boxed);
+  scr_dyn_release(receiver);
+  scr_str_release(receiver_key);
   ScrDyn *prototype = scr_dyn_new_obj();
   scr_dyn_release(scr_dyn_set_prototype(boxed, prototype));
   ScrStr *hidden_key = scr_str_new("hidden", 6);

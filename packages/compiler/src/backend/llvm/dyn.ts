@@ -4790,8 +4790,15 @@ export class LlDyn {
       B.line(`${fast} = call ptr @scr_dyn_typed_ref_key_get(ptr %d, ptr %k)`);
       B.line(`${hit} = icmp ne ptr ${fast}, null`);
       const lFast = B.newLabel("kg.tr.fast");
+      const lMiss = B.newLabel("kg.tr.miss");
       const lView = B.newLabel("kg.tr.view");
-      B.condBr(hit, lFast, lView);
+      B.condBr(hit, lFast, lMiss);
+      B.startBlock(lMiss);
+      // A throwing accessor returns null, but must not run the snapshot fallback.
+      host.declare(`declare zeroext i1 @scr_exc_pending()`);
+      const pending = B.tmp();
+      B.line(`${pending} = call zeroext i1 @scr_exc_pending()`);
+      B.condBr(pending, lFast, lView);
       B.startBlock(lFast);
       B.terminate(`ret ptr ${fast}`);
       B.startBlock(lView);

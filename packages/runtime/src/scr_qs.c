@@ -600,7 +600,7 @@ static void qs_stringify_value(QsBuf *b, const ScrDyn *v) {
 static ScrDyn *qs_read(const ScrDyn *obj, const ScrStr *k) {
   if (obj->kind == SCR_DYN_TYPED_REF) {
     ScrDyn *fast = scr_dyn_typed_ref_key_get(obj, k);
-    if (fast) return fast;
+    if (fast || scr_exc_pending()) return fast;
     ScrDyn *view = scr_dyn_typed_ref_materialize(obj);
     ScrDyn *v = view && !scr_exc_pending() ? qs_read(view, k) : NULL;
     scr_dyn_release(view);
