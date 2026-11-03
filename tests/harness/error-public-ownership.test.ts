@@ -31,7 +31,7 @@ function readPayload(error: Error): number {
 `;
 const ordinary = `
 function probe(error: any): any {
-  Object.defineProperty(error, publicSymbol, { get() { return this; } });
+  Object.defineProperty(error, publicSymbol, { get: function (this: unknown) { return this; } });
   if (error[publicSymbol] !== error) throw new Error("lost nested receiver");
   return error;
 }
