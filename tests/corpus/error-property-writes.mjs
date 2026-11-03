@@ -61,13 +61,23 @@ function checkProperties(error) {
   }
   console.log("toJSON getter", jsonReceiver === error, jsonCalls - beforeJSON);
   console.log(Object.getOwnPropertyDescriptor(error, "hidden").enumerable);
-  console.log(delete error.hidden, "hidden" in error);
+  delete error.hidden;
+  console.log("hidden deleted", !("hidden" in error));
+}
+// Compiled Error subclasses retain the existing integrity and Reflect deletion fences.
+/** @param {any} error */
+function checkBuiltinIntegrity(error) {
+  error.removable = 31;
+  console.log("Reflect delete", Reflect.deleteProperty(error, "removable"), !("removable" in error),
+    Reflect.deleteProperty(error, symbol), error[symbol] === undefined,
+    Reflect.deleteProperty(error, "receiver"));
   Object.freeze(error);
   console.log(Object.isFrozen(error));
 }
 const owned = new Error("owned");
 decorate(owned);
 checkProperties(owned);
+checkBuiltinIntegrity(owned);
 class PropertyError extends Error {}
 const subclass = new PropertyError("subclass");
 decorate(subclass);

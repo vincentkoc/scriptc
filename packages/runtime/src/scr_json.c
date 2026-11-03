@@ -10294,7 +10294,8 @@ void scr_dyn_key_delete_computed(ScrDyn *value, const ScrDyn *raw_key, bool stri
  * the property is absent afterwards (false when it is non-configurable).
  * A Proxy would observe the own-property check through its traps, and a
  * compiled object's native fields keep their values after a delete through
- * its checked-dynamic view, so both refuse. */
+ * its checked-dynamic view, so both refuse. Builtin Errors own their public
+ * property table, and the canonical delete commits its slot changes. */
 bool scr_dyn_reflect_delete_property(ScrDyn *target, const ScrDyn *raw_key) {
   switch (target->kind) {
   case SCR_DYN_NULL:
@@ -10315,7 +10316,7 @@ bool scr_dyn_reflect_delete_property(ScrDyn *target, const ScrDyn *raw_key) {
     scr_dyn_proxy_unsupported("Reflect.deleteProperty");
     return false;
   }
-  if (target->kind == SCR_DYN_TYPED_REF) {
+  if (target->kind == SCR_DYN_TYPED_REF && !scr_dyn_builtin_error_capsule(target)) {
     static const char message[] = "Reflect.deleteProperty on a compiled object is not supported yet";
     scr_throw_error_msg_code(SCR_ERR_ERROR, message, sizeof message - 1, "SC2020");
     return false;

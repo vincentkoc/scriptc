@@ -68,16 +68,21 @@ console.log(typeof Shift.prototype.constructor, Shift.prototype instanceof Duple
 function instanceOf(value, Constructor) {
   return value instanceof Constructor;
 }
-const error = new Error("stream prototype");
-Object.setPrototypeOf(error, Through.prototype);
-console.log("error chain", error instanceof Through, error instanceof PassThrough,
-  error instanceof Transform, error instanceof Duplex, error instanceof Readable, instanceOf(error, Stream.Stream));
-Object.setPrototypeOf(error, null);
-console.log("error null", error instanceof Through, error instanceof Readable, instanceOf(error, Stream.Stream));
 function MissingPrototype() {}
 MissingPrototype.prototype = undefined;
-try {
-  console.log("invalid prototype", error instanceof MissingPrototype);
-} catch (caught) {
-  console.log("invalid prototype", caught instanceof TypeError);
+// Public prototype checks use the dynamic boundary; typed instanceof uses native class intervals.
+/** @param {any} error */
+function checkStreamPrototypes(error) {
+  Object.setPrototypeOf(error, Through.prototype);
+  console.log("error chain", error instanceof Through, error instanceof PassThrough,
+    error instanceof Transform, error instanceof Duplex, error instanceof Readable, instanceOf(error, Stream.Stream));
+  Object.setPrototypeOf(error, null);
+  console.log("error null", error instanceof Through, error instanceof Readable, instanceOf(error, Stream.Stream));
+  try {
+    console.log("invalid prototype", error instanceof MissingPrototype);
+  } catch (caught) {
+    console.log("invalid prototype", caught instanceof TypeError);
+  }
 }
+const error = new Error("stream prototype");
+checkStreamPrototypes(error);

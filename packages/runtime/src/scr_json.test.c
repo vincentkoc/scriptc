@@ -1183,6 +1183,10 @@ static void error_public_properties(void) {
   assert(!scr_dyn_obj_get(definition, "enumerable", 10)->v.b);
   assert(scr_dyn_obj_get(definition, "configurable", 12)->v.b);
   scr_dyn_release(definition);
+  hidden_name = scr_dyn_new_str(hidden_key);
+  assert(scr_dyn_reflect_delete_property(boxed, hidden_name));
+  assert(!scr_exc_pending() && !scr_dyn_has_own(boxed, hidden_key));
+  scr_dyn_release(hidden_name);
   scr_str_release(hidden_key);
   ScrDyn *null_prototype = scr_dyn_new_null();
   scr_dyn_release(scr_dyn_set_prototype(boxed, null_prototype));
@@ -1213,6 +1217,12 @@ static void error_public_properties(void) {
   scr_str_release(key);
   scr_dyn_release(scr_dyn_freeze(boxed));
   assert(!scr_exc_pending() && scr_dyn_is_frozen(boxed));
+  receiver_key = scr_str_new("receiver", 8);
+  receiver_name = scr_dyn_new_str(receiver_key);
+  assert(!scr_dyn_reflect_delete_property(boxed, receiver_name));
+  assert(!scr_exc_pending() && scr_dyn_has_own(boxed, receiver_key));
+  scr_dyn_release(receiver_name);
+  scr_str_release(receiver_key);
   scr_dyn_release(boxed);
   scr_collect_cycles();
   boxed = scr_dyn_from_error(error);
