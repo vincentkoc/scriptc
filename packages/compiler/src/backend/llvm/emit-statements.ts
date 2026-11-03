@@ -726,7 +726,9 @@ export function emitStmtBody(emitter: LlEmitter, s: IrStmt): void {
         emitter.classMeta.get(s.className)?.root.def.name === "%Error"
       ) {
         emitter.declare(`declare void @scr_error_state_sync(ptr, i32)`);
-        B.line(`call void @scr_error_state_sync(ptr ${obj.name}, i32 ${s.field === "name" ? 2 : 3})`);
+        B.line(
+          `call void @scr_error_state_sync(ptr ${obj.name}, i32 ${s.field === "name" ? 2 : 3})`,
+        );
       }
       break;
     }

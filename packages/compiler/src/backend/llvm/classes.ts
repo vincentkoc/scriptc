@@ -1677,25 +1677,22 @@ export function emitClassShapes(
       );
       if (dispose !== null)
         defs.push(
-          ...arenaDisposeLines(
-            newSym,
-            [
-              ...(meta.root.def.name === "%Error"
-                ? [`  call void @scr_error_state_forget(ptr %o)`]
-                : []),
-              ...refFields.flatMap((f, t) =>
-                disposeFieldLines(
-                  t,
-                  `getelementptr inbounds %${struct}, ptr %o, i64 0, i32 ${f.index}`,
-                  plainRefType(f.type),
-                  meta.root.def.name === "%Error" && f.name === "%errorPublicState"
-                    ? "@scr_error_state_drop"
-                    : releaseSym(host, f.type),
-                  llvmCommentText(f.name),
-                ),
+          ...arenaDisposeLines(newSym, [
+            ...(meta.root.def.name === "%Error"
+              ? [`  call void @scr_error_state_forget(ptr %o)`]
+              : []),
+            ...refFields.flatMap((f, t) =>
+              disposeFieldLines(
+                t,
+                `getelementptr inbounds %${struct}, ptr %o, i64 0, i32 ${f.index}`,
+                plainRefType(f.type),
+                meta.root.def.name === "%Error" && f.name === "%errorPublicState"
+                  ? "@scr_error_state_drop"
+                  : releaseSym(host, f.type),
+                llvmCommentText(f.name),
               ),
-            ],
-          ),
+            ),
+          ]),
         );
     }
 
