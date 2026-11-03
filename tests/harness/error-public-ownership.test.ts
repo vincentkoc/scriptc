@@ -19,8 +19,11 @@ class OwnedError extends Error {
   next: OwnedError | null = null;
   constructor(readonly tag: number) { super("owned " + tag); }
 }
+function dyn(value: unknown): any {
+  return value;
+}
 function readPayload(error: Error): number {
-  return Object.getOwnPropertyDescriptor(error, "payload")!.value.tag;
+  return Object.getOwnPropertyDescriptor(dyn(error), "payload")!.value.tag;
 }
 `;
 const ordinary = `
@@ -28,7 +31,7 @@ function ordinary(): void {
   for (let i = 0; i < 100; i++) {
     const error = new OwnedError(i);
     error.next = new OwnedError(-1);
-    Object.defineProperty(error, "payload", { value: { tag: i }, configurable: true });
+    Object.defineProperty(dyn(error), "payload", { value: { tag: i }, configurable: true });
     const base: Error = error;
     if (readPayload(base) !== i) throw new Error("lost public state");
   }
@@ -39,18 +42,18 @@ ordinary();
 const cyclic = `
 function cycle(i: number): Error {
   const error = new OwnedError(i);
-  Object.defineProperty(error, "owner", { value: () => error });
-  Object.defineProperty(error, "payload", { value: { tag: i } });
+  Object.defineProperty(dyn(error), "owner", { value: () => error });
+  Object.defineProperty(dyn(error), "payload", { value: { tag: i } });
   return error;
 }
 function cyclic(): void {
   const held: Error = cycle(999);
   for (let i = 0; i < 100; i++) {
     const error = cycle(i);
-    const owner = Object.getOwnPropertyDescriptor(error, "owner")!.value;
+    const owner = Object.getOwnPropertyDescriptor(dyn(error), "owner")!.value;
     if (owner() !== error || readPayload(error) !== i) throw new Error("lost cyclic state");
   }
-  const owner = Object.getOwnPropertyDescriptor(held, "owner")!.value;
+  const owner = Object.getOwnPropertyDescriptor(dyn(held), "owner")!.value;
   if (owner() !== held || readPayload(held) !== 999) throw new Error("collected held alias");
   console.log("cyclic ownership passed");
 }
