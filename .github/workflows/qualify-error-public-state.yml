@@ -25,7 +25,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 8
           path: candidate
       - uses: actions/checkout@v4
         with:
@@ -71,9 +71,9 @@ jobs:
           function sourceAt(dir,head){
             assert.equal(capture("git",["rev-parse","HEAD"],dir),head);
             assert.equal(capture("git",["status","--porcelain=v1","--untracked-files=all"],dir),"");
-            const tree=capture("git",["ls-tree","-r","--full-tree","HEAD"],dir);
-            const disk=tree.split("\n").map(row=>{
-              const [metadata,path]=row.split("\t"),mode=metadata.split(" ")[0];
+            const tree=capture("git",["ls-tree","-rz","--full-tree","HEAD"],dir);
+            const disk=tree.split("\0").filter(Boolean).map(row=>{
+              const tab=row.indexOf("\t"),metadata=row.slice(0,tab),path=row.slice(tab+1),mode=metadata.split(" ")[0];
               assert.ok(["100644","100755","120000"].includes(mode),"unsupported source entry");
               const p=join(dir,path),st=lstatSync(p);
               if(mode==="120000"){assert.ok(st.isSymbolicLink());return {path,mode,target:readlinkSync(p)};}
