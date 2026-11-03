@@ -22,6 +22,18 @@ attempt(new Value(), new Value());
 attempt(new Map([[1, 2]]), new Map([[1, 2]]));
 attempt(new Set([1]), new Set([1]));
 attempt(new Error("fail"), new Error("fail"));
+class Failure extends Error {}
+attempt(new Failure("fail"), new Failure("fail"));
+attempt({ error: new Error("fail") }, { error: new Error("fail") });
+const sameError = new Failure("same");
+attempt(sameError, sameError);
+let getterCalls = 0;
+Object.defineProperty(sameError, "extra", {
+  get() { getterCalls++; throw new Error("must not read"); },
+  enumerable: true,
+});
+attempt(sameError, new Failure("other"));
+console.log("Error getters", getterCalls);
 attempt({ get value() { return 1; } }, { value: 1 });
 const ctor = () => 1;
 attempt({ constructor: ctor }, { constructor: ctor });
@@ -43,6 +55,11 @@ console.log("after");
         "TypeError SC2020 util.isDeepStrictEqual over native handles is not supported yet\n" +
         "TypeError SC2020 util.isDeepStrictEqual over native handles is not supported yet\n" +
         "TypeError SC2020 util.isDeepStrictEqual over native Error values is not supported yet\n" +
+        "TypeError SC2020 util.isDeepStrictEqual over native Error values is not supported yet\n" +
+        "TypeError SC2020 util.isDeepStrictEqual over native Error values is not supported yet\n" +
+        "true\n" +
+        "TypeError SC2020 util.isDeepStrictEqual over native Error values is not supported yet\n" +
+        "Error getters 0\n" +
         "TypeError SC2020 util.isDeepStrictEqual over native accessor properties is not supported yet\n" +
         "TypeError SC2020 util.isDeepStrictEqual over native own constructor functions is not supported yet\nafter\n",
     );

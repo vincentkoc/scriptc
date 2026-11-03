@@ -8109,12 +8109,9 @@ function lowerDeleteStatement(lowerer: Lowerer, expr: ts.DeleteExpression): IrSt
     if (unionDelete) return unionDelete;
   }
   let obj = lowerer.lowerExpr(target.expression);
-  // `delete this.stack` in an Error subclass that declares a `stack`
-  // accessor (quickjs-wasi's JSException): V8 gives each error an own
-  // `stack` that shadows the accessor, and the delete removes it so reads
-  // reach the accessor. Compiled errors keep the trace internally and
-  // class dispatch already reads the accessor, so only the receiver's
-  // evaluation remains.
+  // Error's own stack shadows a subclass accessor. Delete through the
+  // canonical public view so later reads reach the inherited accessor;
+  // evaluating the receiver alone would leave the own stack in place.
   if (
     obj.type.kind === "object" &&
     ts.isPropertyAccessExpression(target) &&
@@ -8129,7 +8126,7 @@ function lowerDeleteStatement(lowerer: Lowerer, expr: ts.DeleteExpression): IrSt
       }
       if (c.methods.has("get:stack")) accessor = true;
     }
-    if (accessor && errorBase) return { kind: "exprStmt", expr: obj, loc };
+    if (accessor && errorBase) obj = lowerer.coerceToExpected(obj, DYN);
   }
   if (isJsSourceFile(ts.getSourceFileOfNode(expr)) && obj.type.kind === "object") {
     const info = lowerer.classes.get(obj.type.className);

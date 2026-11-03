@@ -11272,7 +11272,6 @@ static void scr_error_state_sync_impl(ScrError *error, int slot) {
     ScrDynEntry *entry = scr_dyn_find_entry(view, key, strlen(key));
     if (!entry || !entry->accessor) {
       scr_dyn_obj_set(view, key, strlen(key), scr_dyn_new_str(value));
-      if (slot == 1) scr_dyn_find_entry(view, key, strlen(key))->enumerable = false;
     }
   }
   if (slot == 0) {
@@ -11473,12 +11472,19 @@ static bool scr_dyn_error_view_on_error_prototype(const ScrDyn *object) {
 }
 
 ScrDyn *scr_error_dyn_fields(const ScrError *e) {
-  scr_error_state_ensure((ScrError *)e);
+  ScrErrorState *state = scr_error_state_ensure((ScrError *)e);
   ScrDyn *d = scr_dyn_new_obj();
   scr_dyn_obj_set(d, "%error", 6, scr_dyn_new_bool(true)); /* the checked-dynamic tree's error marker */
   scr_dyn_obj_dict_entries(d)[d->v.obj.len - 1].enumerable = false;
-  /* Node lists `stack` first among an error's own properties. */
-  scr_error_dyn_add_stack(d);
+  /* The public view owns stack presence and attributes after construction.
+   * Rebuilding a subclass snapshot must neither restore a deleted stack
+   * nor replace a reassigned data property with the default accessor. */
+  if (!state->view || state->adopted) {
+    scr_error_dyn_add_stack(d);
+  } else {
+    ScrDynEntry *stack = scr_dyn_find_entry(state->view, "stack", 5);
+    if (stack) scr_dyn_copy_entry(d, state->view, stack);
+  }
   if (!e->name_present || !e->message_present) {
     ScrDyn *prototype = scr_dyn_new_obj();
     if (!e->name_present) {
@@ -13212,14 +13218,6 @@ static bool scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, con
     return false;
   }
   scr_dyn_obj_set(recv, key->data, key->len, scr_dyn_retain(value));
-  if (key->len == 5 && memcmp(key->data, "stack", 5) == 0 &&
-      scr_error_state_of_value(recv) != NULL &&
-      !scr_error_state_adopted(scr_error_state_of_value(recv))) {
-    /* An error's own `stack` exists from construction as a non-enumerable
-     * data property, so assigning it adds no enumerable key. */
-    ScrDynEntry *entry = scr_dyn_entry(recv, key);
-    if (entry) entry->enumerable = false;
-  }
   scr_error_sync_cause(recv, key);
   return true;
 }

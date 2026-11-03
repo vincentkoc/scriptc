@@ -1155,13 +1155,19 @@ static void scr_warning_defer(ScrDyn *w, void (*fire)(ScrClosure *)) {
 void scr_warning_emit_deferred(ScrDyn *w) {
 #ifdef SCR_WARNING_REPLACE
   if (scr_emit_warning_override != NULL) {
-    const ScrDyn *em = scr_dyn_obj_get(w, "message", 7);
-    const ScrDyn *ec = scr_dyn_obj_get(w, "code", 4);
-    ScrStr *name = scr_warning_name(w);
-    ScrStr *message = em && em->kind == SCR_DYN_STR ? scr_str_retain(em->v.str) : scr_str_new("", 0);
-    scr_emit_warning_replaced(message, name, ec && ec->kind == SCR_DYN_STR ? ec->v.str : NULL);
-    scr_str_release(message);
+    /* Warnings keep their Error capsule identity. Read its public fields
+     * through the same owner path as the default warning report. */
+    ScrDyn *em = scr_warning_field(w, "message", 7);
+    ScrDyn *ec = scr_exc_pending() ? NULL : scr_warning_field(w, "code", 4);
+    ScrStr *name = scr_exc_pending() ? NULL : scr_warning_name(w);
+    if (!scr_exc_pending()) {
+      ScrStr *message = em && em->kind == SCR_DYN_STR ? scr_str_retain(em->v.str) : scr_str_new("", 0);
+      scr_emit_warning_replaced(message, name, ec && ec->kind == SCR_DYN_STR ? ec->v.str : NULL);
+      scr_str_release(message);
+    }
     scr_str_release(name);
+    scr_dyn_release(em);
+    scr_dyn_release(ec);
     return;
   }
 #endif

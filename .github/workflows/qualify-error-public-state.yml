@@ -25,7 +25,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 13
+          fetch-depth: 15
           path: candidate
       - uses: actions/checkout@v4
         with:
@@ -382,7 +382,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 13
+          fetch-depth: 15
           path: candidate
       - uses: pnpm/action-setup@v4
         with:
@@ -657,9 +657,12 @@ jobs:
           function tools(){const llvm=join(capture("brew",["--prefix","llvm@22"]),"bin","llvm-config"),sdk=capture("xcrun",["--sdk","macosx","--show-sdk-path"]);return {node:tool(process.execPath),pnpm:tool("pnpm"),llvm:tool(llvm),clang:tool("clang"),ld:tool("ld",["-v"]),nm:tool("nm"),cmake:tool("cmake"),ninja:tool("ninja"),sdk:{path:sdk,version:capture("xcrun",["--sdk","macosx","--show-sdk-version"]),settingsSha256:hash(join(sdk,"SDKSettings.json"))},xcode:capture("xcodebuild",["-version"]),imageOS:process.env.ImageOS,imageVersion:process.env.ImageVersion};}
 
           const target="darwin-arm64";
-          const corpusCases=["error-property-writes.mjs","6020-class-extends-function-constructor.js","8078-instanceof-object-function.cjs","6454-constructor-function-stream-bases.cjs","web-stream-fetch-interop.mjs","8115-error-prototype-identity.js","6530-error-subclass-header.ts","assert-throws-expected-values.cjs","2285-iferror-dyn.cjs","5546-fs-read-stream.cjs","7246-stream-construct.ts","5807-worker-error-values.ts","5808-worker-unhandled-rejections.ts","6415-error-code-dynamic-writes.ts","5916-dyn-error-stack-property.ts"];
+          const corpusCases=["error-property-writes.mjs","6020-class-extends-function-constructor.js","8078-instanceof-object-function.cjs","6454-constructor-function-stream-bases.cjs","web-stream-fetch-interop.mjs","8115-error-prototype-identity.js","6530-error-subclass-header.ts","assert-throws-expected-values.cjs","2285-iferror-dyn.cjs","5546-fs-read-stream.cjs","7246-stream-construct.ts","5807-worker-error-values.ts","5808-worker-unhandled-rejections.ts","6415-error-code-dynamic-writes.ts","5916-dyn-error-stack-property.ts","6400-dyn-error-stack-property-js.js","6237-error-subclass-delete-stack/main.js","6231-process-emit-warning-assign.ts","process-emit-warning-arguments.cjs","7536-inspect-custom-errors.ts","7537-inspect-custom-errors.cjs","util-format-custom-inspect-show-hidden.ts"];
           const caseSpecs=[
             {id:"ownership",file:"tests/harness/error-public-ownership.test.ts"},
+            {id:"deep-equality",file:"packages/compiler/test/deep-equality.test.ts"},
+            {id:"inspection",file:"tests/harness/dyncheck.test.ts",filter:"%o refuses the dynamic kinds|builtin Error custom inspectors"},
+            {id:"format-refusals",file:"tests/harness/errors.test.ts",filter:"%s of a class instance with toString, %o of objects, colored errors and options"},
             {id:"consumers",file:"tests/harness/llvm-differential.test.ts",filter:" ("+corpusCases.map(x=>x.replace(/[\\^$.*+?()[\]{}|]/g,"\\$&")).join("|")+")$"},
             {id:"foreign-errors",file:"tests/harness/node-island-handles.test.ts",filter:"^foreign Error identity "},
           ];
@@ -731,8 +734,8 @@ jobs:
               report.commands.push(await checked("verify-runtime",process.execPath,["packages/runtime-"+target+"/scripts/verify.mjs"],120));
               report.nativeBefore=nativeFiles();report.runtimeManifest=retain(join(root,"packages/runtime-"+target+"/runtime-pack.json"),"runtime-pack.json");
               const manifest=json(join(root,"packages/runtime-"+target+"/runtime-pack.json"));assert.equal(manifest.flavors.release.optimization,"-O2");
-              report.changedRuntimeUnits=manifest.flavors.release.runtime_units.filter(u=>["scr_error.c","scr_json.c","scr_assert.c","scr_message.c","scr_dyn_builtin_class.c","scr_webstreams.c","scr_qs.c"].includes(u.source));
-              assert.equal(report.changedRuntimeUnits.length,7);
+              report.changedRuntimeUnits=manifest.flavors.release.runtime_units.filter(u=>["scr_error.c","scr_json.c","scr_assert.c","scr_message.c","scr_dyn_builtin_class.c","scr_webstreams.c","scr_qs.c","scr_async_dyn.c","scr_inspect.c","scr_util_compare.c"].includes(u.source));
+              assert.equal(report.changedRuntimeUnits.length,10);
               for(const unit of report.changedRuntimeUnits)for(const variant of unit.variants){
                 const artifact=report.nativeBefore.find(r=>r.path==="packages/runtime-"+target+"/"+variant.path);
                 assert.ok(artifact);assert.equal(artifact.sha256,variant.sha256);assert.equal(artifact.bytes,variant.size);

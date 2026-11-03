@@ -4,7 +4,7 @@ All notable changes to scriptc will be documented in this file.
 
 ## Unreleased
 
-- Errors retain public properties across typed and untyped conversions, keep accessor receivers, thrown values, and builtin Error property deletion intact, and release cycles through those properties.
+- Errors retain public properties across typed and untyped conversions, keep accessor receivers, thrown values, and property deletion intact, expose inherited subclass stack accessors after deleting the own stack, and release cycles through those properties.
 
 - Node-island Error conversion and uncaught reporting run property access on Node's stack, avoiding V8 fatal errors when those accesses trigger garbage collection.
 

@@ -123,6 +123,11 @@ static bool util_deep_equal(const ScrDyn *a, const ScrDyn *b, bool skip,
   if (a->kind == SCR_DYN_PROXY || b->kind == SCR_DYN_PROXY)
     return util_deep_refused("native Proxy values");
 
+  /* Error capsules retain their native brand without materializing getters.
+   * Recognize that owner before the generic opaque-reference refusal. */
+  ScrError *error = scr_errdyn_err_of(a);
+  if (!error) error = scr_errdyn_err_of(b);
+  if (error) { scr_error_release(error); return util_deep_refused("native Error values"); }
   if (a->kind == SCR_DYN_TYPED_REF || b->kind == SCR_DYN_TYPED_REF) {
     const ScrDyn *inputs[] = { a, b };
     for (size_t i = 0; i < 2; i++) {
@@ -140,9 +145,6 @@ static bool util_deep_equal(const ScrDyn *a, const ScrDyn *b, bool skip,
   }
   if (a->kind == SCR_DYN_HANDLE || b->kind == SCR_DYN_HANDLE)
     return util_deep_refused("native handles");
-  ScrError *error = scr_errdyn_err_of(a);
-  if (!error) error = scr_errdyn_err_of(b);
-  if (error) { scr_error_release(error); return util_deep_refused("native Error values"); }
   if (a->kind != b->kind) return false;
   if (a->kind != SCR_DYN_OBJ && a->kind != SCR_DYN_ARR && a->kind != SCR_DYN_BYTES) return false;
   if (!skip) {

@@ -2518,11 +2518,23 @@ static ScrDyn *insp_custom_class_fn(const ScrDyn *d) {
 
 /* The [util.inspect.custom] result for an object kind, or NULL when the
  * value renders normally (*thrown reports a pending exception). +1. */
-static ScrStr *insp_custom(ScrDyn *d, double recurse, double depth, bool *thrown) {
+static ScrStr *insp_custom(ScrDyn *d, double recurse, double depth, bool error_capsule, bool *thrown) {
   *thrown = false;
   if (!g_custom_inspect) return NULL;
-  ScrDyn *fn;
+  ScrDyn *fn = NULL;
   bool compiled = d->kind == SCR_DYN_TYPED_REF;
+  ScrDyn *key = scr_dyn_inspect_custom_symbol();
+  if (error_capsule && key) {
+    /* Owned symbol properties shadow registered class methods, including
+     * an explicit undefined. Accessors still receive the original Error. */
+    ScrDyn *view = scr_dyn_typed_ref_materialize(d);
+    if (!scr_exc_pending() && scr_dyn_has_key_computed(view, key)) {
+      compiled = false;
+      fn = scr_dyn_reflect_get(view, key, d);
+    }
+    scr_dyn_release(view);
+    if (scr_exc_pending()) { scr_dyn_release(fn); *thrown = true; return NULL; }
+  }
   if (compiled) {
     /* A class instance: its class's compiled function, when it has a
      * custom inspect method. A class whose method has no compiled call
@@ -2541,8 +2553,7 @@ static ScrStr *insp_custom(ScrDyn *d, double recurse, double depth, bool *thrown
       return NULL;
     }
     fn = scr_dyn_retain(fn);
-  } else {
-    ScrDyn *key = scr_dyn_inspect_custom_symbol();
+  } else if (!fn) {
     if (!key) return NULL;
     if (d->kind != SCR_DYN_OBJ && d->kind != SCR_DYN_ARR && d->kind != SCR_DYN_FUNC) return NULL;
     fn = scr_dyn_reflect_get(d, key, d);
@@ -2556,7 +2567,9 @@ static ScrStr *insp_custom(ScrDyn *d, double recurse, double depth, bool *thrown
     return NULL;
   }
   /* A constructor's prototype object renders normally. */
-  ScrDyn *ctor = !compiled && d->kind == SCR_DYN_OBJ ? scr_dyn_obj_read(d, "constructor", 11) : NULL;
+  ScrDyn *ctor = !compiled && (d->kind == SCR_DYN_OBJ || error_capsule)
+      ? scr_dyn_iterator_result_get(d, "constructor", 11) : NULL;
+  if (scr_exc_pending()) { scr_dyn_release(ctor); scr_dyn_release(fn); *thrown = true; return NULL; }
   if (ctor && ctor->kind == SCR_DYN_FUNC) {
     ScrDyn *prototype = scr_dyn_fn_get(ctor, "prototype", 9);
     bool own_prototype = prototype == d;
@@ -2747,11 +2760,12 @@ static ScrStr *scr_insp_dyn_func(ScrDyn *d, double recurse, double depth) {
  * render (a function's length/name/prototype, an error's stack, a typed
  * array's byte fields, a native handle's internals): the kind's name, NULL
  * for the kinds it renders. */
-static const char *insp_hidden_refusal(const ScrDyn *d) {
+static const char *insp_hidden_refusal(const ScrDyn *d, bool error_capsule) {
   switch (d->kind) {
     case SCR_DYN_FUNC: return "function";
     case SCR_DYN_BYTES: return d->buffer ? "Buffer" : d->v.bytes->is_data_view ? "DataView" : "typed array";
     case SCR_DYN_OBJ: return scr_dyn_obj_get(d, "%error", 6) != NULL ? "Error" : NULL;
+    case SCR_DYN_TYPED_REF: return error_capsule ? "Error" : NULL;
     case SCR_DYN_HANDLE:
       /* A MIMEParams keeps its entries private: Node prints MIMEParams {}
        * with or without showHidden. */
@@ -2819,15 +2833,20 @@ static ScrStr *scr_insp_search_params(ScrSearchParams *sp, double recurse, doubl
 
 ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
   if (d->kind == SCR_DYN_PROXY) return scr_insp_dyn(d->v.proxy.target, recurse, depth);
-  if ((d->kind == SCR_DYN_TYPED_REF ? g_ncustom_classes > 0 : scr_dyn_inspect_custom_symbol() != NULL) &&
+  ScrError *error = d->kind == SCR_DYN_TYPED_REF ? scr_errdyn_err_of(d) : NULL;
+  bool error_capsule = error != NULL;
+  scr_error_release(error);
+  if ((d->kind == SCR_DYN_TYPED_REF
+           ? g_ncustom_classes > 0 || (error_capsule && scr_dyn_inspect_custom_symbol() != NULL)
+           : scr_dyn_inspect_custom_symbol() != NULL) &&
       (d->kind == SCR_DYN_OBJ || d->kind == SCR_DYN_ARR || d->kind == SCR_DYN_FUNC ||
        d->kind == SCR_DYN_TYPED_REF)) {
     bool thrown;
-    ScrStr *custom = insp_custom(d, recurse, depth, &thrown);
+    ScrStr *custom = insp_custom(d, recurse, depth, error_capsule, &thrown);
     if (custom) return custom;
     if (thrown) return scr_str_new("", 0);
   }
-  const char *refused = g_show_hidden ? insp_hidden_refusal(d) : NULL;
+  const char *refused = g_show_hidden ? insp_hidden_refusal(d, error_capsule) : NULL;
   if (refused) {
     InspBuf out = {0};
     ib_cstr(&out, "util.format %o of ");
@@ -3076,6 +3095,7 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
     }
 
     case SCR_DYN_TYPED_REF: {
+      if (g_colors && error_capsule) return insp_colors_fence("Error values");
       if (g_colors && scr_insp_is_generator(d)) return insp_colors_fence("generator objects");
       if (scr_insp_is_generator(d)) return scr_insp_generator(d);
       const char *cls = NULL;

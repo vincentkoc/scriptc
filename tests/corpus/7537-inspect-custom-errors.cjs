@@ -5,12 +5,14 @@
 "use strict";
 const util = require("util");
 const NodeInspectSymbol = Symbol.for("nodejs.util.inspect.custom");
+let inspections = 0;
 
 class YieldableError extends Error {
   toJSON() {
     return { _tag: "YieldableError", message: this.message };
   }
   [NodeInspectSymbol]() {
+    inspections++;
     return `YieldableError: ${this.message}`;
   }
 }
@@ -24,3 +26,16 @@ try {
   console.log(e);
   console.log(util.inspect([e]), util.inspect({ e }));
 }
+
+/** @param {any} value */
+function inspectOverrides(value) {
+  value[NodeInspectSymbol] = function() { return `own: ${this.message}`; };
+  console.log(util.inspect(value));
+  const beforeShadow = inspections;
+  value[NodeInspectSymbol] = undefined;
+  util.inspect(value);
+  console.log("own undefined shadows", inspections === beforeShadow);
+  delete value[NodeInspectSymbol];
+  console.log(util.inspect(value), inspections === beforeShadow + 1);
+}
+inspectOverrides(direct);

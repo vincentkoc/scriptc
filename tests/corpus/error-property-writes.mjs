@@ -131,3 +131,41 @@ function checkDeleted(error) {
 installSetters(subclass);
 checkSetters(subclass);
 checkDeleted(subclass);
+
+/** @param {any} error */
+function deleteStack(error) {
+  delete error.stack;
+  error.afterDelete = 1;
+  console.log("stack absent", error.stack === undefined,
+    Object.getOwnPropertyDescriptor(error, "stack") === undefined);
+}
+/** @param {any} error */
+function restoreStack(error) {
+  console.log("stack still absent", error.stack === undefined, !("stack" in error));
+  error.stack = "restored stack";
+  console.log("stack restored", error.stack,
+    Object.getOwnPropertyDescriptor(error, "stack").enumerable);
+}
+const deletedBuiltin = new Error("deleted builtin");
+deleteStack(deletedBuiltin);
+restoreStack(deletedBuiltin);
+const deletedSubclass = new PropertyError("deleted subclass");
+deleteStack(deletedSubclass);
+restoreStack(deletedSubclass);
+
+/** @param {any} error */
+function throwingStackSetter(error) {
+  error.stack = "original cache";
+  const nativeGetter = Object.getOwnPropertyDescriptor(error, "stack").get;
+  Object.defineProperty(error, "stack", {
+    get() { return "custom stack"; },
+    set(value) { console.log("stack setter receiver", this === error); throw sentinel; },
+    configurable: true,
+  });
+  try { error.stack = "rejected cache"; } catch (caught) {
+    console.log("stack setter throw", caught === sentinel);
+  }
+  console.log("stack setter cache", nativeGetter.call(error), error.stack);
+}
+throwingStackSetter(new Error("setter builtin"));
+throwingStackSetter(new PropertyError("setter subclass"));

@@ -6034,10 +6034,9 @@ export class ClassDynamicDispatch {
         },
       ];
     }
-    // An Error's own `stack`: a string is the native error's stack, which
-    // typed reads share; any other value is kept with the instance's own
-    // properties, which a read checks first. A class whose chain declares
-    // a `stack` accessor answers through it (the accessor code below).
+    // The public view owns stack presence and descriptors. Its native
+    // accessor shares the string cache; bypassing it would resurrect a
+    // deleted stack or mutate the cache before a user setter runs.
     if (
       name === "stack" &&
       !info.fields.has(name) &&
@@ -6046,7 +6045,6 @@ export class ClassDynamicDispatch {
       !findMethodOn(lowerer, info, "set:stack")
     ) {
       const key: IrExpr = { kind: "strLit", value: name, type: STRING, loc };
-      const error = lowerer.upcastTo(receiver, "%Error");
       if (write) {
         const helper = classPropertiesHelper(lowerer, loc);
         this.generated.add(helper);
@@ -6071,66 +6069,16 @@ export class ClassDynamicDispatch {
           },
           loc,
         };
-        return [
-          {
-            kind: "if",
-            cond: {
-              kind: "dynTest",
-              test: "string",
-              value: varRef("p.1", DYN, loc),
-              type: BOOL,
-              loc,
-            },
-            then: [
-              {
-                kind: "exprStmt",
-                expr: {
-                  kind: "libCall",
-                  fn: "error.setStack",
-                  args: [error, lowerer.coerceToExpected(varRef("p.1", DYN, loc), STRING)],
-                  type: VOID,
-                  loc,
-                },
-                loc,
-              },
-              {
-                kind: "if",
-                cond: this.readBagHas(
-                  lowerer,
-                  "dyn.hasKey",
-                  this.branchPropertyBag(lowerer, info, receiver, false, loc),
-                  key,
-                  loc,
-                ),
-                then: [store],
-                else_: null,
-                loc,
-              },
-            ],
-            else_: [store],
-            loc,
-          },
-          { kind: "return", value: null, loc },
-        ];
+        return [store, { kind: "return", value: null, loc }];
       }
       const bag = this.branchPropertyBag(lowerer, info, receiver, false, loc);
       return [
         {
           kind: "return",
           value: {
-            kind: "ternary",
-            cond: this.readBagHas(lowerer, "dyn.hasKey", bag, key, loc),
-            then: {
-              kind: "libCall",
-              fn: "dyn.bagGet",
-              args: [bag, key, lowerer.coerceToExpected(receiver, DYN)],
-              type: DYN,
-              loc,
-            },
-            else_: lowerer.coerceToExpected(
-              { kind: "libCall", fn: "error.stack", args: [error], type: STRING, loc },
-              DYN,
-            ),
+            kind: "libCall",
+            fn: "dyn.bagGet",
+            args: [bag, key, lowerer.coerceToExpected(receiver, DYN)],
             type: DYN,
             loc,
           },

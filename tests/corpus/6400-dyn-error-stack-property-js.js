@@ -99,6 +99,12 @@ const removed = dyn(new Error("removed"));
 delete removed.stack;
 console.log("deleted", removed.stack, "stack" in removed, Object.hasOwn(removed, "stack"));
 
+const typedDeleted = new ParseError("typed deletion");
+delete dyn(typedDeleted).stack;
+typedDeleted.stack = "typed restored";
+console.log("typed restored", typedDeleted.stack,
+  Object.getOwnPropertyDescriptor(dyn(typedDeleted), "stack").enumerable);
+
 const spreadSource = dyn(new Error("spread"));
 console.log("spread", Object.keys({ ...spreadSource }).length, Object.keys(Object.assign({}, spreadSource)).length);
 console.log("inherited", firstLine(Object.create(dyn(new RangeError("prototype"))).stack));

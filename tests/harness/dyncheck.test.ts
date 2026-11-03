@@ -1866,7 +1866,12 @@ try {
       "format-o-hidden-refusals",
       `import { format } from "node:util";
 function f(): void {}
-const values: [string, unknown][] = [["fn", f], ["err", new Error("e")], ["u8", new Uint8Array(1)], ["arr", [1]]];
+class Failure extends Error {}
+function dyn(value: unknown): any { return value; }
+const guarded = new Error("guarded");
+let stackReads = 0;
+Object.defineProperty(dyn(guarded), "stack", { get() { stackReads++; throw new Error("must not read"); } });
+const values: [string, unknown][] = [["fn", f], ["err", new Error("e")], ["subclass", new Failure("e")], ["nested", { error: guarded }], ["u8", new Uint8Array(1)], ["arr", [1]]];
 for (const [label, value] of values) {
   try {
     console.log(label, format("%o", value));
@@ -1874,6 +1879,10 @@ for (const [label, value] of values) {
     console.log(label, (e as Error).message);
   }
 }
+console.log("stack reads", stackReads);
+const ordinary = new Error("ordinary");
+ordinary.stack = "Error: ordinary";
+console.log("ordinary", format("%O", ordinary));
 `,
     );
     expect(r.exitCode).toBe(0);
@@ -1881,10 +1890,50 @@ for (const [label, value] of values) {
       [
         "fn util.format %o of function values is not supported yet",
         "err util.format %o of Error values is not supported yet",
+        "subclass util.format %o of Error values is not supported yet",
+        "nested util.format %o of Error values is not supported yet",
         "u8 util.format %o of typed array values is not supported yet",
         "arr [ 1, [length]: 1 ]",
+        "stack reads 0",
+        "ordinary [Error: ordinary]",
         "",
       ].join("\n"),
     );
+  });
+
+  test("builtin Error custom inspectors preserve their public receivers", async () => {
+    const r = await compileAndRun(
+      "builtin-error-custom-inspect",
+      `const util = require("node:util");
+/** @param {any} value */
+function dyn(value) { return value; }
+const error = new Error("custom");
+error.stack = "Error: custom";
+let gets = 0;
+let calls = 0;
+Object.defineProperty(error, util.inspect.custom, {
+  get() {
+    gets++;
+    console.log("getter receiver", this === error);
+    return function(depth, options) {
+      calls++;
+      return "custom " + (this === error) + " " + options.showHidden;
+    };
+  },
+  configurable: true,
+});
+console.log(util.format("%o", dyn(error)));
+console.log(util.inspect(dyn(error), { customInspect: false }).includes("Error: custom"));
+console.log("counts", gets, calls);
+const sentinel = new Error("sentinel");
+Object.defineProperty(error, util.inspect.custom, { get() { throw sentinel; } });
+try { util.inspect(dyn(error)); } catch (caught) { console.log("getter throw", caught === sentinel); }
+console.log(util.inspect(dyn(error), { customInspect: false }).includes("Error: custom"));
+`,
+      "cjs",
+      true,
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("counts 1 1\n");
   });
 });
