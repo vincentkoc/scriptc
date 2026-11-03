@@ -643,7 +643,10 @@ export function liveDynUnionRefAdapter(
         !directArm(arm) &&
         (streamTypedRefEligible(arm) || isDynTypedRefType(arm)),
     );
-  if (mutableArms.length === 0 && !union.arms.some((arm) => arm.kind === "bytes" || directArm(arm))) {
+  if (
+    mutableArms.length === 0 &&
+    !union.arms.some((arm) => arm.kind === "bytes" || directArm(arm))
+  ) {
     throw new InternalCompilerError(`llvm emitter bug: live dyn ref of immutable union ${key}`);
   }
 
