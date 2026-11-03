@@ -19,10 +19,14 @@ function decorate(error) {
   error.stack = { saved: true };
   return error;
 }
+/** @param {any} error */
+function checkProperties(error) {
+  console.log(error[symbol], error.hidden, error.receiver === error, error.stack.saved);
+  console.log(Object.getOwnPropertyDescriptor(error, "hidden").enumerable);
+  console.log(delete error.hidden, "hidden" in error);
+  Object.freeze(error);
+  console.log(Object.isFrozen(error));
+}
 const owned = new Error("owned");
 decorate(owned);
-console.log(owned[symbol], owned.hidden, owned.receiver === owned, owned.stack.saved);
-console.log(Object.getOwnPropertyDescriptor(owned, "hidden").enumerable);
-console.log(delete owned.hidden, "hidden" in owned);
-Object.freeze(owned);
-console.log(Object.isFrozen(owned));
+checkProperties(owned);
