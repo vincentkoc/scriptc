@@ -64,12 +64,16 @@ console.log(through instanceof Transform, through instanceof Duplex, through ins
 console.log(out instanceof Writable, out instanceof Readable, both instanceof Readable);
 console.log(typeof Shift.prototype.constructor, Shift.prototype instanceof Duplex);
 
+/** @param {any} value @param {any} Constructor */
+function instanceOf(value, Constructor) {
+  return value instanceof Constructor;
+}
 const error = new Error("stream prototype");
 Object.setPrototypeOf(error, Through.prototype);
 console.log("error chain", error instanceof Through, error instanceof PassThrough,
-  error instanceof Transform, error instanceof Duplex, error instanceof Readable, error instanceof Stream);
+  error instanceof Transform, error instanceof Duplex, error instanceof Readable, instanceOf(error, Stream));
 Object.setPrototypeOf(error, null);
-console.log("error null", error instanceof Through, error instanceof Readable, error instanceof Stream);
+console.log("error null", error instanceof Through, error instanceof Readable, instanceOf(error, Stream));
 function MissingPrototype() {}
 MissingPrototype.prototype = undefined;
 try {

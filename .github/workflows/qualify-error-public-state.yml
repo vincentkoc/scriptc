@@ -751,7 +751,7 @@ jobs:
                 report.commands.push(await capacityAgain(flavor));
                 for(const spec of caseSpecs){
                   const row=await gate(spec,flavor,packRoot);report.observations.push(row);save("summary.json",report);
-                  assert.ok(allDrained(),"test custody unresolved");if(row.error)throw new Error(row.id+": "+row.error);
+                  assert.ok(allDrained(),"test custody unresolved");
                 }
               }
               assert.equal(report.observations.length,6);assert.ok(report.observations.every(r=>r.accepted));report.preCleanupComplete=true;

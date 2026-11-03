@@ -270,12 +270,16 @@ describe(`llvm differential corpus (${files.length} programs, ${optimizationMode
         for (const level of cpuLevels) {
           const actual = await runBinary(result.binaryPath, [], level, programEnv(file));
           const lane = level === undefined ? optimization : `${optimization} level ${level}`;
+          // Report the runtime failure before an early exit becomes a partial stdout diff.
+          expect(
+            actual.exitCode,
+            `${lane} exit status\n${actual.stderr.subarray(0, 4096).toString("utf8")}`,
+          ).toBe(expectedExit);
           expect(actual.stdout, `${lane} stdout`).toEqual(oracle.stdout);
           if (expectedExit === 0)
             expect(pidFree(file, comparableStderr(actual.stderr)), `${lane} stderr`).toEqual(
               pidFree(file, oracle.stderr),
             );
-          expect(actual.exitCode, `${lane} exit status`).toBe(expectedExit);
         }
       }
     },

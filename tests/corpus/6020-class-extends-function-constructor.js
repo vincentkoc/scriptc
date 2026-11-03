@@ -30,5 +30,6 @@ function ErrorBase() {}
 ErrorBase.prototype = new Error("base prototype");
 class WithErrorPrototype extends ErrorBase {}
 const inherited = new WithErrorPrototype();
+const dynamicInherited = Object.create(WithErrorPrototype.prototype);
 console.log(Object.getPrototypeOf(WithErrorPrototype.prototype) === ErrorBase.prototype,
-  inherited.message, inherited instanceof ErrorBase);
+  inherited.message, dynamicInherited instanceof ErrorBase);
