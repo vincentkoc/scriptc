@@ -408,7 +408,64 @@ static void check_handle_transfer(void) {
   scr_collect_cycles();
 }
 
+static void *receive_error_graph(void *data) {
+  scr_context_enter(2);
+  scr_error_set_traced();
+  scr_init();
+  scr_lib_init(0, NULL);
+  ScrDyn *root = scr_message_decode(data);
+  assert(root && !scr_exc_pending());
+  ScrDyn *error = scr_dyn_obj_get(root, "first", 5);
+  assert(error == scr_dyn_obj_get(root, "second", 6));
+  assert(scr_dyn_ref_is_error(error));
+  ScrDyn *cause = scr_dyn_iterator_result_get(error, "cause", 5);
+  assert(cause == error);
+  scr_dyn_release(cause);
+  ScrDyn *stack = scr_dyn_iterator_result_get(error, "stack", 5);
+  assert(stack && stack->kind == SCR_DYN_STR && stack->v.str->len == 11);
+  assert(!memcmp(stack->v.str->data, "saved stack", 11));
+  scr_dyn_release(stack);
+  ScrStr *key = scr_str_new("cause", 5);
+  ScrDyn *descriptor = scr_dyn_own_descriptor(error, key);
+  assert(scr_dyn_obj_get(descriptor, "enumerable", 10)->v.b == false);
+  assert(scr_dyn_obj_get(descriptor, "writable", 8)->v.b == true);
+  assert(scr_dyn_obj_get(descriptor, "configurable", 12)->v.b == true);
+  scr_dyn_release(descriptor);
+  scr_str_release(key);
+  ScrError *native = scr_error_from_dyn(error);
+  ScrDyn *reboxed = scr_dyn_from_error(native);
+  assert(reboxed == error);
+  scr_dyn_release(reboxed);
+  scr_error_release(native);
+  scr_dyn_release(root);
+  scr_collect_cycles();
+  scr_context_cleanup();
+  return NULL;
+}
+
+static void check_error_graph(void) {
+  ScrError *error = scr_error_new(SCR_ERR_TYPE, NULL);
+  ScrStr *stack = scr_str_new("saved stack", 11);
+  scr_error_set_stack(error, stack);
+  scr_str_release(stack);
+  ScrDyn *value = scr_dyn_from_error(error);
+  scr_error_set_cause(error, value);
+  ScrDyn *root = scr_dyn_new_obj();
+  scr_dyn_obj_set(root, "first", 5, scr_dyn_retain(value));
+  scr_dyn_obj_set(root, "second", 6, value);
+  ScrMessage *message = scr_message_encode(root);
+  assert(message && !scr_exc_pending());
+  scr_dyn_release(root);
+  scr_error_release(error);
+  scr_collect_cycles();
+  pthread_t receiver;
+  assert(pthread_create(&receiver, NULL, receive_error_graph, message) == 0);
+  assert(pthread_join(receiver, NULL) == 0);
+  scr_message_free(message);
+}
+
 int main(void) {
+  scr_error_set_traced();
   scr_init();
   scr_lib_init(0, NULL);
   ScrDyn *source = make_graph();
@@ -427,6 +484,7 @@ int main(void) {
   check_large();
   check_readers();
   check_handle_transfer();
+  check_error_graph();
   scr_context_cleanup();
   puts("message graphs preserve identity, sparse values, byte aliases and getter order");
   puts("native handles cross threads through their transfer hooks");

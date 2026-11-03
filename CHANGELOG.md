@@ -54,6 +54,7 @@ All notable changes to scriptc will be documented in this file.
   - The type checker executable is written once, and builds with an empty cache no longer hash the runtime pack's artifacts again.
   - Large modules decide in one pass whether fs reads must return Buffers.
 - **Memory and size:**
+  - Errors retain their public properties across typed and untyped conversions, and cycles through those properties are collected.
   - Programs return freed memory sooner: large strings are freed when they are released, writes of large shared views go out in chunks, and the main thread returns free pages when its event loop waits.
   - An HTTP response whose socket closes releases its completion callbacks, and the web view of an abandoned fetch body is released while its transfer runs.
   - Intl executables ship ICU data without the categories no Intl form reads (21.5 MB smaller), and the runtime pack is 24 MB smaller on Linux x64.

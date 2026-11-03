@@ -21,6 +21,7 @@ import {
 import { emitLlvmModule, lowRegionTarget } from "./emitter.js";
 import {
   mangleClassNew,
+  mangleClassGcFree,
   mangleClassReleaseDirect,
   mangleClassRelease,
   mangleClassRetain,
@@ -808,4 +809,37 @@ test("the young-in nursery flag adds the nursery entry to traced constructors on
     if (saved === undefined) delete process.env["SCRIPTC_YOUNG_NURSERY"];
     else process.env["SCRIPTC_YOUNG_NURSERY"] = saved;
   }
+});
+
+test("Error subclasses trace private public state and detach it before ordinary or cyclic teardown", () => {
+  const fields = [
+    { name: "name", type: STRING },
+    { name: "message", type: STRING },
+    { name: "%cause", type: DYN },
+    { name: "%errorPublicState", type: DYN },
+  ];
+  const module: IrModule = {
+    irVersion: 17,
+    sourceFile: loc.file,
+    entry: "main",
+    functions: [{ name: "main", params: [], returnType: VOID, locals: [], body: [], loc }],
+    classes: [
+      { name: "%Error", runtime: true, fields, methods: [], loc },
+      { name: "OwnedError", base: "%Error", fields, methods: [], loc },
+    ],
+  };
+  const llvm = emitLlvmModule(module, { pointerBits: 64 });
+  const definition = (name: string): string =>
+    llvm.split(/^define /m).find((body) => body.startsWith(`internal void @${name}(`)) ?? "";
+  const destroy = definition(`${mangleClassReleaseDirect("OwnedError")}_destroy`);
+  expect(destroy).toContain("@scr_error_state_forget(ptr %o)");
+  expect(destroy).toMatch(/store ptr null, ptr %f\d+[^]*call void @scr_error_state_drop/);
+  expect(destroy).not.toMatch(/@scr_dyn_release[^\n]*private Error state/);
+  const trace = definition(mangleClassTrace("OwnedError"));
+  expect(trace).toContain("%errorPublicState");
+  expect(trace).toContain("call void %visit");
+  const collected = definition(mangleClassGcFree("OwnedError"));
+  expect(collected).toContain("@scr_error_state_forget(ptr %o)");
+  expect(collected).not.toContain("@scr_error_state_drop");
+  expect(collected).not.toContain("@scr_dyn_release");
 });

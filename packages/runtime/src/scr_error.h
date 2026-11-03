@@ -89,6 +89,8 @@ void scr_dyn_bag_set(struct ScrDyn *bag, ScrStr *key, struct ScrDyn *value, stru
  * monomorphic-struct divergence). scr_object.c. */
 void scr_record_key_miss(ScrStr *k);
 
+typedef struct ScrErrorState ScrErrorState;
+
 typedef struct ScrError {
   size_t rc;
   const ScrVt *vt;
@@ -118,6 +120,7 @@ typedef struct ScrError {
   ScrStr *system_code;
   bool native_plain; /* a native binding's coded Error: "Name: message", no "[code]" */
   bool errno_order;  /* ErrnoException key order: errno, code, path, syscall */
+  ScrErrorState *public_state; /* owned, traced; private checked-value state */
 } ScrError;
 
 enum {
@@ -166,6 +169,7 @@ typedef struct ScrDomException {
   ScrStr *system_code;
   bool native_plain;
   bool errno_order;
+  ScrErrorState *public_state;
   double dom_code; /* the WebIDL legacy code (0 when the name is off-table) */
   bool has_cause;  /* the options form carried a `cause` member */
   struct ScrDyn *cause; /* owned; NULL when has_cause is false */
@@ -229,6 +233,14 @@ ScrError *scr_suppressed_new(const struct ScrDyn *error, const struct ScrDyn *su
 /* Switch runtime-side error allocation to collector-headered (called from
  * main() when the compiler's cycle fixpoint marks the hierarchy). */
 void scr_error_set_traced(void);
+/* The dynamic unit installs the private state destructor before allocation.
+ * Emitted subclasses use the same owner contract as builtin Errors. */
+void scr_error_install_state_hooks(void (*drop)(ScrErrorState *), void (*forget)(void *),
+                                   void (*sync)(ScrError *, int));
+/* Slots: code=0, stack=1, name=2, message=3. Borrows the owner. */
+void scr_error_state_sync(ScrError *error, int slot);
+void scr_error_state_forget(void *owner);
+void scr_error_state_drop(ScrErrorState *state);
 
 /* Allocate + initialize (name = the kind's builtin name, message retained
  * from the borrowed argument; NULL means ""). Returns +1. */

@@ -19,6 +19,30 @@ static void scr_error_oom(void) {
 
 static SCR_TL bool scr_error_traced = false;
 static SCR_TL void (*scr_error_cause_drop)(void *obj) = NULL;
+static SCR_TL void (*scr_error_state_drop_impl)(ScrErrorState *) = NULL;
+
+static SCR_TL void (*scr_error_state_forget_impl)(void *) = NULL;
+
+static SCR_TL void (*scr_error_state_sync_impl)(ScrError *, int) = NULL;
+
+void scr_error_state_sync(ScrError *error, int slot) {
+  if (error->public_state) scr_error_state_sync_impl(error, slot);
+}
+
+void scr_error_install_state_hooks(void (*drop)(ScrErrorState *), void (*forget)(void *),
+                                   void (*sync)(ScrError *, int)) {
+  scr_error_state_drop_impl = drop;
+  scr_error_state_forget_impl = forget;
+  scr_error_state_sync_impl = sync;
+}
+
+void scr_error_state_forget(void *owner) {
+  if (scr_error_state_forget_impl) scr_error_state_forget_impl(owner);
+}
+
+void scr_error_state_drop(ScrErrorState *state) {
+  if (state) scr_error_state_drop_impl(state);
+}
 
 void scr_error_install_cause_drop(void (*fn)(void *obj)) {
   scr_error_cause_drop = fn;
@@ -39,10 +63,12 @@ static const char *const scr_error_names[SCR_ERR_COUNT] = {
 void scr_error_trace(void *e, ScrTraceVisit visit, void *ctx) {
   /* String fields have no collector header; the stored cause does. */
   visit(((ScrError *)e)->error_cause, ctx);
+  visit(((ScrError *)e)->public_state, ctx);
 }
 
 static void scr_error_gcfree(void *obj) {
   ScrError *e = (ScrError *)obj;
+  scr_error_state_forget(obj);
   scr_str_release(e->name);
   scr_str_release(e->message);
   scr_str_release(e->code); /* NULL-safe: absent on most errors */
@@ -53,7 +79,7 @@ static void scr_error_gcfree(void *obj) {
   scr_str_release(e->system_dest);
   scr_str_release(e->system_message);
   scr_str_release(e->system_code);
-  /* The collector already accounts for the traced cause edge. */
+  /* The collector already accounts for the cause and public-state edges. */
   scr_obj_free_note();
   scr_cyc_free(e);
 }
@@ -92,6 +118,7 @@ static void scr_aggregate_trace(void *obj, ScrTraceVisit visit, void *ctx) {
  * analogous sc_reld_* for user subclasses). */
 static void scr_error_destroy(void *obj) {
   ScrError *e = (ScrError *)obj;
+  scr_error_state_forget(obj);
   scr_str_release(e->name);
   scr_str_release(e->message);
   scr_str_release(e->code);
@@ -102,6 +129,9 @@ static void scr_error_destroy(void *obj) {
   scr_str_release(e->system_dest);
   scr_str_release(e->system_message);
   scr_str_release(e->system_code);
+  ScrErrorState *state = e->public_state;
+  e->public_state = NULL;
+  scr_error_state_drop(state);
   if (e->error_cause && scr_error_cause_drop) scr_error_cause_drop(obj);
   scr_obj_free_note();
   if (scr_error_traced) scr_cyc_free(e);
@@ -359,6 +389,7 @@ void scr_error_set_stack(ScrError *e, ScrStr *stack) {
   ScrStr *replacement = scr_str_retain(stack);
   scr_str_release(e->stack);
   e->stack = replacement;
+  scr_error_state_sync(e, 1);
 }
 
 bool scr_error_is(const void *obj) {
@@ -383,6 +414,7 @@ void scr_throw_error_msg(int kind, const char *message, size_t len) {
 void scr_error_set_code(ScrError *e, const char *code) {
   scr_str_release(e->code); /* NULL-safe; replace is Node's assignment */
   e->code = scr_str_new(code, strlen(code));
+  scr_error_state_sync(e, 0);
 }
 
 /* new AbortError(undefined, { cause: reason }) as Node's AbortController

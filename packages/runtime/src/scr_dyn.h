@@ -1845,16 +1845,14 @@ void scr_dyn_obj_set_accessor(ScrDyn *obj, const char *key, size_t key_len, ScrD
 /* The getter or setter of an own accessor property, +1 (undefined when none). */
 ScrDyn *scr_dyn_obj_accessor_fn(const ScrDyn *obj, const char *key, size_t key_len, bool setter);
 void scr_error_commit_dyn(ScrError *e, const ScrDyn *view);
-/* The reverse extraction, riding the same identity cache: a dyn error
- * that came from a runtime ScrError answers THAT instance (+1;
- * out-and-back crossings compare reference-equal); alien %error objects
- * rebuild once and enter the cache. Borrows d. */
-ScrError *scr_error_from_dyn(const ScrDyn *d); /* scr_async_dyn.c (gated) */
-/* The cache's runtime-internal access pair (scr_json.c owns the storage;
- * the gated extraction reads/writes through these). */
+/* Reverse extraction preserves native owners and adopted values. Borrows d;
+ * the returned native carrier owns its public state and original value. */
+ScrError *scr_error_from_dyn(const ScrDyn *d);
+/* Native brand only: adopted plain objects and primitives have no Error
+ * brand. The weak indexes never retain the carrier or its public view. */
 ScrError *scr_errdyn_err_of(const ScrDyn *d); /* +1 or NULL */
 void scr_error_capture_stack_trace(ScrDyn *target, const char *through, bool skip);
-void scr_errdyn_put(ScrError *e, ScrDyn *d);  /* retains both sides */
+void scr_errdyn_put(ScrError *e, ScrDyn *d); /* e retains d */
 /* Sets an own property on an error: its checked-dynamic node, which casts
  * and util.inspect read. Moves value. */
 void scr_error_set_prop(ScrError *e, const char *key, size_t key_len, ScrDyn *value);

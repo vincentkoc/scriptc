@@ -2546,7 +2546,8 @@ failed:
 void scr_assert_expects_err_dyn(ScrDyn *actual, ScrDyn *expected, ScrStr *msg, bool has_msg,
                                 bool rejection) {
   const char *op = rejection ? "rejects" : "throws";
-  if (expected->kind != SCR_DYN_OBJ) {
+  if (expected->kind != SCR_DYN_OBJ &&
+      !(expected->kind == SCR_DYN_TYPED_REF && scr_dyn_ref_is_error(expected))) {
     scr_assert_eq_dyn(actual, expected, false, true, msg, has_msg);
     return;
   }
@@ -2562,8 +2563,11 @@ void scr_assert_expects_err_dyn(ScrDyn *actual, ScrDyn *expected, ScrStr *msg, b
                     true);
     return;
   }
-  bool is_error = scr_dyn_obj_get(expected, "%error", 6) != NULL;
-  size_t total = scr_dyn_obj_count(expected);
+  ScrDyn *view = expected->kind == SCR_DYN_TYPED_REF
+      ? scr_dyn_typed_ref_materialize(expected) : scr_dyn_retain(expected);
+  if (scr_exc_pending()) { scr_dyn_release(view); return; }
+  bool is_error = scr_dyn_ref_is_error(expected);
+  size_t total = scr_dyn_obj_count(view);
   /* ObjectKeys(expected) is the enumerable own keys; an Error instance adds
    * `name` and `message` on top (they are own non-enumerable properties, or
    * inherited from the prototype, in an error's encoding). `stack` and the
@@ -2573,7 +2577,7 @@ void scr_assert_expects_err_dyn(ScrDyn *actual, ScrDyn *expected, ScrStr *msg, b
   if (cap > 0 && keys == NULL) scr_trap("scriptc: out of memory\n");
   size_t count = 0;
   for (size_t i = 0; i < total; i++) {
-    ScrDynProp e = scr_dyn_obj_prop_at(expected, i);
+    ScrDynProp e = scr_dyn_obj_prop_at(view, i);
     if (e.key_len == 6 && memcmp(e.key, "%error", 6) == 0) continue;
     if (!e.enumerable) continue;
     keys[count++] = scr_str_new(e.key, e.key_len);
@@ -2582,6 +2586,7 @@ void scr_assert_expects_err_dyn(ScrDyn *actual, ScrDyn *expected, ScrStr *msg, b
     keys[count++] = scr_str_new("name", 4);
     keys[count++] = scr_str_new("message", 7);
   }
+  scr_dyn_release(view);
   if (count == 0 && !is_error) {
     free(keys);
     if (total == 0) {
@@ -3049,14 +3054,15 @@ void scr_assert_iferror_bool(bool v) {
  * value's inspection. */
 void scr_assert_iferror_dyn(const ScrDyn *v) {
   if (v->kind == SCR_DYN_UNDEF || v->kind == SCR_DYN_NULL) return;
-  if (v->kind == SCR_DYN_OBJ && scr_dyn_obj_get(v, "%error", 6) != NULL) {
-    const ScrDyn *msg = scr_dyn_obj_get(v, "message", 7);
-    const ScrDyn *name = scr_dyn_obj_get(v, "name", 4);
-    const ScrDyn *d = msg != NULL && msg->kind == SCR_DYN_STR && msg->v.str->len > 0 ? msg : name;
-    if (d != NULL && d->kind == SCR_DYN_STR) {
-      scr_assert_iferror_fail(d->v.str->data, d->v.str->len, scr_dyn_retain((ScrDyn *)v));
-      return;
-    }
+  if (scr_dyn_ref_is_error(v)) {
+    ScrDyn *msg = scr_dyn_iterator_result_get(v, "message", 7);
+    ScrDyn *name = scr_dyn_iterator_result_get(v, "name", 4);
+    const ScrDyn *d = msg && msg->kind == SCR_DYN_STR && msg->v.str->len > 0 ? msg : name;
+    bool text = d && d->kind == SCR_DYN_STR;
+    if (text) scr_assert_iferror_fail(d->v.str->data, d->v.str->len, scr_dyn_retain((ScrDyn *)v));
+    scr_dyn_release(msg);
+    scr_dyn_release(name);
+    if (text || scr_exc_pending()) return;
   }
   ScrStr *q = scr_assert_cf_inspect(v);
   scr_assert_iferror_fail(q->data, q->len, scr_dyn_retain((ScrDyn *)v));

@@ -7980,7 +7980,7 @@ static ScrError *scr_stream_aggregate_errors(ScrError *inner, ScrError *outer) {
     scr_dyn_arr_push(list, scr_dyn_from_error(inner));
     scr_aggregate_set_errors(agg, list);
     scr_dyn_release(list);
-    ScrDyn *code = scr_dyn_obj_read(outer_value, "code", 4);
+    ScrDyn *code = scr_dyn_iterator_result_get(outer_value, "code", 4);
     if (code && code->kind == SCR_DYN_STR) scr_error_set_code(agg, code->v.str->data);
     scr_dyn_release(code);
     scr_dyn_release(outer_value);

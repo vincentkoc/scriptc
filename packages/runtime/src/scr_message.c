@@ -1013,6 +1013,9 @@ ScrDyn *scr_message_decode(const ScrMessage *message) {
   }
   for (size_t i = 0; i < message->count; i++) {
     const ScrMessageNode *node = &message->nodes[i];
+    ScrDyn *error_view = node->kind == SCR_MESSAGE_ERROR
+        ? scr_dyn_typed_ref_materialize(values[i]) : NULL;
+    ScrDyn *target = error_view ? error_view : values[i];
     for (size_t j = 0; j < node->count; j++) {
       const ScrMessageProperty *property = &node->properties[j];
       ScrDyn *value = scr_dyn_retain(values[property->value]);
@@ -1031,23 +1034,24 @@ ScrDyn *scr_message_decode(const ScrMessage *message) {
         scr_dyn_key_set(values[i], key, value);
         scr_str_release(key);
         scr_dyn_release(value);
-      } else scr_dyn_obj_set(values[i], property->key, property->length, value);
+      } else scr_dyn_obj_set(target, property->key, property->length, value);
     }
     if (node->kind == SCR_MESSAGE_ERROR) {
-      for (size_t j = 0; j < scr_dyn_obj_count(values[i]); j++) {
-        ScrDynProp entry = scr_dyn_obj_prop_at(values[i], j);
+      for (size_t j = 0; j < scr_dyn_obj_count(target); j++) {
+        ScrDynProp entry = scr_dyn_obj_prop_at(target, j);
         bool enumerable = false;
         for (size_t k = 0; k < node->count; k++) {
           const ScrMessageProperty *property = &node->properties[k];
           if (!property->hidden && property->length == entry.key_len && !memcmp(property->key, entry.key, entry.key_len))
             enumerable = true;
         }
-        scr_dyn_obj_set_attrs_at(values[i], j, entry.writable, enumerable, entry.configurable);
+        scr_dyn_obj_set_attrs_at(target, j, entry.writable, enumerable, entry.configurable);
       }
       ScrError *error = scr_errdyn_err_of(values[i]);
-      scr_error_commit_dyn(error, values[i]);
+      scr_error_commit_dyn(error, target);
       scr_error_release(error);
     }
+    scr_dyn_release(error_view);
   }
   scr_message_tag_document(message, values);
 done:;

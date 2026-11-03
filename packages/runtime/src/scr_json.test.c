@@ -1087,6 +1087,190 @@ static void error_suppressed_snapshots(void) {
   assert(!scr_exc_suppressed_values((const void *)address, &first, &second));
 }
 
+/* Uses the existing public API so this mode also builds against the old
+ * retained-pair implementation: cycles must fail by liveness, not linkage. */
+static void error_public_cycles(void) {
+  const int kinds[] = {SCR_ERR_ERROR, SCR_ERR_TYPE, SCR_ERR_DOMEX, SCR_ERR_AGGREGATE};
+  for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
+    for (uint16_t gen = SCR_CYC_NURSERY; gen < SCR_CYC_NGENS; gen++) {
+      for (int alias = 0; alias < 3; alias++) {
+        ErrorHeapSnapshot before = error_heap_snapshot();
+        ScrDyn *payload = scr_dyn_new_arr();
+        scr_cyc_set_gen(scr_cyc_hdr(payload), gen);
+        ScrError *error = error_with_payload(kinds[k], payload);
+        scr_error_set_prop(error, "extra", 5, error_backedge(error));
+        ScrDyn *boxed = scr_dyn_from_error(error);
+        ScrDyn *again = scr_dyn_from_error(error);
+        assert(boxed == again);
+        scr_dyn_release(again);
+        scr_dyn_arr_push(payload, scr_dyn_retain(boxed));
+        scr_dyn_release(payload);
+        if (alias != 1) scr_error_release(error);
+        if (alias != 2) scr_dyn_release(boxed);
+        scr_collect_cycles();
+        if (alias) {
+          ScrDyn *extra = scr_dyn_iterator_result_get(boxed, "extra", 5);
+          assert(extra && extra->kind == SCR_DYN_FUNC);
+          scr_dyn_release(extra);
+          if (alias == 1) scr_error_release(error);
+          else scr_dyn_release(boxed);
+        }
+        error_heap_restored(before, "public-cycle", kinds[k], gen, alias);
+      }
+    }
+  }
+}
+
+static ScrDyn *error_receiver(ScrClosure *closure, ScrDyn *const *args, size_t argc) {
+  (void)closure; (void)args; (void)argc;
+  return scr_dyn_this_get();
+}
+
+static void error_public_properties(void) {
+  ScrError *error = scr_error_new(SCR_ERR_ERROR, NULL);
+  ScrDyn *boxed = scr_dyn_from_error(error);
+  ScrDyn *payload = scr_dyn_new_obj();
+  const char *names[] = {"extra", "stack", "code", "name", "message"};
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+    ScrStr *key = scr_str_new(names[i], strlen(names[i]));
+    scr_dyn_key_set(boxed, key, payload);
+    assert(!scr_exc_pending());
+    scr_str_release(key);
+  }
+  ScrDyn *receiver_descriptor = scr_dyn_new_obj();
+  scr_dyn_obj_set(receiver_descriptor, "get", 3,
+      scr_dyn_new_func(scr_closure_new(NULL, 0), error_receiver, 0, "func()=>dyn", "receiver"));
+  ScrStr *receiver_key = scr_str_new("receiver", 8);
+  ScrDyn *receiver_name = scr_dyn_new_str(receiver_key);
+  scr_dyn_release(scr_dyn_define_property(boxed, receiver_name, receiver_descriptor));
+  scr_dyn_release(receiver_name);
+  scr_dyn_release(receiver_descriptor);
+  scr_str_release(receiver_key);
+  ScrDyn *receiver = scr_dyn_iterator_result_get(boxed, "receiver", 8);
+  assert(receiver == boxed);
+  scr_dyn_release(receiver);
+  ScrDyn *prototype = scr_dyn_new_obj();
+  scr_dyn_release(scr_dyn_set_prototype(boxed, prototype));
+  ScrStr *hidden_key = scr_str_new("hidden", 6);
+  ScrDyn *hidden_name = scr_dyn_new_str(hidden_key);
+  ScrDyn *definition = scr_dyn_new_obj();
+  scr_dyn_obj_set(definition, "value", 5, scr_dyn_retain(payload));
+  scr_dyn_obj_set(definition, "writable", 8, scr_dyn_new_bool(false));
+  scr_dyn_obj_set(definition, "enumerable", 10, scr_dyn_new_bool(false));
+  scr_dyn_obj_set(definition, "configurable", 12, scr_dyn_new_bool(true));
+  scr_dyn_release(scr_dyn_define_property(boxed, hidden_name, definition));
+  scr_dyn_release(hidden_name);
+  scr_dyn_release(definition);
+  assert(!scr_exc_pending());
+  scr_dyn_release(boxed);
+  scr_collect_cycles();
+  boxed = scr_dyn_from_error(error);
+  ScrDyn *actual_prototype = scr_dyn_get_prototype(boxed);
+  assert(actual_prototype == prototype);
+  scr_dyn_release(actual_prototype);
+  scr_dyn_release(prototype);
+  definition = scr_dyn_own_descriptor(boxed, hidden_key);
+  assert(scr_dyn_obj_get(definition, "value", 5) == payload);
+  assert(!scr_dyn_obj_get(definition, "writable", 8)->v.b);
+  assert(!scr_dyn_obj_get(definition, "enumerable", 10)->v.b);
+  assert(scr_dyn_obj_get(definition, "configurable", 12)->v.b);
+  scr_dyn_release(definition);
+  scr_str_release(hidden_key);
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+    ScrDyn *value = scr_dyn_iterator_result_get(boxed, names[i], strlen(names[i]));
+    assert(value == payload);
+    scr_dyn_release(value);
+  }
+  scr_error_set_code(error, "UPDATED");
+  ScrStr *stack = scr_str_new("updated stack", 13);
+  scr_error_set_stack(error, stack);
+  scr_str_release(stack);
+  ScrDyn *value = scr_dyn_iterator_result_get(boxed, "code", 4);
+  assert(value && value->kind == SCR_DYN_STR && str_is(value->v.str, "UPDATED"));
+  scr_dyn_release(value);
+  value = scr_dyn_iterator_result_get(boxed, "stack", 5);
+  assert(value && value->kind == SCR_DYN_STR && str_is(value->v.str, "updated stack"));
+  scr_dyn_release(value);
+  ScrStr *key = scr_str_new("extra", 5);
+  scr_dyn_key_delete(boxed, key, true);
+  assert(!scr_exc_pending() && !scr_dyn_has_own(boxed, key));
+  scr_str_release(key);
+  scr_dyn_release(scr_dyn_freeze(boxed));
+  assert(!scr_exc_pending() && scr_dyn_is_frozen(boxed));
+  scr_dyn_release(boxed);
+  scr_collect_cycles();
+  boxed = scr_dyn_from_error(error);
+  assert(scr_dyn_is_frozen(boxed));
+  scr_dyn_release(boxed);
+  scr_error_release(error);
+  scr_dyn_release(payload);
+  scr_collect_cycles();
+}
+
+static void error_adopted_values(void) {
+  for (int kind = 0; kind < 4; kind++) {
+    ErrorHeapSnapshot before = error_heap_snapshot();
+    ScrDyn *original = kind == 0 ? scr_dyn_new_obj()
+        : kind == 1 ? scr_dyn_retain(scr_dyn_undefined()) : scr_dyn_new_num(7);
+    if (kind == 3) {
+      scr_dyn_release(original);
+      ScrBytes *bytes = scr_bytes_new(SCR_BYTES_U8, 8);
+      original = scr_array_buffer_from_bytes(bytes);
+      scr_bytes_release(bytes);
+    }
+    ScrError *carrier = scr_error_from_dyn(original);
+    ScrError *same = scr_error_from_dyn(original);
+    assert(same == carrier);
+    scr_error_release(same);
+    ScrDyn *boxed = scr_dyn_from_error(carrier);
+    assert(boxed == original);
+    assert(!scr_dyn_ref_is_error(original));
+    assert(scr_errdyn_err_of(original) == NULL);
+    scr_dyn_release(boxed);
+    scr_error_release(carrier);
+    /* The original may outlive its carrier. Its next conversion must not
+     * resolve a freed native owner, even when the allocator reuses it. */
+    assert(scr_errdyn_err_of(original) == NULL);
+    for (int i = 0; i < 32; i++) {
+      carrier = scr_error_from_dyn(original);
+      boxed = scr_dyn_from_error(carrier);
+      assert(boxed == original);
+      scr_dyn_release(boxed);
+      scr_error_release(carrier);
+    }
+    scr_dyn_release(original);
+    error_heap_restored(before, "adopted", kind, -1, -1);
+  }
+}
+
+static int error_public_ownership(void) {
+  scr_error_set_traced();
+  scr_init();
+  /* Initialize the shared stack accessors before measuring graph liveness. */
+  ScrError *warm = scr_error_new(SCR_ERR_ERROR, NULL);
+  ScrDyn *boxed = scr_dyn_from_error(warm);
+  ScrDyn *stack = scr_dyn_iterator_result_get(boxed, "stack", 5);
+  scr_dyn_release(stack);
+  scr_dyn_release(boxed);
+  scr_error_release(warm);
+  scr_collect_cycles();
+  error_public_cycles();
+  error_public_properties();
+  error_adopted_values();
+  /* The mark intentionally retains its identity until context teardown. */
+  warm = scr_error_new(SCR_ERR_ERROR, NULL);
+  boxed = scr_dyn_from_error(warm);
+  scr_mark_uncloneable(boxed);
+  assert(scr_uncloneable_marked(boxed));
+  scr_dyn_release(boxed);
+  boxed = scr_dyn_from_error(warm);
+  assert(scr_uncloneable_marked(boxed));
+  scr_dyn_release(boxed);
+  scr_error_release(warm);
+  puts("native Error public ownership checks passed");
+  return 0;
+}
+
 static int error_owned_payloads(void) {
   scr_error_set_traced();
   scr_init();
@@ -1099,6 +1283,7 @@ static int error_owned_payloads(void) {
 
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "error-owned-payloads") == 0) return error_owned_payloads();
+  if (argc == 2 && strcmp(argv[1], "error-public-ownership") == 0) return error_public_ownership();
   assert(argc == 1);
   json_string_boundaries();
   record_frozen_bit();

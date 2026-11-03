@@ -74,6 +74,16 @@ test.each([false, true])(
         });
         expect(errors.stdout).toBe("native Error owned payload checks passed\n");
         expect(errors.stderr).toBe("");
+        const publicState = await exec(binary, ["error-public-ownership"], {
+          env: {
+            ...process.env,
+            SCR_CYCLE_THRESHOLD: threshold,
+            ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1",
+            UBSAN_OPTIONS: "halt_on_error=1",
+          },
+        });
+        expect(publicState.stdout).toBe("native Error public ownership checks passed\n");
+        expect(publicState.stderr).toBe("");
       }
     } finally {
       await rm(scratch, { recursive: true, force: true });

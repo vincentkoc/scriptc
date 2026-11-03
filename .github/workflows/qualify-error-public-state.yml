@@ -1,0 +1,366 @@
+name: Qualify native Error public state
+
+on:
+  push:
+    branches: [feat/scriptc-lazy-stack-integration-20261103]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: error-public-state-focused
+  cancel-in-progress: false
+
+jobs:
+  focused:
+    if: github.repository == 'vincentkoc/scriptc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        working-directory: candidate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 2
+          path: candidate
+      - uses: actions/checkout@v4
+        with:
+          ref: 741731656c0615b33a237354d26dc05043ebae3f
+          persist-credentials: false
+          fetch-depth: 1
+          path: baseline
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+          cache-dependency-path: candidate/pnpm-lock.yaml
+      - name: Disable piped core dumps
+        run: sudo sysctl -w kernel.core_pattern=core
+      - name: Prepare owned focused runner
+        run: |
+          umask 077
+          set -C
+          cat > "$RUNNER_TEMP/error-public-state.mjs" <<'RUNNER'
+          import assert from "node:assert/strict";
+          import { createHash } from "node:crypto";
+          import { spawn, spawnSync } from "node:child_process";
+          import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync, chmodSync, readlinkSync } from "node:fs";
+          import { join, relative, dirname, resolve } from "node:path";
+          import { fileURLToPath } from "node:url";
+          import { setTimeout as delay } from "node:timers/promises";
+          const self=fileURLToPath(import.meta.url),root=process.cwd();
+          const out=join(process.env.RUNNER_TEMP,"error-public-state-proof"),work=join(process.env.RUNNER_TEMP,"error-public-state-work");
+          const trees={candidate:root};
+          const baselineRoot=resolve(root,"../baseline"),baselineHead="741731656c0615b33a237354d26dc05043ebae3f";
+          const owner={workflow:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,source:process.env.GITHUB_SHA,platform:process.platform};
+          const CAP=16*1024*1024;
+          const digest=bytes=>createHash("sha256").update(bytes).digest("hex"),hash=path=>digest(readFileSync(path));
+          const json=path=>JSON.parse(readFileSync(path,"utf8"));
+          const save=(name,value)=>writeFileSync(join(out,name),JSON.stringify(value,null,2)+"\n");
+          const record=path=>({path:relative(out,path),bytes:statSync(path).size,sha256:hash(path)});
+          const scrub=value=>String(value).split(root).join("<source>").split(process.env.RUNNER_TEMP).join("<runner-temp>");
+          const capture=(command,args=[],cwd=root)=>{const r=spawnSync(command,args,{cwd,encoding:"utf8",timeout:30000,maxBuffer:CAP});assert.equal(r.error,undefined);assert.equal(r.status,0,command+": "+r.stderr);return r.stdout.trim();};
+          function verifyWorkOwner(){const st=lstatSync(work);assert.ok(st.isDirectory()&&!st.isSymbolicLink());assert.equal(st.mode&0o777,0o700);assert.deepEqual(json(join(work,"owner.json")),owner);}
+          function sourceAt(dir,head){
+            assert.equal(capture("git",["rev-parse","HEAD"],dir),head);
+            assert.equal(capture("git",["status","--porcelain=v1","--untracked-files=all"],dir),"");
+            const tree=capture("git",["ls-tree","-r","--full-tree","HEAD"],dir);
+            const disk=tree.split("\n").map(row=>{
+              const [metadata,path]=row.split("\t"),mode=metadata.split(" ")[0];
+              assert.ok(["100644","100755","120000"].includes(mode),"unsupported source entry");
+              const p=join(dir,path),st=lstatSync(p);
+              if(mode==="120000"){assert.ok(st.isSymbolicLink());return {path,mode,target:readlinkSync(p)};}
+              assert.ok(st.isFile()&&!st.isSymbolicLink());return {path,mode,bytes:st.size,sha256:hash(p)};
+            });
+            return {head,treeSha256:digest(tree),disk};
+          }
+          const source=()=>sourceAt(root,owner.source);
+          function files(base,prefix=""){return readdirSync(base,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name)).flatMap(item=>{const p=join(base,item.name),name=prefix+item.name,st=lstatSync(p);assert.ok(!st.isSymbolicLink());if(st.isDirectory())return files(p,name+"/");assert.ok(st.isFile());return [{path:name,bytes:st.size,sha256:hash(p)}];});}
+          function tool(command,args=["--version"]){const path=realpathSync(capture("/bin/sh",["-c",'command -v "$1"',"identity",command]));const result=spawnSync(command,args,{encoding:"utf8",timeout:30000,maxBuffer:CAP});assert.equal(result.error,undefined);assert.equal(result.status,0);return {path,sha256:hash(path),version:(result.stdout+result.stderr).trim()};}
+          function groupMembers(group) {
+            assert.ok(Number.isInteger(group) && group > 1 && group !== process.pid);
+            const lines = capture("/bin/ps", ["-axo", "pid=,ppid=,pgid=,stat="]).split("\n");
+            return lines.filter(Boolean).map(line => {
+              const [pid, ppid, pgid, state] = line.trim().split(/\s+/);
+              return { pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), state };
+            }).filter(row => row.pgid === group);
+          }
+          async function run(label, command, args, seconds, env = {}) {
+            const stdoutPath = join(out, label + ".stdout.log"), stderrPath = join(out, label + ".stderr.log");
+            const sinks = [stdoutPath, stderrPath].map(path => ({ fd: openSync(path, "wx"), bytes: 0, retained: 0, hash: createHash("sha256") }));
+            const ready = join(work, label + ".ready"), permit = join(work, label + ".permit");
+            const childEnv = { ...process.env, ...env, DIAGNOSTIC_READY: ready, DIAGNOSTIC_PERMIT: permit };
+            for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "NODE_AUTH_TOKEN", "NODE_OPTIONS", "NODE_CHANNEL_FD", "NODE_CHANNEL_SERIALIZATION_MODE", "OPENCLAW_CLI_RESPAWN_PARENT", "SCRIPTC_CC", "SCRIPTC_TARGET", "SCRIPTC_NO_CACHE", "SCRIPTC_LIBNODE", "SCRIPTC_LLVM_HELPER", "SCRIPTC_LLVM_TEST_MODE", "SCRIPTC_TEST_SHARD", "SCRIPTC_TEST_OPTIMIZATION", "CC", "CXX"]) delete childEnv[key];
+            if (env.SCRIPTC_LIBNODE) { assert.equal(env.SCRIPTC_LIBNODE, process.env.SCRIPTC_LIBNODE); assert.ok(env.SCRIPTC_LIBNODE.startsWith("/")); childEnv.SCRIPTC_LIBNODE = env.SCRIPTC_LIBNODE; }
+            const started = Date.now();
+            const ownerPath = join(out, label + ".owner.json");
+            // Reserve custody before spawning; a failed PID update leaves a marker that forbids cleanup.
+            writeFileSync(ownerPath, JSON.stringify({ spawned: false, parent: process.pid, admitted: false }) + "\n");
+            const child = spawn(process.execPath, [self, "--child", command, ...args], { cwd: root, env: childEnv, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+            const result = { status: "starting", code: null, signal: null, pid: child.pid ?? null, elapsedMs: 0, drained: false, storageComplete: true, forcedCleanup: false, groupSnapshots: [] };
+            let exited = false, closed = false, launchError = null, stopReason = null;
+            child.once("close", () => { closed = true; });
+            child.once("error", error => { launchError = String(error); exited = true; });
+            child.once("exit", (code, signal) => { exited = true; result.code = code; result.signal = signal; });
+            for (const [index, stream] of [child.stdout, child.stderr].entries()) stream.on("data", bytes => {
+              const sink = sinks[index]; sink.bytes += bytes.length;
+              try {
+                sink.hash.update(bytes);
+                const keep = bytes.subarray(0, Math.max(0, CAP - sink.retained));
+                if (keep.length) { writeAll(sink.fd, keep); sink.retained += keep.length; }
+                if (sink.bytes > CAP) { result.storageComplete = false; stopReason = "diagnostic-storage-limit"; }
+              } catch {
+                result.storageComplete = false; stopReason = "diagnostic-storage-error";
+              }
+            });
+            const interrupted = () => { stopReason = "interrupted"; };
+            process.on("SIGTERM", interrupted); process.on("SIGINT", interrupted);
+            try {
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: false }) + "\n");
+              }
+              assert.ok(Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid, "no owned process group");
+              for (let n = 0; n < 100 && !existsSync(ready) && !exited; n++) await delay(100);
+              assert.ok(existsSync(ready) && !exited, "worker did not reach admission handshake");
+              const members = groupMembers(child.pid);
+              assert.ok(members.some(row => row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid), "detached process group identity mismatch");
+              result.groupSnapshots.push({ phase: "admitted", members });
+              writeFileSync(ownerPath, JSON.stringify({ pid: child.pid, parent: process.pid, group: child.pid, admitted: true }) + "\n");
+              writeFileSync(permit, "go\n");
+              const deadline = Date.now() + seconds * 1000;
+              while (!exited && !stopReason && Date.now() < deadline) await delay(100);
+              result.status = launchError ? "launcher-error" : stopReason ?? (!exited ? "timeout" : "exited");
+              if (launchError) result.launchError = launchError;
+            } catch (error) {
+              result.status = "supervisor-error"; result.error = String(error);
+            } finally {
+              process.off("SIGTERM", interrupted); process.off("SIGINT", interrupted);
+              if (Number.isInteger(child.pid) && child.pid > 1 && child.pid !== process.pid) {
+                try {
+                  let members = groupMembers(child.pid);
+                  // Only this detached group is ours. Never signal a PID inferred from a process name.
+                  if (members.length) {
+                    result.forcedCleanup = true;
+                    result.groupSnapshots.push({ phase: "before-term", members });
+                    process.kill(-child.pid, "SIGTERM");
+                    for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    if (members.length) {
+                      result.groupSnapshots.push({ phase: "before-kill", members });
+                      process.kill(-child.pid, "SIGKILL");
+                      for (let n = 0; n < 50 && (members = groupMembers(child.pid)).length; n++) await delay(100);
+                    }
+                  }
+                  result.groupSnapshots.push({ phase: "drained", members });
+                  result.drained = members.length === 0;
+                } catch (error) { result.drainError = String(error); }
+              }
+              for (let n = 0; n < 50 && !closed; n++) await delay(100);
+              result.streamsClosed = closed;
+              if (!closed) result.storageComplete = false;
+              child.stdout.destroy(); child.stderr.destroy();
+              for (const [index, sink] of sinks.entries()) {
+                closeSync(sink.fd);
+                result[index === 0 ? "stdout" : "stderr"] = { ...record([stdoutPath, stderrPath][index]), observedBytes: sink.bytes, observedSha256: sink.hash.digest("hex"), complete: result.storageComplete };
+              }
+              result.elapsedMs = Date.now() - started;
+              save(label + ".process.json", result);
+            }
+            return result;
+          }
+          function writeAll(fd, bytes, write = writeSync) {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const count = write(fd, bytes, offset, bytes.length - offset);
+              assert.ok(Number.isInteger(count) && count > 0 && count <= bytes.length - offset, "short capture write");
+              offset += count;
+            }
+          }
+          function requireSuccess(value) {
+            for (const name of ["stdout", "stderr"]) {
+              assert.ok(Number.isInteger(value[name].bytes) && value[name].bytes >= 0);
+            assert.match(value[name].sha256, /^[0-9a-f]{64}$/);
+            assert.match(value[name].observedSha256, /^[0-9a-f]{64}$/);
+            assert.equal(value[name].complete, true);
+              assert.equal(value[name].bytes, value[name].observedBytes);
+              assert.equal(value[name].sha256, value[name].observedSha256);
+            }
+            assert.equal(value.status, "exited"); assert.equal(value.code, 0); assert.equal(value.signal, null);
+            assert.equal(value.drained, true); assert.equal(value.storageComplete, true); assert.equal(value.streamsClosed, true); assert.equal(value.forcedCleanup, false);
+          }
+
+
+          function allDrained() {
+            return readdirSync(out).filter(name => name.endsWith(".owner.json")).every(name => {
+              const value = json(join(out, name)), path = join(out, name.replace(".owner.json", ".process.json"));
+              if (!existsSync(path)) return false; const result = json(path);
+              return value.admitted === true && value.pid > 1 && value.pid === value.group && result.pid === value.pid && result.drained === true &&
+                result.streamsClosed === true && groupMembers(value.group).length === 0;
+            });
+          }
+
+          async function childMain() {
+            verifyWorkOwner(); writeFileSync(process.env.DIAGNOSTIC_READY, "ready\n");
+            while (!existsSync(process.env.DIAGNOSTIC_PERMIT)) await delay(25);
+            const child = spawn(process.argv[3], process.argv.slice(4), { cwd: root, stdio: "inherit" });
+            child.once("error", error => { process.stderr.write(String(error)); process.exitCode = 1; });
+            child.once("exit", (code, signal) => { if (signal) process.kill(process.pid, signal); else process.exitCode = code ?? 1; });
+          }
+          function readOutput(step,stream){return readFileSync(join(out,step[stream].path),"utf8");}
+          let deadline;
+          function commandBudget(seconds,now=Date.now()){assert.ok(Number.isInteger(seconds)&&seconds>0);const remaining=Math.floor((deadline-now-120000)/1000);assert.ok(remaining>0,"reserved drain/readback budget reached");return Math.min(seconds,remaining);}
+          async function checked(label,command,args,seconds,env={}){const row=await run(label,command,args,commandBudget(seconds),env);requireSuccess(row);return row;}
+          function headArgs(label,command,args){return ["-c",'cd "$1" && shift && exec "$@"',"owned-head",trees[label],command,...args];}
+          async function headRun(label,id,command,args,seconds,env={}){return checked(label+"-"+id,"/bin/sh",headArgs(label,command,args),seconds,env);}
+          function environment(id){const dir=join(work,id);mkdirSync(dir,{mode:0o700});for(const n of ["tmp","cache","xdg"])mkdirSync(join(dir,n),{mode:0o700});return {TMPDIR:join(dir,"tmp"),XDG_CACHE_HOME:join(dir,"xdg"),SCRIPTC_CACHE_DIR:join(dir,"cache"),SCRIPTC_TEST_STABLE_TOOLCHAIN:"1"};}
+          function clearBuildOverrides(env){const removed=[];for(const key of Object.keys(env)){if(/^SCRIPTC_(?:SAN|RUNTIME_PROFILE|NATIVE_PROFILE|NATIVE_LAYOUT|LLVM_CODEGEN|LLVM_PACKAGE|LLVM_PROFILE|LLVM_THINLTO|RUNTIME_BITCODE|RUNTIME_PACK|CPU_DISPATCH|TEST_RUNTIME_SRC_DIR|LINKER|DSYMUTIL|CHECKER)(?:_|$)/.test(key)){delete env[key];removed.push(key);}}return {removed:removed.sort(),runtimePack:"default per-source resolution only",helper:"same exact admitted input and binary only",profiles:"canonical committed profiles; no environment override",valuesRetained:false};}
+
+          const testPaths=[
+            "packages/runtime/src/scr_json.test.ts",
+            "packages/runtime/src/scr_message.test.ts",
+            "packages/compiler/src/backend/llvm/classes.test.ts",
+            "packages/compiler/src/backend/llvm/dyn.test.ts",
+            "packages/compiler/src/backend/llvm/publish.test.ts",
+          ];
+          function testInventory(data,collection){
+            assert.ok(Array.isArray(collection)&&collection.length>0);
+            assert.equal(data.success,true);
+            for(const field of ["numFailedTests","numPendingTests","numTodoTests","numFailedTestSuites","numPendingTestSuites"]) assert.equal(data[field],0,field);
+            const rows=data.testResults.flatMap(suite=>{
+              assert.equal(suite.status,"passed");assert.equal(suite.message,"");
+              return suite.assertionResults.map(row=>{
+                assert.equal(row.status,"passed");assert.deepEqual(row.failureMessages,[]);
+                return {file:relative(root,suite.name),name:[...row.ancestorTitles,row.title].join(" > ")};
+              });
+            });
+            const names=values=>values.map(x=>JSON.stringify(x)).sort();
+            assert.deepEqual([...new Set(rows.map(x=>x.file))].sort(),testPaths.slice().sort());
+            assert.deepEqual(names(rows),names(collection.map(row=>({file:relative(root,resolve(root,row.file)),name:row.name}))));
+            assert.equal(new Set(names(rows)).size,rows.length);
+            assert.equal(data.numTotalTests,rows.length);assert.equal(data.numPassedTests,rows.length);
+            return {count:rows.length,cases:rows};
+          }
+
+          async function baselineWitness(report,env){
+            const fixture=join(work,"public-ownership.c"),original=join(root,"packages/runtime/src/scr_json.test.c");
+            copyFileSync(original,fixture);
+            assert.equal(hash(fixture),hash(original));
+            report.baselineFixture={sha256:hash(fixture),origin:"candidate test bytes against unchanged baseline runtime and headers"};
+            const src=join(baselineRoot,"packages/runtime/src");
+            const units=["scr_json.c","scr_string.c","scr_array.c","scr_arena.c","scr_map.c","scr_exception.c","scr_error.c","scr_number.c","scr_console.c","scr_closure.c","scr_object.c","scr_union.c","scr_cycle.c","scr_alloc.c","scr_lib.c","scr_hash.c","scr_bytes.c","scr_shared.c","scr_bigint.c","scr_url.c","scr_url_params.c","scr_path.c"];
+            report.baselineObservations=[];
+            for(const audit of [false,true]){
+              const label="baseline-audit-"+audit,binary=join(work,label);
+              const args=["-std=c11","-O1","-Wall","-Wextra","-fsanitize=address,undefined","-DSCR_CYC_TESTING",...(audit?["-DSCR_RC_AUDIT"]:[]),"-I",src,"-o",binary,fixture,...units.map(p=>join(src,p)),"-D_GNU_SOURCE","-lm"];
+              report.commands.push(await checked(label+"-build","clang",args,300,env));
+              const binaryHash=hash(binary);
+              for(const threshold of ["1","7","256"]){
+                const row=await run(label+"-threshold-"+threshold,binary,["error-public-ownership"],30,{...env,SCR_CYCLE_THRESHOLD:threshold,ASAN_OPTIONS:"detect_leaks=0:halt_on_error=1",UBSAN_OPTIONS:"halt_on_error=1"});
+                report.commands.push(row);save("summary.json",report);
+                assert.equal(row.signal,"SIGABRT");assert.equal(row.code,null);
+                requireSuccess({...row,signal:null,code:0});
+                assert.equal(readOutput(row,"stdout"),"");
+                const stderr=readOutput(row,"stderr");
+                assert.equal(stderr.split("error-owned phase=public-cycle variant=0 gen=0 alias=0 threshold="+threshold+" ").length,2);
+                assert.match(stderr,/Assertion .*after\.allocated - after\.pooled == before\.allocated - before\.pooled.* failed\./);
+                assert.doesNotMatch(stderr,/AddressSanitizer|LeakSanitizer|runtime error:|timed out|DEADLYSIGNAL/);
+                assert.equal(hash(binary),binaryHash);
+                assert.equal(hash(fixture),report.baselineFixture.sha256);
+                report.baselineObservations.push({audit,threshold,binarySha256:binaryHash,accepted:true,signature:"uncollected-public-property-cycle"});
+              }
+              rmSync(binary);
+            }
+            assert.equal(report.baselineObservations.length,6);
+          }
+
+          async function main(){
+            const report=json(join(out,"summary.json"));verifyWorkOwner();deadline=Date.now()+25*60*1000;
+            try{
+              clearBuildOverrides(process.env);
+              assert.deepEqual(source(),report.sourceBefore);
+              report.toolsBefore={node:tool(process.execPath),pnpm:tool("pnpm"),clang:tool("clang")};
+              assert.equal(report.toolsBefore.node.version,"v24.22.1");assert.equal(report.toolsBefore.pnpm.version,"11.1.3");
+              const env={...environment("focused"),SCRIPTC_TEST_WORKERS:"1"};
+              report.commands.push(await checked("install","pnpm",["install","--frozen-lockfile"],300,env));save("summary.json",report);
+              report.lock=hash(join(root,"node_modules/.pnpm/lock.yaml"));
+              const changed=capture("git",["diff","--name-only","741731656c0615b33a237354d26dc05043ebae3f","HEAD"]).split("\n").filter(Boolean);
+              const js=changed.filter(p=>/\.[cm]?[jt]sx?$/.test(p));
+              if(js.length){
+                report.commands.push(await checked("format","pnpm",["exec","oxfmt","--check",...js],120,env));
+                report.commands.push(await checked("lint","pnpm",["exec","oxlint","--deny-warnings",...js],120,env));
+              }
+              report.commands.push(await checked("build","pnpm",["build"],600,env));save("summary.json",report);
+              const collection=join(out,"tests.collection.json"),results=join(out,"tests.results.json");
+              report.commands.push(await checked("collect","pnpm",["exec","vitest","list",...testPaths,"--json="+collection],120,env));
+              report.commands.push(await checked("test","pnpm",["test",...testPaths,"--reporter=verbose","--reporter=json","--outputFile="+results],660,env));
+              report.inventory=testInventory(json(results),json(collection));
+              await baselineWitness(report,env);
+              report.preCleanupComplete=true;
+            }catch(error){report.error=scrub(error.stack??error);process.stderr.write(report.error+"\n");}
+            finally{
+              try{
+                assert.deepEqual(source(),report.sourceBefore);
+                report.sourceAfter=source();
+                assert.deepEqual(sourceAt(baselineRoot,baselineHead),report.baselineBefore);
+                if(report.lock)assert.equal(hash(join(root,"node_modules/.pnpm/lock.yaml")),report.lock);
+                report.toolsAfter={node:tool(process.execPath),pnpm:tool("pnpm"),clang:tool("clang")};
+                assert.deepEqual(report.toolsAfter,report.toolsBefore);
+                report.inputsVerifiedAfter=true;
+              }catch(error){report.readbackError=scrub(error.stack??error);}
+              save("summary.json",report);
+            }
+            assert.equal(report.preCleanupComplete,true,"focused proof incomplete");
+            assert.equal(report.inputsVerifiedAfter,true,"input readback incomplete");
+          }
+          function initialize(){
+            assert.equal(process.platform,"linux");assert.equal(process.arch,"x64");assert.equal(process.version,"v24.22.1");
+            mkdirSync(work,{mode:0o700});writeFileSync(join(work,"owner.json"),JSON.stringify(owner),{flag:"wx",mode:0o600});
+            mkdirSync(out,{mode:0o700});copyFileSync(self,join(out,"runner.mjs"));
+            save("summary.json",{schema:"scriptc.error-public-state-focused.v1",...owner,runnerSha256:hash(self),sourceBefore:source(),baselineBefore:sourceAt(baselineRoot,baselineHead),testPaths,
+              commands:[],scope:"C ownership and compiler emission prerequisite; V8 promotion disabled",
+              preCleanupComplete:false,inputsVerifiedAfter:false,complete:false,runtimeQualification:false,productionAdoption:false});
+          }
+          function finalize(){
+            const report=json(join(out,"summary.json"));report.cleanup={passed:false,retained:true};
+            try{
+              verifyWorkOwner();assert.deepEqual(Object.fromEntries(Object.keys(owner).map(k=>[k,report[k]])),owner);
+              assert.ok(allDrained(),"owned process closure unresolved");assert.equal(hash(self),report.runnerSha256);
+              assert.deepEqual(source(),report.sourceBefore);
+              assert.deepEqual(sourceAt(baselineRoot,baselineHead),report.baselineBefore);
+              rmSync(work,{recursive:true});report.cleanup={passed:true,retained:false};rmSync(self);
+            }catch(error){report.cleanup.error=scrub(error.stack??error);}
+            report.complete=report.preCleanupComplete===true&&report.inputsVerifiedAfter===true&&report.cleanup.passed;
+            save("summary.json",report);save("artifact-manifest.json",files(out).filter(r=>r.path!=="artifact-manifest.json"));
+            assert.equal(report.complete,true,"focused ownership proof incomplete");
+          }
+          try{
+            if(process.argv[2]==="--init")initialize();
+            else if(process.argv[2]==="--finalize")finalize();
+            else if(process.argv[2]==="--child")await childMain();
+            else await main();
+          }catch(error){process.stderr.write(scrub(error.stack??error)+"\n[error-public-state] FAILED (exit 1)\n");process.exitCode=1;}
+
+          RUNNER
+          node "$RUNNER_TEMP/error-public-state.mjs" --init
+      - name: Run C ownership and compiler emission checks
+        run: |
+          ulimit -c 0
+          node "$RUNNER_TEMP/error-public-state.mjs"
+      - name: Verify custody and remove owned scratch
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/error-public-state.mjs"
+          node "$RUNNER_TEMP/error-public-state.mjs" --finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: error-public-state-focused
+          path: ${{ runner.temp }}/error-public-state-proof
+          if-no-files-found: error
+          retention-days: 1

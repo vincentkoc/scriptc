@@ -3578,8 +3578,10 @@ static ScrDyn *scr_net_lookup_dyn_thunk(ScrClosure *clo, ScrDyn *const *args, si
   ScrArr *ips = NULL;
   bool failed = scr_dyn_truthy(err);
   if (failed) {
-    const ScrDyn *m = err->kind == SCR_DYN_OBJ ? scr_dyn_obj_get(err, "message", 7) : NULL;
+    ScrDyn *m = err->kind == SCR_DYN_OBJ || err->kind == SCR_DYN_TYPED_REF
+        ? scr_dyn_iterator_result_get(err, "message", 7) : NULL;
     msg = m != NULL && m->kind == SCR_DYN_STR ? scr_str_retain(m->v.str) : scr_dyn_string_coerce_js(err);
+    scr_dyn_release(m);
   } else {
     ScrDyn *view = addr->kind == SCR_DYN_TYPED_REF ? scr_dyn_typed_ref_materialize(addr) : NULL;
     const ScrDyn *list = view != NULL ? view : addr;

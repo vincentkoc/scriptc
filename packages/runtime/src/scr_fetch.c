@@ -309,9 +309,7 @@ static void sf_not_function(const char *what) {
 }
 
 static bool sf_is_error_dyn(const ScrDyn *d) {
-  if (!d || d->kind != SCR_DYN_OBJ) return false;
-  const ScrDyn *mark = scr_dyn_obj_get(d, "%error", 6);
-  return mark && mark->kind == SCR_DYN_BOOL && mark->v.b;
+  return d && scr_dyn_ref_is_error(d);
 }
 
 static void sf_throw_dyn_reason(ScrDyn *reason) {
@@ -5998,8 +5996,6 @@ static ScrDyn *sf_failure_cause(const ScrStr *message) {
   scr_error_set_code(e, code_buf);
   e->system_errno = uv;
   e->system_call = scr_str_new(data, syscall_len);
-  ScrDyn *cause = scr_dyn_from_error(e);
-  scr_error_release(e);
   const char *detail = code_end < end ? code_end + 1 : end;
   size_t detail_len = (size_t)(end - detail);
   if (syscall_len == 7 && memcmp(data, "connect", 7) == 0 && detail_len > 0) {
@@ -6009,15 +6005,17 @@ static ScrDyn *sf_failure_cause(const ScrStr *message) {
     }
     if (colon != NULL && colon > detail && colon + 1 < end) {
       ScrStr *address = scr_str_new(detail, (size_t)(colon - detail));
-      scr_dyn_obj_set(cause, "address", 7, scr_dyn_new_str(address));
+      scr_error_set_prop(e, "address", 7, scr_dyn_new_str(address));
       scr_str_release(address);
-      scr_dyn_obj_set(cause, "port", 4, scr_dyn_new_num(strtod(colon + 1, NULL)));
+      scr_error_set_prop(e, "port", 4, scr_dyn_new_num(strtod(colon + 1, NULL)));
     }
   } else if (syscall_len == 11 && memcmp(data, "getaddrinfo", 11) == 0 && detail_len > 0) {
     ScrStr *hostname = scr_str_new(detail, detail_len);
-    scr_dyn_obj_set(cause, "hostname", 8, scr_dyn_new_str(hostname));
+    scr_error_set_prop(e, "hostname", 8, scr_dyn_new_str(hostname));
     scr_str_release(hostname);
   }
+  ScrDyn *cause = scr_dyn_from_error(e);
+  scr_error_release(e);
   return cause;
 }
 

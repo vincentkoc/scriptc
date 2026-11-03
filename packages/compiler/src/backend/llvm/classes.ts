@@ -973,7 +973,7 @@ export function classUndefinedFieldInits(
   meta.def.fields.forEach((f, i) => {
     // Error.cause uses NULL for absence; an options constructor installs
     // a value only when the cause property is present.
-    if (f.name === "%cause") return;
+    if (f.name === "%cause" || f.name === "%errorPublicState") return;
     // A nullable-pointer field's zeroed slot already is its unit arm.
     if (nullable?.get(meta.def.name, f.name)) return;
     // An inline array field's slot holds its count, which `new` stores.
@@ -1277,7 +1277,15 @@ export function emitClassShapes(
     // (the public one on standalone classes, the DIRECT one on hierarchy
     // members). Runs at rc == 0.
     const teardown = (lines: string[]): void => {
+      if (meta.root.def.name === "%Error") {
+        host.declare(`declare void @scr_error_state_forget(ptr)`);
+        lines.push(`  call void @scr_error_state_forget(ptr %o)`);
+      }
       const release = (prefix: string, f: (typeof refFields)[number], t: number): string[] => {
+        if (meta.root.def.name === "%Error" && f.name === "%errorPublicState") {
+          host.declare(`declare void @scr_error_state_drop(ptr)`);
+          return [`  call void @scr_error_state_drop(ptr %v${t}) ; private Error state`];
+        }
         // An Array subclass instance's destroy releases its fields plainly
         // (it takes no chain length).
         const direct =
@@ -1301,6 +1309,9 @@ export function emitClassShapes(
       const loads = refFields.map((f, t) => [
         `  %f${t} = getelementptr inbounds %${struct}, ptr %o, i64 0, i32 ${f.index}`,
         `  %v${t} = load ptr, ptr %f${t}`,
+        ...(meta.root.def.name === "%Error" && f.name === "%errorPublicState"
+          ? [`  store ptr null, ptr %f${t}`]
+          : []),
       ]);
       if (segmented) {
         // A segmented teardown loads its fields, releases its own block, and
@@ -1668,15 +1679,22 @@ export function emitClassShapes(
         defs.push(
           ...arenaDisposeLines(
             newSym,
-            refFields.flatMap((f, t) =>
-              disposeFieldLines(
-                t,
-                `getelementptr inbounds %${struct}, ptr %o, i64 0, i32 ${f.index}`,
-                plainRefType(f.type),
-                releaseSym(host, f.type),
-                llvmCommentText(f.name),
+            [
+              ...(meta.root.def.name === "%Error"
+                ? [`  call void @scr_error_state_forget(ptr %o)`]
+                : []),
+              ...refFields.flatMap((f, t) =>
+                disposeFieldLines(
+                  t,
+                  `getelementptr inbounds %${struct}, ptr %o, i64 0, i32 ${f.index}`,
+                  plainRefType(f.type),
+                  meta.root.def.name === "%Error" && f.name === "%errorPublicState"
+                    ? "@scr_error_state_drop"
+                    : releaseSym(host, f.type),
+                  llvmCommentText(f.name),
+                ),
               ),
-            ),
+            ],
           ),
         );
     }
@@ -1712,6 +1730,10 @@ export function emitClassShapes(
         `define internal void @${mangleClassGcFree(cls.name)}(ptr %o) ${FN_ATTRS} { ; gcFree ${cls.name}`,
         `entry:`,
       ];
+      if (meta.root.def.name === "%Error") {
+        host.declare(`declare void @scr_error_state_forget(ptr)`);
+        gf.push(`  call void @scr_error_state_forget(ptr %o)`);
+      }
       if (runtimePrefix) gf.push(...regCall("gf", runtimePrefix.gcFree, ""));
       if (isStreamRooted) gf.push(...stCall("gfs", "scr_stream_st_gcfree", ""));
       untracedRefFields.forEach((f, i) => {

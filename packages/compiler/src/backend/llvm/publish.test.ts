@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { F64, STRING, VOID, type IrModule } from "../../ir/ir.js";
+import { DYN, F64, STRING, VOID, type IrModule } from "../../ir/ir.js";
 import { emitLlvmModule } from "./emitter.js";
 
 const loc = { file: "publish-walkers.ts", start: 0, end: 1 };
@@ -102,4 +102,21 @@ test("walkers of classes with more than ten pushed fields keep their value names
   const defined = [...fn.matchAll(/^ {2}(%[\w.]+) = /gm)].map((m) => m[1]);
   expect(defined.length).toBeGreaterThan(12 * 8);
   expect(new Set(defined).size).toBe(defined.length);
+});
+
+test("runtime Error roots refuse publication before walking private state", () => {
+  const fields = [{ name: "%errorPublicState", type: DYN }];
+  const errors: IrModule = {
+    ...mod,
+    classes: [
+      { name: "%Error", runtime: true, fields, methods: [], loc },
+      { name: "Node", base: "%Error", fields, methods: [], loc },
+    ],
+  };
+  const llvm = emitLlvmModule(errors, { pointerBits: 64 });
+  const body = walker(llvm);
+  expect(body).not.toBe("");
+  expect(body).not.toContain("@scr_pub_dyn_fn");
+  expect(body).not.toContain("getelementptr");
+  expect(llvm).toContain("Cannot publish a Error object");
 });

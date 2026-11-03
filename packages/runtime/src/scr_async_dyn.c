@@ -576,9 +576,9 @@ ScrDyn *scr_unhandled_rejection_error(ScrDyn *reason) {
   scr_str_release(error->name);
   error->name = scr_str_new("UnhandledPromiseRejection", 25);
   error->code = scr_str_new("ERR_UNHANDLED_REJECTION", 23);
-  ScrDyn *value = scr_dyn_from_error(error);
   /* Node's class fields: code, then name, both own and enumerable */
-  scr_dyn_obj_set(value, "name", 4, scr_dyn_new_str(error->name));
+  scr_error_set_prop(error, "name", 4, scr_dyn_new_str(error->name));
+  ScrDyn *value = scr_dyn_from_error(error);
   scr_error_release(error);
   return value;
 }

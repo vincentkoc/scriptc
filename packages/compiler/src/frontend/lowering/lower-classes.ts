@@ -999,6 +999,8 @@ export function registerBuiltinErrorClasses(lowerer: Lowerer): void {
           { name: "%systemCode", type: STRING },
           { name: "%nativePlain", type: BOOL },
           { name: "%errnoOrder", type: BOOL },
+          // A private traced owner; classes.ts emits its runtime destructor.
+          { name: "%errorPublicState", type: DYN },
         ],
         loc,
       },
