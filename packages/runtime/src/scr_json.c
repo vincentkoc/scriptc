@@ -31,6 +31,12 @@ static bool scr_error_state_adopted(const ScrErrorState *state);
 static ScrDyn *scr_error_capsule_view(const ScrDyn *capsule);
 static void scr_error_capsule_bind_view(const ScrDyn *capsule, ScrDyn *view);
 
+static bool scr_error_owned_capsule(const ScrDyn *value) {
+  if (value->kind != SCR_DYN_TYPED_REF) return false;
+  ScrErrorState *state = scr_error_state_of_value(value);
+  return state && !scr_error_state_adopted(state);
+}
+
 const ScrDateClassHooks *scr_date_class_hooks = NULL;
 
 /* The checked-dynamic Error.prototype (scr_dyn_error_prototype) is not the
@@ -4880,10 +4886,14 @@ ScrDyn *scr_dyn_typed_ref_materialize(const ScrDyn *d) {
     scr_dyn_release(fresh->prototype);
     fresh->prototype = capsule->v.typed_ref.materialized->prototype ? scr_dyn_retain(capsule->v.typed_ref.materialized->prototype) : NULL;
     fresh->null_proto = capsule->v.typed_ref.materialized->null_proto;
-    scr_dyn_release(fresh->symbol_properties);
-    scr_dyn_release(fresh->symbol_keys);
-    fresh->symbol_properties = capsule->v.typed_ref.materialized->symbol_properties ? scr_dyn_retain(capsule->v.typed_ref.materialized->symbol_properties) : NULL;
-    fresh->symbol_keys = capsule->v.typed_ref.materialized->symbol_keys ? scr_dyn_retain(capsule->v.typed_ref.materialized->symbol_keys) : NULL;
+    /* Error subclass snapshots include the native bag and declared symbol
+     * fields. Keeping the old table would erase definitions or typed writes. */
+    if (!scr_error_owned_capsule(capsule)) {
+      scr_dyn_release(fresh->symbol_properties);
+      scr_dyn_release(fresh->symbol_keys);
+      fresh->symbol_properties = cached->symbol_properties ? scr_dyn_retain(cached->symbol_properties) : NULL;
+      fresh->symbol_keys = cached->symbol_keys ? scr_dyn_retain(cached->symbol_keys) : NULL;
+    }
     size_t cached_rc = capsule->v.typed_ref.materialized->rc;
     size_t fresh_rc = fresh->rc;
     ScrDyn old = *capsule->v.typed_ref.materialized;
@@ -10117,6 +10127,7 @@ void scr_dyn_symbol_key_set(ScrDyn *value, ScrDyn *key, ScrDyn *stored) {
     scr_dyn_key_set(receiver->symbol_properties, name, stored);
     if (!scr_exc_pending() && !present) scr_dyn_arr_push(receiver->symbol_keys, scr_dyn_retain(key));
     scr_str_release(name);
+    if (!scr_exc_pending() && scr_error_owned_capsule(value)) scr_dyn_typed_ref_commit(value);
   }
   scr_dyn_release(receiver);
 }
@@ -10257,11 +10268,48 @@ void scr_dyn_obj_delete_symbol_field(ScrDyn *obj, ScrDyn *symbol) {
   }
 }
 
+/* A rejected native-field deletion must restore the live view. Only a
+ * commit failure after a real removal is a non-configurable-field refusal. */
+static void scr_dyn_typed_ref_delete(ScrDyn *value, const ScrDyn *key, bool strict) {
+  ScrDyn *view = scr_dyn_typed_ref_materialize(value);
+  bool own = !scr_exc_pending() && scr_dyn_has_own_computed(view, key);
+  if (!scr_exc_pending()) scr_dyn_key_delete_computed(view, key, strict);
+  bool deleted = own && !scr_exc_pending() && !scr_dyn_has_own_computed(view, key);
+  bool rejected = false;
+  if (deleted && !scr_exc_pending()) {
+    scr_dyn_typed_ref_commit(value);
+    rejected = deleted && scr_exc_pending();
+    if (!scr_exc_pending() && key->kind == SCR_DYN_STR)
+      scr_error_sync_slots(value, view, key->v.str);
+  }
+  scr_dyn_release(view);
+  if (rejected) {
+    scr_exc_clear();
+    scr_dyn_release(scr_dyn_typed_ref_materialize(value));
+    if (strict && !scr_exc_pending()) {
+      ScrStr *name = key->kind == SCR_DYN_SYMBOL
+          ? key->v.symbol.render(key->v.symbol.value) : scr_str_retain(key->v.str);
+      ScrJsonBuf message;
+      scr_jb_init(&message);
+      scr_jb_puts(&message, "Cannot delete property '");
+      scr_jb_write(&message, name->data, name->len);
+      scr_jb_puts(&message, "' of #<Object>");
+      scr_str_release(name);
+      scr_throw_error(SCR_ERR_TYPE, scr_jb_finish(&message));
+    }
+  }
+}
+
 void scr_dyn_key_delete_computed(ScrDyn *value, const ScrDyn *raw_key, bool strict) {
   ScrDyn *key = scr_dyn_property_key_value(raw_key);
   if (!key) return;
   if (key->kind != SCR_DYN_SYMBOL) {
     scr_dyn_key_delete(value, key->v.str, strict);
+    scr_dyn_release(key);
+    return;
+  }
+  if (scr_error_owned_capsule(value)) {
+    scr_dyn_typed_ref_delete(value, key, strict);
     scr_dyn_release(key);
     return;
   }
@@ -11355,6 +11403,9 @@ static ScrDyn *scr_error_stack_set_call(ScrClosure *closure, ScrDyn *const *args
       scr_dyn_release(old_value);
       scr_dyn_release(old_getter);
       scr_dyn_release(old_setter);
+      /* This native setter owns the accessor-to-data mutation. An outer
+       * assignment must not commit after arbitrary user setters run. */
+      if (!scr_exc_pending() && scr_error_owned_capsule(self)) scr_dyn_typed_ref_commit(self);
     }
     scr_dyn_release(view);
   }
@@ -13071,8 +13122,9 @@ static void scr_dyn_throw_property(const ScrDyn *object, const char *key, size_t
 
 /* One lookup of the own property decides the assignment: an own property
  * is written (or runs its setter, or refuses the write); an absent one
- * consults the prototype chain and is then added. */
-static void scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, const ScrDyn *receiver) {
+ * consults the prototype chain and is then added. Return true only for a data
+ * write: a user setter can mutate native fields, making this snapshot stale. */
+static bool scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, const ScrDyn *receiver) {
   if (recv->v.obj.layout) {
     ScrDyn **slot = scr_dyn_layout_slot(recv, key->data, key->len);
     if (slot) {
@@ -13081,7 +13133,7 @@ static void scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, con
       *slot = scr_dyn_retain(value);
       scr_dyn_release(old);
       scr_error_sync_cause(recv, key);
-      return;
+      return true;
     }
   }
   ScrDynEntry *entry = recv->v.obj.layout ? NULL : scr_dyn_entry(recv, key);
@@ -13094,22 +13146,22 @@ static void scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, con
       scr_dyn_this_pop();
       scr_dyn_release(setter);
       scr_dyn_release(result);
-      return;
+      return false;
     }
     if (entry->accessor || !entry->writable) {
       scr_dyn_throw_property(receiver, key->data, key->len, false);
-      return;
+      return false;
     }
     if (entry->fenced) {
       scr_dyn_namespace_member_fence();
-      return;
+      return false;
     }
     scr_dyn_region_store(recv, value);
     ScrDyn *old = entry->value;
     entry->value = scr_dyn_retain(value);
     scr_dyn_release(old);
     scr_error_sync_cause(recv, key);
-    return;
+    return true;
   }
   {
     for (const ScrDyn *current = scr_dyn_proto_next(recv); current;) {
@@ -13138,12 +13190,12 @@ static void scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, con
         scr_dyn_release(setter);
         scr_dyn_release(result);
         scr_dyn_release(table);
-        return;
+        return false;
       }
       if (inherited->accessor || !inherited->writable) {
         scr_dyn_throw_property(receiver, key->data, key->len, false);
         scr_dyn_release(table);
-        return;
+        return false;
       }
       scr_dyn_release(table);
       break;
@@ -13157,7 +13209,7 @@ static void scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, con
     scr_jb_puts(&buffer, ", object is not extensible");
     scr_throw_error(SCR_ERR_TYPE, scr_jb_finish(&buffer));
     scr_dyn_note_assign_failure();
-    return;
+    return false;
   }
   scr_dyn_obj_set(recv, key->data, key->len, scr_dyn_retain(value));
   if (key->len == 5 && memcmp(key->data, "stack", 5) == 0 &&
@@ -13169,7 +13221,7 @@ static void scr_dyn_object_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value, con
     if (entry) entry->enumerable = false;
   }
   scr_error_sync_cause(recv, key);
-  return;
+  return true;
 }
 
 void scr_dyn_arr_named_put(ScrDyn *arr, const char *key, size_t key_len, ScrDyn *value) {
@@ -13180,6 +13232,15 @@ void scr_dyn_arr_named_put(ScrDyn *arr, const char *key, size_t key_len, ScrDyn 
   scr_dyn_obj_set(arr->v.arr.properties, key, key_len, value);
 }
 
+static void scr_dyn_error_key_set(ScrDyn *target, ScrStr *key, ScrDyn *value, ScrDyn *receiver) {
+  ScrDyn *view = scr_dyn_typed_ref_materialize(target);
+  if (!scr_exc_pending() && scr_dyn_object_key_set(view, key, value, receiver) && !scr_exc_pending()) {
+    scr_dyn_typed_ref_commit(target);
+    if (!scr_exc_pending()) scr_error_sync_slots(target, view, key);
+  }
+  scr_dyn_release(view);
+}
+
 void scr_dyn_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value) {
   if (scr_dyn_class_reflection_fence(recv) || scr_dyn_error_prototype_fence(recv)) return;
   if (recv->kind == SCR_DYN_PROXY) { scr_dyn_proxy_set(recv, key, value); return; }
@@ -13187,16 +13248,13 @@ void scr_dyn_key_set(ScrDyn *recv, ScrStr *key, ScrDyn *value) {
     if (scr_typed_ref_array_set(recv, key, value)) return;
     if (scr_typed_ref_record_set(recv, key, value)) return;
     if (scr_event_ref_hooks && scr_event_ref_hooks->set(recv, key, value)) return;
-    ScrDyn *materialized = scr_dyn_typed_ref_materialize(recv);
-    if (materialized->kind == SCR_DYN_OBJ && scr_error_state_of_value(recv))
-      scr_dyn_object_key_set(materialized, key, value, recv);
-    else scr_dyn_key_set(materialized, key, value);
-    if (!scr_exc_pending()) {
-      scr_dyn_typed_ref_commit(recv);
-      /* An Error subclass's class commit writes its declared fields; the
-       * slots it inherits from Error take the write here. */
-      scr_error_sync_slots(recv, materialized, key);
+    if (scr_error_owned_capsule(recv)) {
+      scr_dyn_error_key_set(recv, key, value, recv);
+      return;
     }
+    ScrDyn *materialized = scr_dyn_typed_ref_materialize(recv);
+    scr_dyn_key_set(materialized, key, value);
+    if (!scr_exc_pending()) scr_dyn_typed_ref_commit(recv);
     scr_dyn_release(materialized);
     return;
   }
@@ -15380,31 +15438,9 @@ void scr_dyn_key_delete(ScrDyn *recv, const ScrStr *key, bool strict) {
   if (recv->kind == SCR_DYN_TYPED_REF && recv->v.typed_ref.commit &&
       (!strncmp(recv->v.typed_ref.type_key, "record:", 7) ||
        !strncmp(recv->v.typed_ref.type_key, "object:", 7))) {
-    ScrDyn *materialized = scr_dyn_typed_ref_materialize(recv);
-    bool own = !scr_exc_pending() && materialized->kind == SCR_DYN_OBJ &&
-               scr_dyn_entry(materialized, key) != NULL;
-    if (!scr_exc_pending()) scr_dyn_key_delete(materialized, key, strict);
-    bool deleted = own && !scr_exc_pending();
-    if (!scr_exc_pending()) {
-      scr_dyn_typed_ref_commit(recv);
-      scr_error_sync_slots(recv, materialized, key);
-    }
-    scr_dyn_release(materialized);
-    if (deleted && scr_exc_pending()) {
-      /* The native layout requires this field, so the commit rejected the
-       * view before storing anything new. Restore the view from the native
-       * value and refuse the delete like a non-configurable property. */
-      scr_exc_clear();
-      scr_dyn_release(scr_dyn_typed_ref_materialize(recv));
-      if (strict && !scr_exc_pending()) {
-        ScrJsonBuf message;
-        scr_jb_init(&message);
-        scr_jb_puts(&message, "Cannot delete property '");
-        scr_jb_write(&message, key->data, key->len);
-        scr_jb_puts(&message, "' of #<Object>");
-        scr_throw_error(SCR_ERR_TYPE, scr_jb_finish(&message));
-      }
-    }
+    ScrDyn *name = scr_dyn_new_str((ScrStr *)key);
+    scr_dyn_typed_ref_delete(recv, name, strict);
+    scr_dyn_release(name);
     return;
   }
   /* A live native array keeps the noncanonical numeric properties written
@@ -17058,10 +17094,20 @@ ScrDyn *scr_dyn_obj_read_ic(const ScrDyn *d, const ScrStr *key, ScrDynReadIc *ic
 /* Compiler-owned class property tables use their native instance as the
  * receiver of inherited accessors, retaining field updates on that instance. */
 ScrDyn *scr_dyn_bag_get(ScrDyn *bag, ScrStr *key, ScrDyn *receiver) {
+  if (scr_error_owned_capsule(bag)) {
+    ScrDyn *name = scr_dyn_new_str(key);
+    ScrDyn *result = scr_dyn_reflect_get(bag, name, receiver);
+    scr_dyn_release(name);
+    return result;
+  }
   return scr_dyn_obj_read_receiver(bag, key->data, key->len, receiver);
 }
 
 void scr_dyn_bag_set(ScrDyn *bag, ScrStr *key, ScrDyn *value, ScrDyn *receiver) {
+  if (scr_error_owned_capsule(bag)) {
+    scr_dyn_error_key_set(bag, key, value, receiver);
+    return;
+  }
   scr_dyn_object_key_set(bag, key, value, receiver);
 }
 
@@ -17106,7 +17152,11 @@ bool scr_dyn_reflect_define(ScrDyn *receiver, ScrDyn *raw_key, ScrDyn *value) {
   if (receiver->kind == SCR_DYN_TYPED_REF) {
     ScrDyn *view = scr_dyn_typed_ref_materialize(receiver);
     if (!scr_exc_pending()) ok = scr_dyn_reflect_define(view, key, value);
-    if (ok) scr_dyn_typed_ref_commit(receiver);
+    if (ok) {
+      scr_dyn_typed_ref_commit(receiver);
+      if (!scr_exc_pending() && key->kind == SCR_DYN_STR)
+        scr_error_sync_slots(receiver, view, key->v.str);
+    }
     scr_dyn_release(view);
   } else if (receiver->kind == SCR_DYN_PROXY) {
     scr_dyn_proxy_unsupported("Reflect.set receiver definition");

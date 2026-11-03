@@ -34,6 +34,22 @@ Object.setPrototypeOf(error, null);
 console.log("error null", error instanceof ReadableStream, isInstance(error, RS));
 console.log("error child null", errorChild instanceof ReadableStream, isInstance(errorChild, RS));
 
+const streamSymbol = Symbol("stream Error");
+class StreamError extends Error {}
+/** @param {any} value */
+function inspectStreamError(value) {
+  Object.defineProperty(value, streamSymbol, { get() { return this; } });
+  return value[streamSymbol] === value;
+}
+const streamError = new StreamError("array element");
+const streamValue = (await ReadableStream.from([streamError]).getReader().read()).value;
+console.log("stream Error", inspectStreamError(streamValue), streamValue === streamError);
+const unionError = new StreamError("union element");
+/** @type {(StreamError | string)[]} */
+const unionElements = [unionError, "tail"];
+const unionValue = (await ReadableStream.from(unionElements).getReader().read()).value;
+console.log("stream union Error", inspectStreamError(unionValue), unionValue === unionError);
+
 const locked = new ReadableStream();
 locked.getReader();
 try {

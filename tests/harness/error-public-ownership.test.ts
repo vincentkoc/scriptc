@@ -15,8 +15,11 @@ import {
 const exec = promisify(execFile);
 const sanitize = process.env["SCRIPTC_SAN"] === "1";
 const shared = `
+const requiredSymbol = Symbol("required");
+const publicSymbol = Symbol("public");
 class OwnedError extends Error {
   next: OwnedError | null = null;
+  [requiredSymbol] = 1;
   constructor(readonly tag: number) { super("owned " + tag); }
 }
 function dyn(value: unknown): any {
@@ -27,7 +30,31 @@ function readPayload(error: Error): number {
 }
 `;
 const ordinary = `
+function probe(error: any): any {
+  Object.defineProperty(error, publicSymbol, { get() { return this; } });
+  if (error[publicSymbol] !== error) throw new Error("lost nested receiver");
+  return error;
+}
+function recordProbe(value: any): any { return probe(value.child); }
+function arrayProbe(value: any): any { return probe(value[0]); }
+function unionProbe(value: OwnedError | { other: number }): any { return probe(value); }
+function nested(): void {
+  const recordError = new OwnedError(1);
+  const record: { child: OwnedError } = { child: recordError };
+  if (recordProbe(record) !== dyn(recordError)) throw new Error("record identity");
+  const arrayError = new OwnedError(2);
+  const array: OwnedError[] = [arrayError];
+  if (arrayProbe(array) !== dyn(arrayError)) throw new Error("array identity");
+  const unionError = new OwnedError(3);
+  if (unionProbe(unionError) !== dyn(unionError)) throw new Error("union identity");
+  let refused = false;
+  try { delete dyn(unionError)[requiredSymbol]; }
+  catch (error) { refused = error instanceof TypeError; }
+  if (!refused || unionError[requiredSymbol] !== 1 || dyn(unionError)[requiredSymbol] !== 1)
+    throw new Error("required symbol deletion changed native state");
+}
 function ordinary(): void {
+  nested();
   for (let i = 0; i < 100; i++) {
     const error = new OwnedError(i);
     error.next = new OwnedError(-1);

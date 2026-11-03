@@ -631,21 +631,19 @@ export function liveDynUnionRefAdapter(
   if (!union) {
     throw new InternalCompilerError(`llvm emitter bug: live dyn ref of unknown union ${t.unionId}`);
   }
-  // Codec records box as their own handles, by reference, through toDynHelper.
-  const codecArm = (arm: IrType): boolean =>
-    textCodecRecordClass(arm, (id) => host.recordsById.get(id)) !== null;
+  // Codec handles and Errors keep their canonical owner when nested in a union.
+  const directArm = (arm: IrType): boolean =>
+    textCodecRecordClass(arm, (id) => host.recordsById.get(id)) !== null ||
+    (arm.kind === "object" && host.shapeHost.isErrorClass(arm.className));
   const mutableArms = union.arms
     .map((arm, tag) => ({ arm, tag }))
     .filter(
       ({ arm }) =>
         arm.kind !== "bytes" &&
-        !codecArm(arm) &&
+        !directArm(arm) &&
         (streamTypedRefEligible(arm) || isDynTypedRefType(arm)),
     );
-  if (
-    mutableArms.length === 0 &&
-    !union.arms.some((arm) => arm.kind === "bytes" || codecArm(arm))
-  ) {
+  if (mutableArms.length === 0 && !union.arms.some((arm) => arm.kind === "bytes" || directArm(arm))) {
     throw new InternalCompilerError(`llvm emitter bug: live dyn ref of immutable union ${key}`);
   }
 
@@ -824,6 +822,7 @@ export function streamTypedRefBoxValue(
   // it does outside a live view.
   if (
     t.kind === "bytes" ||
+    (t.kind === "object" && host.shapeHost.isErrorClass(t.className)) ||
     textCodecRecordClass(t, (id) => host.recordsById.get(id)) !== null ||
     (!streamTypedRefEligible(t) && !isDynTypedRefType(t))
   ) {
@@ -1964,9 +1963,19 @@ export function streamFromArrayAdapter(
   const unionRefArms =
     unionDef?.arms
       .map((arm, tag) => ({ arm, tag }))
-      .filter(({ arm }) => isRefCounted(arm) && arm.kind !== "dyn" && arm.kind !== "string") ?? [];
+      .filter(
+        ({ arm }) =>
+          isRefCounted(arm) &&
+          arm.kind !== "dyn" &&
+          arm.kind !== "string" &&
+          !(arm.kind === "object" && host.shapeHost.isErrorClass(arm.className)),
+      ) ?? [];
   const typedRef =
-    isRefCounted(elem) && elem.kind !== "dyn" && elem.kind !== "string" && elem.kind !== "union";
+    isRefCounted(elem) &&
+    elem.kind !== "dyn" &&
+    elem.kind !== "string" &&
+    elem.kind !== "union" &&
+    !(elem.kind === "object" && host.shapeHost.isErrorClass(elem.className));
   let snapshot = `${sym}_materialize`;
   let value: string;
   if (elem.kind === "f64") {

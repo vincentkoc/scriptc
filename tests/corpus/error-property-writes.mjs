@@ -14,6 +14,9 @@ format("bad");
 const symbol = Symbol("error property");
 const receiverSymbol = Symbol("receiver");
 const throwingSymbol = Symbol("throwing getter");
+const nativeSymbol = Symbol("native field");
+const setterSymbol = Symbol("setter");
+const temporarySymbol = Symbol("temporary");
 const sentinel = new Error("getter sentinel");
 let getterCalls = 0;
 let jsonCalls = 0;
@@ -78,7 +81,53 @@ const owned = new Error("owned");
 decorate(owned);
 checkProperties(owned);
 checkBuiltinIntegrity(owned);
-class PropertyError extends Error {}
+class PropertyError extends Error {
+  [nativeSymbol] = 1;
+  count = 0;
+  method() { return 5; }
+}
 const subclass = new PropertyError("subclass");
 decorate(subclass);
 checkProperties(subclass);
+
+/** @param {any} error */
+function readNative(error) { return error[nativeSymbol]; }
+/** @param {any} error */
+function writeNative(error) { error[nativeSymbol] = 3; error.other = 4; }
+console.log("native initial", readNative(subclass));
+subclass[nativeSymbol] = 2;
+console.log("typed to dynamic", readNative(subclass));
+writeNative(subclass);
+console.log("dynamic to typed", subclass[nativeSymbol], readNative(subclass));
+
+/** @param {any} error */
+function installSetters(error) {
+  Object.defineProperty(error, "setter", {
+    set(value) { subclass.count = value; console.log("string setter", this === error); },
+  });
+  Object.defineProperty(error, setterSymbol, {
+    set(value) { subclass.count = value; console.log("symbol setter", this === error); },
+  });
+  Object.defineProperty(error, "method", { get() { return this; } });
+}
+/** @param {any} error */
+function checkSetters(error) {
+  error.setter = 6;
+  console.log("string setter field", subclass.count);
+  error[setterSymbol] = 7;
+  console.log("symbol setter field", subclass.count);
+  console.log("method shadow", error.method === error);
+  error[temporarySymbol] = 8;
+  error.other = 9;
+  console.log("symbol stored", error[temporarySymbol]);
+  delete error[temporarySymbol];
+  error.other = 10;
+}
+/** @param {any} error */
+function checkDeleted(error) {
+  console.log("symbol deleted", !(temporarySymbol in error), error[temporarySymbol] === undefined);
+  console.log("native retained", error[nativeSymbol]);
+}
+installSetters(subclass);
+checkSetters(subclass);
+checkDeleted(subclass);

@@ -1833,19 +1833,24 @@ export class ClassDynamicDispatch {
       const initializers = this.bagInitializers.get(className) ?? [];
       initializers.push(initialize);
       this.bagInitializers.set(className, initializers);
+      // Error public operations keep the capsule as their receiver. Its
+      // snapshot/commit adapter alone owns the private native bag.
+      const publicError = lowerer.isSubclassOf(className, "%Error");
       this.propertyBag.body.unshift({
         kind: "if",
         cond: condition,
-        then: [
-          {
-            kind: "if",
-            cond: { kind: "dynTest", test: "undefined", value: bag, type: BOOL, loc },
-            then: [initialize],
-            else_: null,
-            loc,
-          },
-          { kind: "return", value: bag, loc },
-        ],
+        then: publicError
+          ? [{ kind: "return", value: varRef("p.0", DYN, loc), loc }]
+          : [
+              {
+                kind: "if",
+                cond: { kind: "dynTest", test: "undefined", value: bag, type: BOOL, loc },
+                then: [initialize],
+                else_: null,
+                loc,
+              },
+              { kind: "return", value: bag, loc },
+            ],
         else_: null,
         loc,
       });
@@ -5060,7 +5065,11 @@ export class ClassDynamicDispatch {
   ): IrFunction | null {
     // A superclass constructor can be the first code to access this bag.
     // Its receiver still needs the actual subclass's prototype.
-    if (lowerer.classes.get(type.className)?.subclasses.length) return null;
+    if (
+      lowerer.classes.get(type.className)?.subclasses.length ||
+      lowerer.isSubclassOf(type.className, "%Error")
+    )
+      return null;
     const key = `${type.className}:${readOnly}`;
     const existing = this.typedPropertyBags.get(key);
     if (existing) return existing;
